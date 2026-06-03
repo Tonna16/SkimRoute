@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "PagePilot",
+  "short_name": "PagePilot",
+  "version": "1.0.0",
+  "description": "Navigate long web pages and AI chats. PagePilot finds the useful part and stays out of the way.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "file:///*"
+  ],
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "PagePilot",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "content/adapters.js",
+        "content/engine.js",
+        "content/ui.js",
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "node_modules/pdfjs-dist/build/pdf.min.mjs",
+        "node_modules/pdfjs-dist/build/pdf.worker.min.mjs",
+        "node_modules/pdfjs-dist/cmaps/*",
+        "node_modules/tesseract.js/dist/*",
+        "node_modules/tesseract.js-core/*",
+        "node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
