@@ -1,0 +1,92 @@
+{
+  "manifest_version": 3,
+  "name": "SkimRoute",
+  "short_name": "SkimRoute",
+  "version": "1.2.0",
+  "description": "Navigate long web pages, AI chats, and PDFs. SkimRoute finds the useful part and stays out of the way.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "file:///*"
+  ],
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "SkimRoute",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "assets/adapters.js-BxVfMoxi.js",
+        "assets/engine.js-BJkAhsDZ.js",
+        "assets/ui.js-DPUnGKsp.js",
+        "assets/content.js-BzKMfaWY.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "background": {
+    "service_worker": "service-worker-loader.js",
+    "type": "module"
+  },
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "resources": [
+        "node_modules/pdfjs-dist/build/pdf.min.mjs",
+        "node_modules/pdfjs-dist/build/pdf.worker.min.mjs",
+        "node_modules/pdfjs-dist/cmaps/*",
+        "node_modules/pdfjs-dist/wasm/*",
+        "node_modules/pdfjs-dist/standard_fonts/*",
+        "node_modules/pdfjs-dist/iccs/*",
+        "node_modules/tesseract.js/dist/*",
+        "node_modules/tesseract.js-core/*",
+        "node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz"
+      ],
+      "use_dynamic_url": false
+    },
+    {
+      "matches": [
+        "file:///*",
+        "http://*/*",
+        "https://*/*"
+      ],
+      "resources": [
+        "assets/adapters.js-BxVfMoxi.js",
+        "assets/engine.js-BJkAhsDZ.js",
+        "assets/ui.js-DPUnGKsp.js",
+        "assets/content.js-BzKMfaWY.js"
+      ],
+      "use_dynamic_url": false
+    }
+  ]
+}
