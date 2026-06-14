@@ -261,9 +261,13 @@
         let score = 0;
         if (meta.role === "assistant") score += 44;
         if (meta.role === "user") score -= 64;
-        if (meta.isLatestAssistant) score += 22;
+        if (meta.isLatestCompleteAssistant) score += 28;
+        else if (meta.isLatestAssistant && meta.isCompleteAssistantAnswer) score += 20;
+        else if (meta.isLatestAssistant) score += 4;
         if (meta.answersLatestUser) score += 26;
         if (meta.isAfterUserCorrection) score += 30;
+        if (meta.replacesFailedAttempt) score += 32;
+        if (meta.isCompleteAssistantAnswer) score += 18;
         if (meta.hasFinalAnswer) score += 32;
         if (meta.hasRevision) score += 24;
         if (meta.hasSummary) score += 18;
@@ -276,6 +280,7 @@
         if (meta.hasHedgedDraft) score -= 24;
         if (meta.hasFailedAnswer) score -= 64;
         if (meta.isShortConfirmation) score -= 54;
+        if (meta.isCitationOnly) score -= 46;
         if (meta.finalCode) score += 34;
         if (meta.kind === "code") score += 18;
         if (meta.topicShift) score += 10;
@@ -341,9 +346,11 @@
         const meta = section.unitMeta || {};
         if (meta.role === "user") return -58;
         return (meta.role === "assistant" ? 32 : 0)
-          + (meta.isLatestAssistant ? 18 : 0)
+          + (meta.isLatestCompleteAssistant ? 24 : meta.isLatestAssistant && meta.isCompleteAssistantAnswer ? 16 : meta.isLatestAssistant ? 3 : 0)
           + (meta.answersLatestUser ? 22 : 0)
           + (meta.isAfterUserCorrection ? 26 : 0)
+          + (meta.replacesFailedAttempt ? 28 : 0)
+          + (meta.isCompleteAssistantAnswer ? 14 : 0)
           + (meta.hasRevision ? 18 : 0)
           + (meta.hasFinalAnswer ? 20 : 0)
           + (meta.hasSummary ? 14 : 0)
@@ -355,6 +362,7 @@
           + (meta.isSuperseded ? -54 : 0)
           + (meta.hasFailedAnswer ? -56 : 0)
           + (meta.isShortConfirmation ? -46 : 0)
+          + (meta.isCitationOnly ? -38 : 0)
           + (meta.finalCode ? 30 : 0);
       }
     };
@@ -907,11 +915,44 @@
       const hasFailedAnswer = /\b(something went wrong|network error|failed to generate|try again|regenerate response|error occurred|generating response|thinking\.\.\.|loading response|still loading)\b/i.test(text)
         || /^(loading|thinking|generating)\.?\s*$/i.test(text.trim());
       const isShortConfirmation = role === "assistant" && helpers.countWords(text) <= 18 && /^(yes|no|ok|okay|sure|done|got it|sounds good|correct|thanks|you'?re welcome)[.! ]*$/i.test(text);
+      const isCitationOnly = role === "assistant"
+        && helpers.countWords(text) < 220
+        && (text.match(/(\[[0-9,\s-]{1,18}\]|https?:\/\/\S+|\bdoi:\s*\S+|\bsource:|\bcitation\b)/gi) || []).length >= 3
+        && !/\b(summary|answer|recommend|steps?|code|final|because|therefore)\b/i.test(text);
       const topicShift = role === "user" && /\b(new question|different topic|separate issue|also|another question|follow up)\b/i.test(text);
       const isLatestAssistant = index === lastAssistantIndex;
+      const isCompleteAssistantAnswer = role === "assistant"
+        && !hasFailedAnswer
+        && !isShortConfirmation
+        && !isCitationOnly
+        && helpers.countWords(text) >= 24
+        && (
+          hasFinalAnswer
+          || hasRevision
+          || hasSummary
+          || hasCompleteCode
+          || hasRecommendation
+          || hasStepByStep
+          || hasKeyExplanation
+          || codeBlocks.length > 0
+          || helpers.countWords(text) >= 45
+        );
 
       return {
-        title: getConversationTitle({ role, text, codeBlocks, hasFinalAnswer, hasRevision, hasSummary, isLatestAssistant, index }),
+        title: getConversationTitle({
+          role,
+          text,
+          codeBlocks,
+          hasFinalAnswer,
+          hasRevision,
+          hasSummary,
+          hasCompleteCode,
+          hasRecommendation,
+          hasStepByStep,
+          isCompleteAssistantAnswer,
+          isLatestAssistant,
+          index
+        }),
         anchor: group.anchor,
         blocks: group.blocks,
         level: role === "user" ? 2 : 3,
@@ -932,6 +973,8 @@
           hasHedgedDraft,
           hasFailedAnswer,
           isShortConfirmation,
+          isCitationOnly,
+          isCompleteAssistantAnswer,
           topicShift,
           isLatestAssistant,
           codeBlockCount: codeBlocks.length
@@ -1095,9 +1138,13 @@
     const latestUserIndex = latestUser && latestUser.meta ? Number(latestUser.meta.turnIndex) : -1;
     const latestUserText = latestUser ? String(latestUser.text || "") : "";
     const latestUserIsCorrection = /\b(actually|correction|correct|wrong|not what i meant|instead|fix that|revise|update|change|use this|make it)\b/i.test(latestUserText);
+    const failedAttemptTurn = assistantUnits.reduce((latest, unit) => {
+      const meta = unit.meta || {};
+      return meta.hasFailedAnswer ? Math.max(latest, Number(meta.turnIndex) || -1) : latest;
+    }, -1);
     const authoritativeTurn = assistantUnits.reduce((latest, unit) => {
       const meta = unit.meta || {};
-      if (meta.hasRevision || meta.hasFinalAnswer || meta.hasCompleteCode) {
+      if (meta.hasRevision || meta.hasFinalAnswer || meta.hasCompleteCode || meta.isCompleteAssistantAnswer) {
         return Math.max(latest, meta.turnIndex);
       }
       return latest;
@@ -1120,9 +1167,13 @@
       } else if (latestUserIndex > meta.turnIndex && !meta.isLatestAssistant) {
         priority -= 18;
       }
+      meta.replacesFailedAttempt = Boolean(meta.isCompleteAssistantAnswer && failedAttemptTurn > -1 && meta.turnIndex > failedAttemptTurn);
+      meta.isLatestCompleteAssistant = Boolean(meta.isLatestAssistant && meta.isCompleteAssistantAnswer);
       if (meta.hasRevision) priority += 34;
       if (meta.hasFinalAnswer) priority += 32;
       if (meta.hasCompleteCode) priority += 26;
+      if (meta.isLatestCompleteAssistant) priority += 24;
+      if (meta.replacesFailedAttempt) priority += 24;
       if (meta.hasSummary) priority += 18;
       if (meta.hasRecommendation && (meta.hasFinalAnswer || meta.isLatestAssistant)) priority += 22;
       if (meta.hasStepByStep) priority += 18;
@@ -1131,6 +1182,7 @@
       if (meta.hasHedgedDraft) priority -= 24;
       if (meta.hasFailedAnswer) priority -= 56;
       if (meta.isShortConfirmation) priority -= 44;
+      if (meta.isCitationOnly) priority -= 38;
       if (meta.isSuperseded) priority -= 42;
 
       meta.responsePriority = Math.max(0, Math.min(88, priority));
@@ -1197,9 +1249,14 @@
         platform: last.unit.meta.platform,
         kind: "code",
         finalCode: true,
+        hasCompleteCode: true,
+        hasFinalAnswer: Boolean(last.unit.meta.hasFinalAnswer || last.unit.meta.hasCompleteCode),
+        isCompleteAssistantAnswer: true,
         isLatestAssistant: last.unit.meta.isLatestAssistant,
+        isLatestCompleteAssistant: Boolean(last.unit.meta.isLatestCompleteAssistant || last.unit.meta.isLatestAssistant),
         answersLatestUser: Boolean(last.unit.meta.answersLatestUser),
         isAfterUserCorrection: Boolean(last.unit.meta.isAfterUserCorrection),
+        replacesFailedAttempt: Boolean(last.unit.meta.replacesFailedAttempt),
         turnIndex: last.unit.meta.turnIndex,
         turnGroupId: `${last.unit.meta.turnGroupId || last.unit.meta.turnIndex}-code`,
         isSuperseded: Boolean(last.unit.meta.isSuperseded),
@@ -1212,14 +1269,17 @@
     const prefix = details.role === "user" ? "Question" : "Answer";
     const compact = summarize(details.text, details.role === "user" ? 72 : 76);
 
+    if (details.hasCompleteCode && details.isLatestAssistant) return "Complete code";
     if (details.hasRevision && details.isLatestAssistant) return "Latest corrected answer";
     if (details.hasFinalAnswer && /\b(recommend|recommended|best option|best choice|go with|choose)\b/i.test(details.text)) return "Final recommendation";
+    if (details.hasRecommendation && details.isLatestAssistant) return "Final recommendation";
     if (details.hasFinalAnswer && details.isLatestAssistant) return "Final answer";
     if (details.hasSummary && details.isLatestAssistant) return "Latest summary";
-    if (/\b(step-by-step|step by step|first,|second,|next,|then,|finally,|\d+\.\s+\S)\b/i.test(details.text) && details.isLatestAssistant) return "Step-by-step answer";
+    if ((details.hasStepByStep || /\b(step-by-step|step by step|first,|second,|next,|then,|finally,|\d+\.\s+\S)\b/i.test(details.text)) && details.isLatestAssistant) return "Step-by-step answer";
     if (details.codeBlocks.length && details.isLatestAssistant) return "Latest answer with code";
-    if (details.isLatestAssistant) return "Latest answer";
+    if (details.isLatestAssistant && details.isCompleteAssistantAnswer) return "Latest answer";
     if (details.hasRevision) return "Revised answer";
+    if (details.hasCompleteCode) return "Complete code";
     if (details.hasFinalAnswer) return "Final answer";
     if (details.hasSummary) return "Summary";
     return `${prefix}: ${compact}`;
@@ -1287,11 +1347,14 @@
         if (meta.searchBlockType === "people_also_ask") score += 58;
         if (meta.searchBlockType === "sources") score += 54;
         if (meta.searchBlockType === "videos") score += 42;
-        if (meta.searchBlockType === "shopping") score += 34;
         if (meta.searchBlockType === "maps") score += 34;
+        if (meta.searchBlockType === "related_searches") score += 24;
+        if (meta.searchBlockType === "shopping") score += 16;
         if (/\b(ai overview|overview from ai|generative ai|answer|featured snippet|people also ask|top result|sources?)\b/.test(text)) score += 18;
         if (/\b(sponsored|advertisement|ad\s*·|shop now|buy now|checkout|sign in|privacy|settings)\b/.test(text)) score -= 60;
         if ((section.wordCount || 0) < 12 && !/ai overview|people also ask|videos|shopping|maps/i.test(section.title || "")) score -= 24;
+        if (/\b(sponsored|advertisement|ad\s*.|shop now|buy now|checkout|add to cart)\b/.test(text)) score -= 12;
+        if (meta.searchBlockType === "related_searches" && (section.wordCount || 0) < 12) score += 24;
         return score;
       }
     };
@@ -1305,7 +1368,7 @@
       if (!block) return;
       const text = helpers.cleanText(block.innerText || block.textContent || "");
       const words = helpers.countWords(text);
-      if (words < 8 && !["people_also_ask", "videos", "shopping", "maps"].includes(type)) return;
+      if (words < 8 && !["people_also_ask", "videos", "shopping", "maps", "related_searches"].includes(type)) return;
       candidates.push({
         element: block,
         type,
@@ -1321,9 +1384,28 @@
       "[data-attrid*='SGE' i]",
       "[data-attrid*='ai-overview' i]",
       "[class*='ai-overview' i]",
-      "[data-testid*='ai-overview' i]"
+      "[data-testid*='ai-overview' i]",
+      "[class*='b_ai' i]"
     ].forEach((selector) => {
       helpers.querySelectorAllDeep(doc, selector).forEach((node) => addCandidate(node, "ai_overview", "AI Overview"));
+    });
+
+    [
+      "[data-attrid*='featured_snippet' i]",
+      "[data-attrid*='answer' i]",
+      "[class*='featured-snippet' i]",
+      "[class*='answer' i]",
+      ".b_ans",
+      ".b_entityTP",
+      "#b_context"
+    ].forEach((selector) => {
+      helpers.querySelectorAllDeep(root, selector).slice(0, 20).forEach((node) => {
+        if (!helpers.isVisible(node) || helpers.isLowValueElement(node)) return;
+        const text = helpers.cleanText(node.innerText || node.textContent || "");
+        if (helpers.countWords(text) >= 8 && /\b(answer|definition|featured snippet|quick answer|according to|is a|are a|means|convert|weather|score|result)\b/i.test(text)) {
+          addCandidate(node, "answer", "Search answer");
+        }
+      });
     });
 
     helpers.querySelectorAllDeep(root, "h1, h2, h3, [role='heading'], div, section, article")
@@ -1333,11 +1415,13 @@
         const text = helpers.cleanText(node.innerText || node.textContent || "");
         const head = text.slice(0, 180);
         if (/^(ai overview|overview from ai|generative ai)\b/i.test(head)) addCandidate(node, "ai_overview", "AI Overview");
+        else if (/^(featured snippet|direct answer|answer|quick answer|best answer)\b/i.test(head)) addCandidate(node, "answer", "Search answer");
         else if (/^(sources?|source links?|web sources?)\b/i.test(head)) addCandidate(node, "sources", "Sources");
         else if (/^(people also ask|related questions)\b/i.test(head)) addCandidate(node, "people_also_ask", "People also ask");
         else if (/^(videos?|video results?)\b/i.test(head)) addCandidate(node, "videos", "Videos");
         else if (/^(shopping|products?|popular products?)\b/i.test(head)) addCandidate(node, "shopping", "Shopping");
         else if (/^(maps?|local results?|places)\b/i.test(head)) addCandidate(node, "maps", "Maps");
+        else if (/^(related searches|related search|searches related to|related topics)\b/i.test(head)) addCandidate(node, "related_searches", "Related searches");
       });
 
     [
@@ -1345,7 +1429,9 @@
       "#search .g",
       "#search .MjjYud",
       "#b_results > li.b_algo",
+      "#b_results > li.b_ans",
       "#b_results > li",
+      "#b_context",
       "[data-testid*='result' i]",
       "[class*='result' i] article",
       "article"
@@ -1396,6 +1482,8 @@
     const block = element.closest([
       "[data-attrid*='SGE' i]",
       "[aria-label*='AI Overview' i]",
+      "[data-attrid*='featured_snippet' i]",
+      ".b_ans",
       "#rso > div",
       "#search .g",
       "#search .MjjYud",
@@ -1426,9 +1514,10 @@
     if (/^(sources?|source links?)\b/i.test(text || "") || /\b(source|sources)\b.{0,80}\b(ai overview|overview)\b/i.test(text || "")) return "sources";
     if (/\b(people also ask|related questions)\b/.test(value)) return "people_also_ask";
     if (/\b(videos?|youtube|watch)\b/.test(value)) return "videos";
-    if (/\b(shopping|products?|price|\$\d+|buy now|add to cart)\b/.test(value)) return "shopping";
+    if (/\b(sponsored|advertisement|ad\s*.|shopping|products?|price|\$\d+|buy now|add to cart)\b/.test(value)) return "shopping";
     if (/\b(maps?|local results?|directions|near me|places)\b/.test(value)) return "maps";
-    if (/\b(featured snippet|answer box|quick answer)\b/.test(value)) return "answer";
+    if (/\b(related searches|searches related to|related topics|related search)\b/.test(value)) return "related_searches";
+    if (/\b(featured snippet|answer box|quick answer|direct answer|b_ans)\b/.test(value)) return "answer";
     return "top_results";
   }
 
@@ -1441,7 +1530,8 @@
       top_results: "Top results",
       videos: "Videos",
       shopping: "Shopping",
-      maps: "Maps"
+      maps: "Maps",
+      related_searches: "Related searches"
     };
     return labels[type] || "Search results";
   }
@@ -1454,8 +1544,9 @@
       top_results: 3,
       people_also_ask: 4,
       videos: 5,
-      shopping: 6,
-      maps: 7
+      maps: 6,
+      related_searches: 7,
+      shopping: 8
     };
     return Number.isFinite(priorities[type]) ? priorities[type] : 9;
   }
@@ -1464,7 +1555,7 @@
     const sample = getSample(context, helpers).slice(0, 6000);
     const unitTypes = Array.isArray(units) ? units.map((unit) => unit.type || unit.meta && unit.meta.searchBlockType || "") : [];
     if (unitTypes.includes("ai_overview") || /\b(ai overview|overview from ai|generative ai)\b/i.test(sample)) return "ai_overview";
-    if (/\b(featured snippet|answer box|quick answer|people also ask)\b/i.test(sample)) return "answer_page";
+    if (unitTypes.includes("answer") || /\b(featured snippet|answer box|quick answer|direct answer|people also ask)\b/i.test(sample)) return "answer_page";
     if (unitTypes.length <= 1) return "low_map_search";
     return "standard_results";
   }
@@ -1478,7 +1569,8 @@
       top_results: "Top organic result area is useful after search summaries",
       videos: "Video result block may be useful for this query",
       shopping: "Shopping block is a specialized result area",
-      maps: "Map/local block is a specialized result area"
+      maps: "Map/local block is a specialized result area",
+      related_searches: "Related searches can help refine the query"
     };
     return reasons[type] || "Search result block";
   }

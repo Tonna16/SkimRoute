@@ -290,7 +290,8 @@
     function sectionButtonTemplate(section, settings) {
       const depth = Math.max(0, getSectionDepth(section));
       const hasChildren = section.childIds && section.childIds.length > 0;
-      const label = section.label ? `<span class="pp-badge">${escape(section.label)}</span>` : "";
+      const displayLabel = labelForSection(section);
+      const label = displayLabel ? `<span class="pp-badge">${escape(displayLabel)}</span>` : "";
       const reason = settings.showReason ? `<span class="pp-reason">${escape(formatWhyReason(reasonForSection(section)))}</span>` : "";
       const preview = !settings.showReason ? `<span class="pp-preview">${escape(sectionPreview(section))}</span>` : "";
       const importantClass = section.isImportant ? " pp-item-important" : "";
@@ -628,6 +629,10 @@
 
   function reasonForSection(section) {
     if (!section || !section.metrics) return "Useful section";
+    const intelligenceReason = section.intelligence
+      && Array.isArray(section.intelligence.whyReasons)
+      && section.intelligence.whyReasons[0];
+    if (intelligenceReason) return intelligenceReason;
     if (section.unitMeta && section.unitMeta.diagnosticReason) return section.unitMeta.diagnosticReason;
     const kindReason = reasonForSectionKind(section);
     if (kindReason) return kindReason;
@@ -654,6 +659,13 @@
     if (section.metrics.listItems >= 3) return "Structured for quick scanning";
     if (section.metrics.hasNumbers) return "Contains concrete details";
     return `${section.wordCount} focused words`;
+  }
+
+  function labelForSection(section) {
+    const intelligenceLabel = section
+      && section.intelligence
+      && section.intelligence.roleLabel;
+    return intelligenceLabel || section && section.label || "";
   }
 
   function reasonForSectionKind(section) {

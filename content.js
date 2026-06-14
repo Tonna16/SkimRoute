@@ -329,7 +329,29 @@
       finalizePdfPublicStatus,
       verifyPdfPublicStatusTopLevelFields,
       getPdfOcrPlan,
-      shouldRunBetterPdfOcrAfterFast
+      shouldRunBetterPdfOcrAfterFast,
+      normalizePdfOcrLineTextSpacing,
+      sortPdfOcrLinesByReadingOrder,
+      reconstructPdfOcrTextFromLines,
+      evaluatePdfOcrTextQuality,
+      isBetterPdfOcrVariant,
+      getPdfOcrImmediateReturnDecision,
+      evaluatePdfOcrCandidateUsability,
+      getPdfOcrEarlyStopDecision,
+      mapPdfOcrBBoxToFullPage,
+      rotatePdfOcrBBoxForDisplay,
+      normalizePdfOcrSourceLine,
+      normalizePdfOcrSourceLines,
+      mergePdfOcrLineBackedGeometry,
+      buildRecoveredPdfOcrLineBackedChunk,
+      buildRecoveredPdfOcrLetterChunks,
+      classifyRecoveredPdfOcrRole,
+      classifyRecoveredPdfOcrLineRole,
+      getPdfOcrStructureCompleteness,
+      scoreRecoveredPdfChunk,
+      compareRecoveredPdfSections,
+      isPdfOcrExactGeometryUsable,
+      getVerifiedPdfOcrHighlightGeometry
     };
   }
 
@@ -944,6 +966,150 @@
     };
   }
 
+  function normalizeSectionIntelligenceForPublic(section, pageType = "pdf") {
+    if (!section) return null;
+    const existing = section.intelligence && typeof section.intelligence === "object" ? section.intelligence : {};
+    const role = String(existing.role || getPublicSectionRole(section)).slice(0, 100);
+    const roleLabel = String(existing.roleLabel || getPublicSectionRoleLabel(section, role)).slice(0, 140);
+    const whyReasons = uniquePublicStrings(Array.isArray(existing.whyReasons) ? existing.whyReasons : [])
+      .concat(uniquePublicStrings(getPublicSectionWhyReasons(section, role)))
+      .slice(0, 5);
+    const scoreDetails = normalizePublicScoreDetails(existing.scoreDetails, section, role);
+    return {
+      role,
+      roleLabel,
+      pageType: String(existing.pageType || pageType || "pdf").slice(0, 80),
+      roleConfidence: Number.isFinite(Number(existing.roleConfidence))
+        ? Math.max(0, Math.min(100, Math.round(Number(existing.roleConfidence))))
+        : getPublicSectionRoleConfidence(section),
+      whyReasons: whyReasons.length ? whyReasons : ["Looks like a useful section"],
+      scoreDetails,
+      sourceType: String(existing.sourceType || getPublicSectionSourceType(section)).slice(0, 80)
+    };
+  }
+
+  function normalizePublicScoreDetails(scoreDetails, section, role) {
+    const source = scoreDetails && typeof scoreDetails === "object" ? scoreDetails : {};
+    let signals = Array.isArray(source.signals)
+      ? source.signals.map((signal) => ({
+        signal: String(signal && signal.signal || "").slice(0, 120),
+        weight: Number.isFinite(Number(signal && signal.weight)) ? Number(signal.weight) : 0,
+        explanation: String(signal && signal.explanation || "").slice(0, 240)
+      })).filter((signal) => signal.signal && signal.explanation).slice(0, 7)
+      : [];
+    if (!signals.length) {
+      signals = getPublicSectionSignals(section, role);
+    }
+    return {
+      score: Number.isFinite(Number(source.score)) ? Number(source.score) : Number(section && section.score) || 0,
+      usefulScore: Number.isFinite(Number(source.usefulScore)) ? Number(source.usefulScore) : Number(section && section.usefulScore) || 0,
+      importanceScore: Number.isFinite(Number(source.importanceScore)) ? Number(source.importanceScore) : Number(section && section.importanceScore) || 0,
+      fluffScore: Number.isFinite(Number(source.fluffScore)) ? Number(source.fluffScore) : Number(section && section.metrics && section.metrics.fluffScore) || 0,
+      signals
+    };
+  }
+
+  function getPublicSectionRole(section) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const ocrRole = normalizeRecoveredPdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (ocrRole) {
+      if (ocrRole === "body") return "ocr_letter_body";
+      if (ocrRole === "date_reference") return "ocr_date_reference";
+      if (ocrRole === "signature") return "ocr_signature";
+      return `ocr_${ocrRole}`;
+    }
+    if (unitMeta.searchBlockType) return `search_${String(unitMeta.searchBlockType).replace(/[^a-z0-9_]+/gi, "_").toLowerCase()}`;
+    if (metrics.pdfSectionType || unitMeta.pdfSectionType) return String(metrics.pdfSectionType || unitMeta.pdfSectionType);
+    if (metrics.sectionKind) return String(metrics.sectionKind);
+    if (unitMeta.kind) return String(unitMeta.kind);
+    return "useful_section";
+  }
+
+  function getPublicSectionRoleLabel(section, role) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    return metrics.ocrRoleLabel
+      || unitMeta.ocrRoleLabel
+      || metrics.sectionKindLabel
+      || recoveredPdfKindLabel(role)
+      || "Useful section";
+  }
+
+  function getPublicSectionRoleConfidence(section) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const explicit = Number(metrics.ocrRoleConfidence || unitMeta.ocrRoleConfidence);
+    if (Number.isFinite(explicit) && explicit > 0) return Math.max(0, Math.min(100, Math.round(explicit)));
+    const score = Number(section && section.score) || 0;
+    const usefulScore = Number(section && section.usefulScore) || 0;
+    const importanceScore = Number(section && section.importanceScore) || 0;
+    let confidence = Math.round(Math.max(0, Math.min(100, (score + 24) * 0.55 + usefulScore * 0.18 + importanceScore * 0.08)));
+    if (section && section.isBest) confidence += 6;
+    else if (section && section.isImportant) confidence += 3;
+    return Math.max(0, Math.min(100, confidence));
+  }
+
+  function getPublicSectionWhyReasons(section, role) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const reasons = [];
+    if (Array.isArray(unitMeta.ocrRoleReasons)) reasons.push(...unitMeta.ocrRoleReasons);
+    if (Array.isArray(metrics.ocrRoleReasons)) reasons.push(...metrics.ocrRoleReasons);
+    if (unitMeta.diagnosticReason) reasons.push(unitMeta.diagnosticReason);
+    if (metrics.selectionReason) reasons.push(metrics.selectionReason);
+    const kindReason = reasonForPublicSectionKind(section);
+    if (kindReason) reasons.push(kindReason);
+    if (!reasons.length && role) reasons.push(`${getPublicSectionRoleLabel(section, role)} signal from existing section metadata`);
+    return reasons;
+  }
+
+  function getPublicSectionSignals(section, role) {
+    const metrics = section && section.metrics || {};
+    const matched = metrics.matched || {};
+    const unitMeta = section && section.unitMeta || {};
+    const signals = [];
+    const add = (signal, weight, explanation) => signals.push({ signal, weight, explanation });
+    if (matched.finalRecommendation) add("finalRecommendation", 104, "Contains final recommendation language.");
+    if (matched.finalAnswer) add("finalAnswer", 92, "Looks like the final answer.");
+    if (matched.correctedAnswer || unitMeta.hasRevision || unitMeta.isAfterUserCorrection) add("correctedAnswer", 96, "Updated answer after a correction.");
+    if (matched.results) add("results", 66, "Shows results or findings.");
+    if (matched.mainArgument) add("mainArgument", 74, "States a main argument or claim.");
+    if (matched.procedure || matched.action || matched.directAction) add("action", 42, "Contains actionable guidance.");
+    if (matched.summary) add("summary", 52, "Summarizes useful content.");
+    if (matched.answer || matched.conciseAnswer) add("answer", 46, "Has a direct answer signal.");
+    if (metrics.codeBlocks > 0) add("structure.codeBlocks", 52, "Includes code or a practical example.");
+    if (metrics.hasNumbers) add("structure.numbers", 12, "Contains concrete numbers or dates.");
+    if (unitMeta.ocr || /^ocr_/i.test(String(role || ""))) add(`role.${role || "ocr"}`, Number(section && section.score) || 0, "OCR role from existing section metadata.");
+    if (unitMeta.pdfSectionType || metrics.pdfSectionType) add(`pdfSectionType.${unitMeta.pdfSectionType || metrics.pdfSectionType}`, Number(section && section.score) || 0, "PDF section type from existing metadata.");
+    if (matched.boilerplate) add("boilerplate", -114, "Looks like boilerplate or page chrome.");
+    if (matched.references) add("references", -112, "Looks like references or citations.");
+    if (metrics.fluffScore >= 82) add("fluff.high", -metrics.fluffScore, "High boilerplate or fluff score.");
+    if (!signals.length) add(`role.${role || "useful_section"}`, Number(section && section.score) || 0, "Role from existing section metadata.");
+    return signals.slice(0, 7);
+  }
+
+  function getPublicSectionSourceType(section) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    if (unitMeta.ocr) return "ocr";
+    if (section && section.source === "pdf" || unitMeta.pdfjs || unitMeta.pageNumber || metrics.pdfSectionType) return "pdf";
+    if (unitMeta.searchBlockType || unitMeta.kind === "search-block") return "search";
+    if (unitMeta.role === "assistant" || unitMeta.role === "user" || metrics.chatRole) return "chat";
+    return unitMeta.kind || section && section.source || "dom";
+  }
+
+  function uniquePublicStrings(values) {
+    const seen = new Set();
+    return (values || []).map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .filter((value) => {
+        const key = value.toLowerCase();
+        if (!value || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
   function normalizePublicPdfOcrSection(section, index = 0) {
     if (!section) return null;
     normalizePdfActionTargetSection(section);
@@ -976,7 +1142,8 @@
       ocrVariantName: String(unitMeta.ocrVariantName || geometry && geometry.ocrVariantName || "").slice(0, 80),
       sourceLineIds: Array.isArray(unitMeta.sourceLineIds) ? unitMeta.sourceLineIds.slice(0, 120) : [],
       sourceLineTextSample: String(unitMeta.sourceLineTextSample || geometry && geometry.sourceLineTextSample || "").replace(/\s+/g, " ").trim().slice(0, 260),
-      sectionTextSample: String(unitMeta.sectionTextSample || section.text || "").replace(/\s+/g, " ").trim().slice(0, 260)
+      sectionTextSample: String(unitMeta.sectionTextSample || section.text || "").replace(/\s+/g, " ").trim().slice(0, 260),
+      intelligence: normalizeSectionIntelligenceForPublic(section, "pdf")
     };
   }
 
@@ -1937,6 +2104,52 @@
     };
   }
 
+  function normalizePdfOcrRotation(rotation) {
+    const value = Number(rotation) || 0;
+    const normalized = ((Math.round(value / 90) * 90) % 360 + 360) % 360;
+    return [0, 90, 180, 270].includes(normalized) ? normalized : 0;
+  }
+
+  function rotatePdfOcrBBoxForDisplay(box, rotation = 0) {
+    const source = normalizePdfOcrBBox(box, box && box.pageWidth, box && box.pageHeight);
+    if (!source) return null;
+    const pageWidth = Number(source.pageWidth) || 0;
+    const pageHeight = Number(source.pageHeight) || 0;
+    const normalizedRotation = normalizePdfOcrRotation(rotation);
+    if (!normalizedRotation || !pageWidth || !pageHeight) return source;
+    if (normalizedRotation === 90) {
+      return normalizePdfOcrBBox({
+        x0: pageHeight - source.y1,
+        y0: source.x0,
+        x1: pageHeight - source.y0,
+        y1: source.x1,
+        pageWidth: pageHeight,
+        pageHeight: pageWidth
+      }, pageHeight, pageWidth);
+    }
+    if (normalizedRotation === 180) {
+      return normalizePdfOcrBBox({
+        x0: pageWidth - source.x1,
+        y0: pageHeight - source.y1,
+        x1: pageWidth - source.x0,
+        y1: pageHeight - source.y0,
+        pageWidth,
+        pageHeight
+      }, pageWidth, pageHeight);
+    }
+    if (normalizedRotation === 270) {
+      return normalizePdfOcrBBox({
+        x0: source.y0,
+        y0: pageWidth - source.x1,
+        x1: source.y1,
+        y1: pageWidth - source.x0,
+        pageWidth: pageHeight,
+        pageHeight: pageWidth
+      }, pageHeight, pageWidth);
+    }
+    return source;
+  }
+
   function mapPdfOcrBBoxToFullPage(box, context = {}, fallbackPageWidth = 0, fallbackPageHeight = 0) {
     const raw = normalizePdfOcrBBox(box, fallbackPageWidth, fallbackPageHeight);
     if (!raw) return null;
@@ -1951,7 +2164,7 @@
     const safeScaleY = scaleY > 0 ? scaleY : 1;
     const pageWidth = size.pageWidth || cropWidth || raw.pageWidth || fallbackPageWidth || 0;
     const pageHeight = size.pageHeight || cropHeight || raw.pageHeight || fallbackPageHeight || 0;
-    return normalizePdfOcrBBox({
+    const mapped = normalizePdfOcrBBox({
       x0: raw.x0 / safeScaleX + size.cropOffsetX,
       y0: raw.y0 / safeScaleY + size.cropOffsetY,
       x1: raw.x1 / safeScaleX + size.cropOffsetX,
@@ -1959,6 +2172,11 @@
       pageWidth,
       pageHeight
     }, pageWidth, pageHeight);
+    if (!mapped) return null;
+    if (context.applyRotationToOcrCoordinates === true || context.rotationAppliedToCanvas === false) {
+      return rotatePdfOcrBBoxForDisplay(mapped, context.rotation);
+    }
+    return mapped;
   }
 
   function mapPdfOcrWordsToFullPage(words, context = {}, fallbackPageWidth = 0, fallbackPageHeight = 0) {
@@ -2106,11 +2324,594 @@
     };
   }
 
+  function isPdfOcrExactGeometryUsable(geometry, options = {}) {
+    const normalized = normalizePdfOcrGeometry(geometry);
+    const bbox = normalized && normalized.bbox;
+    if (!bbox) return false;
+    const pageWidth = Number(bbox.pageWidth || normalized.pageWidth || 0);
+    const pageHeight = Number(bbox.pageHeight || normalized.pageHeight || 0);
+    if (!pageWidth || !pageHeight) return false;
+    const width = Number(bbox.x1) - Number(bbox.x0);
+    const height = Number(bbox.y1) - Number(bbox.y0);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 1 || height <= 1) return false;
+    const areaRatio = (width * height) / Math.max(1, pageWidth * pageHeight);
+    const heightRatio = height / pageHeight;
+    const widthRatio = width / pageWidth;
+    const maxAreaRatio = Number.isFinite(Number(options.maxAreaRatio)) ? Number(options.maxAreaRatio) : 0.48;
+    const maxHeightRatio = Number.isFinite(Number(options.maxHeightRatio)) ? Number(options.maxHeightRatio) : 0.46;
+    if (areaRatio < 0.00002 || areaRatio > maxAreaRatio) return false;
+    if (heightRatio > maxHeightRatio || widthRatio > 0.98) return false;
+    if (bbox.x0 < -1 || bbox.y0 < -1 || bbox.x1 > pageWidth + 1 || bbox.y1 > pageHeight + 1) return false;
+    const wordBoxes = Array.isArray(normalized.wordBoxes) ? normalized.wordBoxes.filter((word) => word && word.bbox) : [];
+    const requireWords = options.requireWords === true;
+    if (requireWords && !wordBoxes.length) return false;
+    if (wordBoxes.length) {
+      const wordArea = wordBoxes.reduce((sum, word) => {
+        const box = normalizePdfOcrBBox(word && word.bbox, pageWidth, pageHeight);
+        if (!box) return sum;
+        return sum + Math.max(0, box.x1 - box.x0) * Math.max(0, box.y1 - box.y0);
+      }, 0);
+      const fillRatio = wordArea / Math.max(1, width * height);
+      if (fillRatio < 0.002) return false;
+    }
+    return true;
+  }
+
+  function normalizePdfOcrSourceLine(line, index = 0) {
+    if (!line || typeof line !== "object") return null;
+    const text = normalizePdfOcrLineTextSpacing(line.text || line.rawText || "");
+    if (!text) return null;
+    const geometry = getPdfOcrLineGeometry(line);
+    const sourceLineIds = Array.isArray(line.sourceLineIds) && line.sourceLineIds.length
+      ? line.sourceLineIds.map((id) => String(id).slice(0, 140)).filter(Boolean)
+      : geometry && Array.isArray(geometry.sourceLineIds) && geometry.sourceLineIds.length
+        ? geometry.sourceLineIds.map((id) => String(id).slice(0, 140)).filter(Boolean)
+        : line.id ? [String(line.id).slice(0, 140)] 
+        : [];
+    const id = String(line.sourceLineId || line.id || sourceLineIds[0] || `ocr-source-line-${index}`).slice(0, 140);
+    const lineIndex = Number.isFinite(Number(line.lineIndex)) ? Number(line.lineIndex) : Number.isFinite(Number(line.order)) ? Number(line.order) : index;
+    return {
+      id,
+      text,
+      rawText: String(line.rawText || line.text || text).slice(0, 500),
+      lineIndex,
+      pageNumber: Number(line.pageNumber) || 1,
+      confidence: Number.isFinite(Number(line.confidence)) ? Math.round(Number(line.confidence)) : 0,
+      bbox: geometry && geometry.bbox || null,
+      pageWidth: geometry && geometry.pageWidth || Number(line.pageWidth) || 0,
+      pageHeight: geometry && geometry.pageHeight || Number(line.pageHeight) || 0,
+      wordBoxes: geometry && geometry.wordBoxes || [],
+      ocrGeometry: geometry,
+      ocrVariantName: String(line.ocrVariantName || line.recognitionVariant || geometry && geometry.ocrVariantName || "").slice(0, 80),
+      sourceLineIds: sourceLineIds.length ? sourceLineIds : [id],
+      sourceBBox: line.sourceBBox || null,
+      cropOffset: line.cropOffset || geometry && geometry.cropOffset || null,
+      renderScale: Number.isFinite(Number(line.renderScale || geometry && geometry.renderScale)) ? Number(line.renderScale || geometry && geometry.renderScale) : 0,
+      rotation: Number.isFinite(Number(line.rotation || geometry && geometry.rotation)) ? Number(line.rotation || geometry && geometry.rotation) : 0
+    };
+  }
+
+  function normalizePdfOcrSourceLines(lines, limit = 120) {
+    if (!Array.isArray(lines)) return [];
+    const seen = new Set();
+    return lines
+      .map((line, index) => normalizePdfOcrSourceLine(line, index))
+      .filter((line) => {
+        if (!line || seen.has(line.id)) return false;
+        seen.add(line.id);
+        return true;
+      })
+      .sort((a, b) => (a.pageNumber - b.pageNumber) || (a.lineIndex - b.lineIndex))
+      .slice(0, Math.max(1, Number(limit) || 120));
+  }
+
+  function mergePdfOcrLineBackedGeometry(lines) {
+    const sourceLines = normalizePdfOcrSourceLines(lines);
+    if (!sourceLines.length) return null;
+    const geometry = mergePdfOcrGeometries(sourceLines);
+    if (!geometry) return null;
+    const sourceLineIds = Array.from(new Set(sourceLines.flatMap((line) => line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : [line.id]).filter(Boolean))).slice(0, 120);
+    const variantNames = Array.from(new Set(sourceLines.map((line) => String(line.ocrVariantName || "")).filter(Boolean)));
+    return {
+      ...geometry,
+      exact: Boolean(geometry.exact && sourceLineIds.length && variantNames.length <= 1 && isPdfOcrExactGeometryUsable(geometry)),
+      approximate: !Boolean(geometry.exact && sourceLineIds.length && variantNames.length <= 1 && isPdfOcrExactGeometryUsable(geometry)),
+      ocrVariantName: variantNames.length === 1 ? variantNames[0] : geometry.ocrVariantName || "",
+      sourceLineIds,
+      sourceLineTextSample: sourceLines.map((line) => line.text || "").join(" ").replace(/\s+/g, " ").trim().slice(0, 260),
+      ocrSourceLines: sourceLines
+    };
+  }
+
+  function buildRecoveredPdfOcrLineBackedChunk(lines, role, cleanText, countWords, extra = {}) {
+    const sourceLines = normalizePdfOcrSourceLines(lines);
+    if (!sourceLines.length) return null;
+    const text = cleanText(sourceLines.map((line) => line.text).join(" "));
+    const words = countWords(text);
+    if (!text || words < 1) return null;
+    const ocrGeometry = mergePdfOcrLineBackedGeometry(sourceLines);
+    const sourceLineIds = Array.from(new Set(sourceLines.flatMap((line) => line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : [line.id]).filter(Boolean))).slice(0, 120);
+    const variantNames = Array.from(new Set(sourceLines.map((line) => line.ocrVariantName).filter(Boolean)));
+    const normalizedRole = normalizeRecoveredPdfOcrRole(role) || "unknown";
+    const roleEvidence = getRecoveredPdfOcrRoleEvidence(normalizedRole, text, {
+      sourceLines,
+      words
+    });
+    const starts = sourceLines.map((line) => Number(line.ocrGeometry && line.ocrGeometry.relativeYStart)).filter((value) => Number.isFinite(value));
+    const ends = sourceLines.map((line) => Number(line.ocrGeometry && line.ocrGeometry.relativeYEnd)).filter((value) => Number.isFinite(value));
+    const centers = sourceLines.map((line) => Number(line.ocrGeometry && line.ocrGeometry.relativeY)).filter((value) => Number.isFinite(value));
+    const center = ocrGeometry && Number.isFinite(ocrGeometry.relativeY)
+      ? ocrGeometry.relativeY
+      : centers.length ? centers.reduce((sum, value) => sum + value, 0) / centers.length : null;
+    const exact = Boolean(ocrGeometry && ocrGeometry.exact && sourceLineIds.length && variantNames.length <= 1 && isPdfOcrExactGeometryUsable(ocrGeometry));
+    return {
+      ...extra,
+      pageNumber: Number(extra.pageNumber) || sourceLines.find((line) => Number(line.pageNumber) > 0)?.pageNumber || 1,
+      text,
+      sectionText: text,
+      words,
+      ocrRole: normalizedRole,
+      ocrRoleLabel: recoveredPdfOcrRoleLabel(normalizedRole),
+      ocrRoleConfidence: roleEvidence.confidence,
+      ocrRoleReasons: roleEvidence.reasons,
+      relativeY: Number.isFinite(center) ? center : 0.12,
+      relativeYStart: ocrGeometry && Number.isFinite(ocrGeometry.relativeYStart) ? ocrGeometry.relativeYStart : starts.length ? Math.min(...starts) : Number.isFinite(center) ? Math.max(0, center - 0.025) : null,
+      relativeYEnd: ocrGeometry && Number.isFinite(ocrGeometry.relativeYEnd) ? ocrGeometry.relativeYEnd : ends.length ? Math.max(...ends) : Number.isFinite(center) ? Math.min(1, center + 0.09) : null,
+      ocrGeometry,
+      bbox: ocrGeometry && ocrGeometry.bbox || null,
+      wordBoxes: ocrGeometry && ocrGeometry.wordBoxes || [],
+      pageWidth: ocrGeometry && ocrGeometry.pageWidth || sourceLines.find((line) => Number(line.pageWidth) > 0)?.pageWidth || 0,
+      pageHeight: ocrGeometry && ocrGeometry.pageHeight || sourceLines.find((line) => Number(line.pageHeight) > 0)?.pageHeight || 0,
+      ocrVariantName: variantNames.length === 1 ? variantNames[0] : "",
+      sourceLineIds,
+      ocrSourceLines: sourceLines,
+      sourceLineTextSample: sourceLines.map((line) => line.text || "").join(" ").replace(/\s+/g, " ").trim().slice(0, 260),
+      ocrGeometryExact: exact,
+      ocrHighlightApproximate: !exact,
+      cropOffset: ocrGeometry && ocrGeometry.cropOffset || sourceLines.find((line) => line.cropOffset)?.cropOffset || null,
+      renderScale: Number(ocrGeometry && ocrGeometry.renderScale || sourceLines.find((line) => Number(line.renderScale) > 0)?.renderScale || 0),
+      rotation: Number(ocrGeometry && ocrGeometry.rotation || sourceLines.find((line) => Number.isFinite(Number(line.rotation)))?.rotation || 0),
+      lineStart: Math.min(...sourceLines.map((line) => Number(line.lineIndex)).filter((value) => Number.isFinite(value))),
+      lineEnd: Math.max(...sourceLines.map((line) => Number(line.lineIndex)).filter((value) => Number.isFinite(value)))
+    };
+  }
+
+  function normalizePdfOcrLineTextSpacing(text) {
+    return String(text || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/\s+([,.;:!?%])/g, "$1")
+      .replace(/([([{])\s+/g, "$1")
+      .replace(/\s+([)\]}])/g, "$1")
+      .replace(/\b(Mr|Mrs|Ms|Dr|Prof|Rev|St|Ref|No|Ltd|Limited|Co)\s*\./gi, "$1.")
+      .replace(/\b([A-Z])\s*\.\s*(?=[A-Z]\s*\.|\b)/g, "$1. ")
+      .replace(/([,;:!?])([A-Za-z0-9])/g, "$1 $2")
+      .replace(/\.([A-Z][a-z])/g, ". $1")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
+  function getPdfOcrLineSortMetrics(line, index = 0) {
+    const geometry = getPdfOcrLineGeometry(line);
+    const bbox = geometry && geometry.bbox || line && line.bbox || null;
+    const pageHeight = Number(bbox && bbox.pageHeight || geometry && geometry.pageHeight || line && line.pageHeight || 0);
+    const pageWidth = Number(bbox && bbox.pageWidth || geometry && geometry.pageWidth || line && line.pageWidth || 0);
+    const y0 = Number.isFinite(Number(bbox && bbox.y0)) ? Number(bbox.y0) : Number.isFinite(Number(line && line.relativeYStart)) && pageHeight ? Number(line.relativeYStart) * pageHeight : null;
+    const y1 = Number.isFinite(Number(bbox && bbox.y1)) ? Number(bbox.y1) : Number.isFinite(Number(line && line.relativeYEnd)) && pageHeight ? Number(line.relativeYEnd) * pageHeight : y0;
+    const x0 = Number.isFinite(Number(bbox && bbox.x0)) ? Number(bbox.x0) : 0;
+    const x1 = Number.isFinite(Number(bbox && bbox.x1)) ? Number(bbox.x1) : x0;
+    const relativeY = Number.isFinite(Number(line && line.relativeY)) ? Number(line.relativeY) : geometry && Number.isFinite(Number(geometry.relativeY)) ? Number(geometry.relativeY) : null;
+    const centerY = y0 !== null && y1 !== null ? (y0 + y1) / 2 : relativeY !== null && pageHeight ? relativeY * pageHeight : index * 1000;
+    const height = y0 !== null && y1 !== null ? Math.max(1, y1 - y0) : pageHeight ? Math.max(1, pageHeight * 0.018) : 12;
+    return {
+      index,
+      pageNumber: Number(line && line.pageNumber) || 1,
+      x0,
+      x1,
+      y0: y0 !== null ? y0 : centerY,
+      y1: y1 !== null ? y1 : centerY + height,
+      centerY,
+      height,
+      pageWidth,
+      pageHeight,
+      hasGeometry: Boolean(bbox || relativeY !== null)
+    };
+  }
+
+  function getMedianPdfOcrLineHeight(lines) {
+    const heights = (Array.isArray(lines) ? lines : [])
+      .map((line, index) => getPdfOcrLineSortMetrics(line, index).height)
+      .filter((height) => Number.isFinite(height) && height > 0)
+      .sort((a, b) => a - b);
+    if (!heights.length) return 12;
+    return heights[Math.floor(heights.length / 2)] || 12;
+  }
+
+  function sortPdfOcrLinesByReadingOrder(lines) {
+    if (!Array.isArray(lines) || lines.length < 2) return Array.isArray(lines) ? lines.slice() : [];
+    const medianHeight = getMedianPdfOcrLineHeight(lines);
+    const rowTolerance = Math.max(6, medianHeight * 0.72);
+    const items = lines.map((line, index) => ({
+      line,
+      metrics: getPdfOcrLineSortMetrics(line, index)
+    }));
+    items.sort((a, b) => {
+      if (a.metrics.pageNumber !== b.metrics.pageNumber) return a.metrics.pageNumber - b.metrics.pageNumber;
+      const sameRow = Math.abs(a.metrics.centerY - b.metrics.centerY) <= rowTolerance;
+      if (!sameRow) return a.metrics.centerY - b.metrics.centerY;
+      if (Math.abs(a.metrics.x0 - b.metrics.x0) > 2) return a.metrics.x0 - b.metrics.x0;
+      return a.metrics.index - b.metrics.index;
+    });
+    const rows = [];
+    items.forEach((item) => {
+      const current = rows[rows.length - 1];
+      if (!current || current.pageNumber !== item.metrics.pageNumber || Math.abs(current.centerY - item.metrics.centerY) > rowTolerance) {
+        rows.push({
+          pageNumber: item.metrics.pageNumber,
+          centerY: item.metrics.centerY,
+          items: [item]
+        });
+        return;
+      }
+      current.items.push(item);
+      current.centerY = (current.centerY * (current.items.length - 1) + item.metrics.centerY) / current.items.length;
+    });
+    return rows.flatMap((row) => row.items.sort((a, b) => a.metrics.x0 - b.metrics.x0 || a.metrics.index - b.metrics.index).map((item) => item.line));
+  }
+
+  function isPdfOcrProtectedHyphenJoin(leftText, rightText) {
+    const leftToken = String(leftText || "").trim().split(/\s+/).pop() || "";
+    const rightToken = String(rightText || "").trim().split(/\s+/)[0] || "";
+    const combined = `${leftToken}${rightToken}`.replace(/^-|-$/g, "");
+    if (!leftToken || !rightToken) return true;
+    if (/\d/.test(leftToken) || /\d/.test(rightToken)) return true;
+    if (/[A-Z]{2,}/.test(leftToken) || /^[A-Z]{2,}/.test(rightToken)) return true;
+    if (/[/.]/.test(leftToken) || /[/.]/.test(rightToken)) return true;
+    if (/^[A-Z][a-z]+-$/.test(leftToken) && /^[A-Z][a-z]+/.test(rightToken)) return true;
+    if (combined.length < 5) return true;
+    return false;
+  }
+
+  function joinPdfOcrLineTexts(leftText, rightText) {
+    const left = normalizePdfOcrLineTextSpacing(leftText);
+    const right = normalizePdfOcrLineTextSpacing(rightText);
+    if (!left) return right;
+    if (!right) return left;
+    if (/-$/.test(left) && /^[A-Za-z]/.test(right) && !isPdfOcrProtectedHyphenJoin(left, right)) {
+      return normalizePdfOcrLineTextSpacing(`${left.slice(0, -1)}${right}`);
+    }
+    return normalizePdfOcrLineTextSpacing(`${left} ${right}`);
+  }
+
+  function shouldJoinPdfOcrWrappedLine(previousLine, nextLine, context = {}) {
+    if (!previousLine || !nextLine) return false;
+    const previous = normalizePdfOcrLineTextSpacing(previousLine.text || previousLine.rawText || "");
+    const next = normalizePdfOcrLineTextSpacing(nextLine.text || nextLine.rawText || "");
+    if (!previous || !next) return false;
+    if (isRecoveredPdfOcrGreetingLine(previous) || isRecoveredPdfOcrClosingLine(previous) || isRecoveredPdfOcrClosingLine(next)) return false;
+    if (/^(?:our\s+ref|your\s+ref|ref(?:erence)?\.?|date|telephone|telex|fax)\b/i.test(previous)) return false;
+    if (!/-$/.test(previous) && (startsWithRecoveredPdfOcrAdministrativeText(previous) || startsWithRecoveredPdfOcrAdministrativeText(next))) return false;
+    const previousMetrics = getPdfOcrLineSortMetrics(previousLine, Number(context.previousIndex) || 0);
+    const nextMetrics = getPdfOcrLineSortMetrics(nextLine, Number(context.nextIndex) || previousMetrics.index + 1);
+    if (previousMetrics.pageNumber !== nextMetrics.pageNumber) return false;
+    const medianHeight = Number(context.medianHeight) || Math.max(previousMetrics.height, nextMetrics.height, 12);
+    const verticalGap = Math.max(0, nextMetrics.y0 - previousMetrics.y1);
+    if (verticalGap > Math.max(18, medianHeight * 1.7)) return false;
+    const sameRowFragment = Math.abs(previousMetrics.centerY - nextMetrics.centerY) <= Math.max(4, medianHeight * 0.45)
+      && nextMetrics.x0 >= previousMetrics.x1
+      && (nextMetrics.x0 - previousMetrics.x1) <= Math.max(28, Math.min(160, (previousMetrics.pageWidth || nextMetrics.pageWidth || 800) * 0.2));
+    if (sameRowFragment && !/[.!?;:]$/.test(previous)) return true;
+    const leftDelta = Math.abs(nextMetrics.x0 - previousMetrics.x0);
+    const indentForward = nextMetrics.x0 > previousMetrics.x0 + Math.max(18, medianHeight * 1.4);
+    const sameColumn = leftDelta <= Math.max(32, medianHeight * 3.4) || indentForward;
+    if (!sameColumn && !/-$/.test(previous)) return false;
+    if (/-$/.test(previous) && /^[A-Za-z]/.test(next)) return !isPdfOcrProtectedHyphenJoin(previous, next);
+    if (/[.!?;:]$/.test(previous)) return false;
+    if (/^[a-z,;:)]/.test(next)) return true;
+    if (/\b(?:and|or|but|that|which|with|for|to|of|in|on|from|because|therefore|please|regarding)\b/i.test(next.split(/\s+/).slice(0, 2).join(" "))) return true;
+    const previousWords = countPdfWords(previous);
+    const nextWords = countPdfWords(next);
+    return previousWords >= 5 && nextWords >= 3 && nextWords <= 22 && verticalGap <= Math.max(10, medianHeight * 1.05);
+  }
+
+  function getPdfOcrReadableWordRatio(text) {
+    const tokens = String(text || "").match(/[A-Za-z0-9][A-Za-z0-9'./-]*/g) || [];
+    if (!tokens.length) return 0;
+    let readable = 0;
+    tokens.forEach((token) => {
+      const value = String(token || "");
+      if (/[A-Za-z]{2,}/.test(value)) {
+        const letters = (value.match(/[A-Za-z]/g) || []).length;
+        const noisy = (value.match(/[^A-Za-z0-9'./-]/g) || []).length;
+        if (letters >= 2 && noisy === 0) readable += 1;
+        return;
+      }
+      if (/^\d{1,4}(?:[./-]\d{1,4})*$/.test(value)) readable += 1;
+      else if (/^[A-Z]{1,6}\d{1,6}[A-Z0-9/-]*$/i.test(value)) readable += 1;
+    });
+    return Math.max(0, Math.min(1, readable / tokens.length));
+  }
+
+  function getPdfOcrLineCoverage(lines) {
+    const source = Array.isArray(lines) ? lines : [];
+    const nonEmpty = source.filter((line) => String(line && (line.text || line.rawText) || "").trim());
+    if (!nonEmpty.length) return 0;
+    const withGeometry = nonEmpty.filter((line, index) => getPdfOcrLineSortMetrics(line, index).hasGeometry);
+    const confidences = nonEmpty.map((line) => Number(line && line.confidence)).filter((value) => Number.isFinite(value) && value > 0);
+    const confidenceFactor = confidences.length
+      ? Math.max(0.35, Math.min(1, (confidences.reduce((sum, value) => sum + value, 0) / confidences.length) / 85))
+      : 0.55;
+    const geometryFactor = withGeometry.length / nonEmpty.length;
+    const lineFactor = Math.min(1, nonEmpty.length / 8);
+    return Math.max(0, Math.min(1, lineFactor * 0.35 + geometryFactor * 0.35 + confidenceFactor * 0.3));
+  }
+
+  function getPdfOcrPageCoverage(lines) {
+    const source = Array.isArray(lines) ? lines : [];
+    const metrics = source
+      .map((line, index) => getPdfOcrLineSortMetrics(line, index))
+      .filter((metric) => metric && metric.hasGeometry && metric.pageHeight > 0);
+    if (!metrics.length) {
+      return {
+        score: 0,
+        verticalSpan: 0,
+        hasUpper: false,
+        hasMiddle: false,
+        hasLower: false,
+        top: null,
+        bottom: null
+      };
+    }
+    const relativeStarts = metrics.map((metric) => Math.max(0, Math.min(1, metric.y0 / Math.max(1, metric.pageHeight))));
+    const relativeEnds = metrics.map((metric) => Math.max(0, Math.min(1, metric.y1 / Math.max(1, metric.pageHeight))));
+    const top = Math.min(...relativeStarts);
+    const bottom = Math.max(...relativeEnds);
+    const verticalSpan = Math.max(0, bottom - top);
+    const hasUpper = relativeStarts.some((value) => value <= 0.28);
+    const hasMiddle = metrics.some((metric) => {
+      const center = Math.max(0, Math.min(1, metric.centerY / Math.max(1, metric.pageHeight)));
+      return center >= 0.32 && center <= 0.68;
+    });
+    const hasLower = relativeEnds.some((value) => value >= 0.72);
+    const regionScore = (hasUpper ? 0.24 : 0) + (hasMiddle ? 0.34 : 0) + (hasLower ? 0.24 : 0);
+    const spanScore = Math.min(0.18, verticalSpan * 0.24);
+    return {
+      score: Math.max(0, Math.min(1, regionScore + spanScore)),
+      verticalSpan: Math.round(verticalSpan * 1000) / 1000,
+      hasUpper,
+      hasMiddle,
+      hasLower,
+      top: Math.round(top * 1000) / 1000,
+      bottom: Math.round(bottom * 1000) / 1000
+    };
+  }
+
+  function getPdfOcrParagraphContinuity(text, lines = []) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    const words = countPdfWords(value);
+    if (!words) return 0;
+    const lineTexts = (Array.isArray(lines) ? lines : []).map((line) => String(line && (line.text || line.rawText) || "").trim()).filter(Boolean);
+    const substantiveLines = lineTexts.filter((line) => countPdfWords(line) >= 5).length;
+    const sentenceCount = (value.match(/[.!?](?:\s|$)/g) || []).length;
+    const continuationHits = countPatternHits(value, /\b(?:because|therefore|which|that|please|regarding|enclosed|permit me|i would like|as a result|this signal|in facsimile|at the|remote terminal)\b/gi);
+    const lineScore = Math.min(0.36, substantiveLines / 10);
+    const sentenceScore = Math.min(0.28, sentenceCount / 8);
+    const continuationScore = Math.min(0.26, continuationHits / 8);
+    const lengthScore = Math.min(0.1, words / 180);
+    return Math.max(0, Math.min(1, lineScore + sentenceScore + continuationScore + lengthScore));
+  }
+
+  function getPdfOcrTextCompletenessScore(text, lines, structure, pageCoverage, paragraphContinuity, confidence) {
+    const words = countPdfWords(text);
+    let score = 0;
+    score += Math.min(0.22, words / 460);
+    score += Math.min(0.18, (Array.isArray(lines) ? lines.length : 0) / 80);
+    score += Math.max(0, Math.min(1, pageCoverage && pageCoverage.score || 0)) * 0.22;
+    score += Math.max(0, Math.min(1, paragraphContinuity || 0)) * 0.18;
+    score += Math.max(0, Math.min(1, (Number(confidence) || 0) / 100)) * 0.1;
+    if (structure && structure.complete) score += 0.1;
+    return Math.max(0, Math.min(1, score));
+  }
+
+  function hasPdfOcrLikelyAdministrativeBodyPrefix(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return false;
+    const words = value.split(/\s+/).slice(0, 18).join(" ");
+    return startsWithRecoveredPdfOcrAdministrativeText(words)
+      || /\b(?:mining surveys|surveys ltd|holroyd|holy\s+road|reading|berks|telephone|telex|our\s+ref|your\s+ref)\b/i.test(words);
+  }
+
+  function getPdfOcrMissedRegionLikely(candidate, structure, pageCoverage, paragraphContinuity, confidence) {
+    const text = String(candidate && candidate.text || "");
+    const source = String(candidate && candidate.source || "");
+    const variant = String(candidate && (candidate.recognitionVariant || candidate.ocrVariantName) || "");
+    const words = Number(candidate && candidate.words) || countPdfWords(text);
+    const isVisibleOrUltra = /visible|ultra-fast/i.test(`${source} ${variant}`);
+    const letterLike = Boolean(structure && structure.letterLike)
+      || /\b(?:dear|our\s+ref|your\s+ref|telephone|telex|yours sincerely|yours faithfully|permit me to introduce)\b/i.test(text);
+    const hasGreeting = /\bdear\b/i.test(text);
+    const hasClosing = /\b(?:yours sincerely|yours faithfully|sincerely|faithfully)\b/i.test(text);
+    const lowConfidence = Number(confidence) > 0 && Number(confidence) < 68;
+    const weakCoverage = !pageCoverage || pageCoverage.score < 0.62 || !pageCoverage.hasMiddle || (letterLike && !pageCoverage.hasLower);
+    const weakContinuity = paragraphContinuity < 0.38 && words >= PDF_RECOVERY_MIN_WORDS;
+    const adminBody = Boolean(structure && structure.administrativePrefix);
+    return Boolean(
+      words >= PDF_RECOVERY_MIN_WORDS
+      && (
+        (isVisibleOrUltra && (lowConfidence || weakCoverage || weakContinuity))
+        || (letterLike && hasGreeting && !hasClosing && isVisibleOrUltra && words < 180)
+        || (letterLike && adminBody)
+      )
+    );
+  }
+
+  function evaluatePdfOcrTextQuality(candidate, structure = null) {
+    const text = String(candidate && candidate.text || "");
+    const lines = Array.isArray(candidate && candidate.lines) ? candidate.lines : [];
+    const words = Number(candidate && candidate.words) || countPdfWords(text);
+    const confidence = Number(candidate && candidate.confidence) || averageLineConfidence(lines);
+    const readableWordRatio = getPdfOcrReadableWordRatio(text);
+    const lineCoverage = getPdfOcrLineCoverage(lines);
+    const pageCoverageDetails = getPdfOcrPageCoverage(lines);
+    const pageCoverage = pageCoverageDetails.score;
+    const paragraphContinuity = getPdfOcrParagraphContinuity(text, lines);
+    const textCompleteness = getPdfOcrTextCompletenessScore(text, lines, structure, pageCoverageDetails, paragraphContinuity, confidence);
+    const lineTexts = lines.map((line) => String(line && line.text || "").trim()).filter(Boolean);
+    const repeated = getRepeatedPdfLineCount(lineTexts);
+    const shortLines = lineTexts.filter((line) => countPdfWords(line) <= 2).length;
+    const noisyLines = lineTexts.filter((line) => {
+      const clean = line.replace(/\s+/g, "");
+      if (!clean) return false;
+      const symbolCount = (clean.match(/[^A-Za-z0-9.,;:'"()/&-]/g) || []).length;
+      const letterCount = (clean.match(/[A-Za-z]/g) || []).length;
+      return symbolCount >= Math.max(2, clean.length * 0.18) || (clean.length >= 8 && letterCount > 0 && letterCount < clean.length * 0.34);
+    }).length;
+    const fragmentRatio = lineTexts.length ? shortLines / lineTexts.length : words ? 0.35 : 1;
+    const noiseRatio = lineTexts.length ? noisyLines / lineTexts.length : 0;
+    const missedRegionLikely = getPdfOcrMissedRegionLikely(candidate, structure, pageCoverageDetails, paragraphContinuity, confidence);
+    const corrupted = Boolean(
+      words > 0
+      && (
+        readableWordRatio < 0.55
+        || fragmentRatio > 0.7
+        || noiseRatio > 0.36
+        || repeated >= Math.max(3, Math.ceil(lineTexts.length * 0.34))
+      )
+    );
+    const completeStructure = structure
+      ? Boolean(structure.complete)
+      : words >= PDF_RECOVERY_MIN_WORDS;
+    const readable = Boolean(words >= PDF_OCR_SHORT_MEANINGFUL_WORDS && readableWordRatio >= 0.62 && lineCoverage >= 0.42 && confidence >= 54 && !corrupted);
+    let score = 0;
+    score += Math.min(30, words / 5);
+    score += Math.min(25, confidence / 4);
+    score += readableWordRatio * 25;
+    score += lineCoverage * 15;
+    score += pageCoverage * 12;
+    score += paragraphContinuity * 10;
+    score += textCompleteness * 12;
+    if (structure && structure.complete) score += 18;
+    if (structure && structure.oneLargeSection) score -= 18;
+    if (structure && structure.administrativePrefix) score -= 18;
+    if (structure && (structure.researchLike || structure.reportLike || structure.formLike) && structure.complete) score += 10;
+    if (missedRegionLikely) score -= 26;
+    if (corrupted) score -= 28;
+    const complete = Boolean(readable && completeStructure && !missedRegionLikely && textCompleteness >= 0.48);
+    const selectedVariantReason = corrupted
+      ? "OCR text contains too much noise or fragmented output."
+      : missedRegionLikely
+        ? "OCR text appears incomplete or misses important page regions."
+        : complete
+          ? "OCR text is readable, structurally complete, and covers the page."
+          : "OCR text is usable but not complete enough for an early stop.";
+    return {
+      readable,
+      structurallyComplete: completeStructure,
+      complete,
+      corrupted,
+      missedRegionLikely,
+      readableWordRatio: Math.round(readableWordRatio * 1000) / 1000,
+      lineCoverage: Math.round(lineCoverage * 1000) / 1000,
+      pageCoverage: Math.round(pageCoverage * 1000) / 1000,
+      pageCoverageDetails,
+      paragraphContinuity: Math.round(paragraphContinuity * 1000) / 1000,
+      textCompleteness: Math.round(textCompleteness * 1000) / 1000,
+      fragmentRatio: Math.round(fragmentRatio * 1000) / 1000,
+      noiseRatio: Math.round(noiseRatio * 1000) / 1000,
+      repeatedLines: repeated,
+      confidence: Math.round(confidence || 0),
+      words,
+      selectedVariantReason,
+      score: Math.max(0, Math.min(100, Math.round(score)))
+    };
+  }
+
+  function reconstructPdfOcrTextFromLines(lines, options = {}) {
+    const normalized = normalizePdfRecoveryLines(lines);
+    const ordered = sortPdfOcrLinesByReadingOrder(normalized).map((line, index) => ({ ...line, readingOrder: index }));
+    if (!ordered.length) {
+      const fallbackText = normalizePdfOcrLineTextSpacing(options.fallbackText || "");
+      const quality = evaluatePdfOcrTextQuality({ text: fallbackText, lines: [], words: countPdfWords(fallbackText), confidence: 0 });
+      return {
+        text: fallbackText,
+        reconstructedText: fallbackText,
+        rawText: String(options.fallbackText || ""),
+        lines: [],
+        paragraphs: fallbackText ? [fallbackText] : [],
+        stats: {
+          lineCount: 0,
+          paragraphCount: fallbackText ? 1 : 0,
+          joinedLines: 0,
+          hyphenatedJoins: 0,
+          ...quality
+        }
+      };
+    }
+    const medianHeight = getMedianPdfOcrLineHeight(ordered);
+    const paragraphs = [];
+    const paragraphLineIds = [];
+    let current = "";
+    let currentIds = [];
+    let joinedLines = 0;
+    let hyphenatedJoins = 0;
+    ordered.forEach((line, index) => {
+      const clean = normalizePdfOcrLineTextSpacing(line.text || line.rawText || "");
+      if (!clean) return;
+      const previous = index > 0 ? ordered[index - 1] : null;
+      const join = current && previous && shouldJoinPdfOcrWrappedLine(previous, line, {
+        medianHeight,
+        previousIndex: index - 1,
+        nextIndex: index
+      });
+      if (join) {
+        if (/-$/.test(current)) hyphenatedJoins += 1;
+        current = joinPdfOcrLineTexts(current, clean);
+        currentIds = currentIds.concat(line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : line.sourceLineId ? [line.sourceLineId] : []);
+        joinedLines += 1;
+        return;
+      }
+      if (current) {
+        paragraphs.push(current);
+        paragraphLineIds.push(currentIds);
+      }
+      current = clean;
+      currentIds = line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds.slice() : line.sourceLineId ? [line.sourceLineId] : [];
+    });
+    if (current) {
+      paragraphs.push(current);
+      paragraphLineIds.push(currentIds);
+    }
+    const text = paragraphs.join("\n\n").trim();
+    const confidence = averageLineConfidence(ordered);
+    const quality = evaluatePdfOcrTextQuality({
+      text,
+      lines: ordered,
+      words: countPdfWords(text),
+      confidence
+    });
+    return {
+      text,
+      reconstructedText: text,
+      rawText: String(options.fallbackText || ordered.map((line) => line.rawText || line.text || "").join("\n")).trim(),
+      lines: ordered,
+      paragraphs,
+      paragraphLineIds,
+      stats: {
+        lineCount: ordered.length,
+        paragraphCount: paragraphs.length,
+        joinedLines,
+        hyphenatedJoins,
+        ...quality
+      }
+    };
+  }
+
   function normalizePdfRecoveryLines(lines) {
     if (!Array.isArray(lines)) return [];
     return lines
       .map((line, index) => {
-        const text = String(line && line.text ? line.text : "").replace(/\s+/g, " ").trim();
+        const rawText = String(line && (line.rawText || line.text) || "");
+        const text = normalizePdfOcrLineTextSpacing(line && line.text ? line.text : rawText);
         if (!text) return null;
         const geometry = getPdfOcrLineGeometry(line);
         const relativeY = Number(line && line.relativeY);
@@ -2126,6 +2927,7 @@
           relativeYStart: safeStart !== null ? safeStart : safeRelativeY,
           relativeYEnd: safeEnd !== null ? safeEnd : safeRelativeY,
           confidence: Number.isFinite(Number(line && line.confidence)) ? Math.round(Number(line.confidence)) : 0,
+          pageNumber: Number(line && line.pageNumber) || 1,
           bbox: geometry && geometry.bbox || null,
           pageWidth: geometry && geometry.pageWidth || 0,
           pageHeight: geometry && geometry.pageHeight || 0,
@@ -2136,7 +2938,7 @@
           sourceLineIds: Array.isArray(line && line.sourceLineIds)
             ? line.sourceLineIds.map((id) => String(id).slice(0, 140)).filter(Boolean).slice(0, 12)
             : geometry && Array.isArray(geometry.sourceLineIds) ? geometry.sourceLineIds : [],
-          rawText: String(line && (line.rawText || line.text) || text).slice(0, 500),
+          rawText: rawText.slice(0, 500),
           sourceBBox: line && line.sourceBBox || null,
           cropOffset: line && line.cropOffset || geometry && geometry.cropOffset || null,
           renderScale: Number.isFinite(Number(line && line.renderScale || geometry && geometry.renderScale)) ? Number(line && line.renderScale || geometry && geometry.renderScale) : 0,
@@ -2177,6 +2979,11 @@
       partial: Boolean(entry.partial),
       pagesRead: Number(entry.pagesRead) || pages.length,
       words,
+      rawText: String(entry.rawText || pages.map((page) => page.rawText || "").filter(Boolean).join("\n\n")).slice(0, 120000),
+      reconstructedText: String(entry.reconstructedText || (isPdfOcrSourceType(source) ? text : "")).slice(0, 120000),
+      ocrTextQuality: entry.ocrTextQuality && typeof entry.ocrTextQuality === "object"
+        ? { ...entry.ocrTextQuality }
+        : isPdfOcrSourceType(source) ? evaluatePdfOcrTextQuality({ text, lines: pages.flatMap((page) => page.lines || []), words, confidence: entry.confidence }) : null,
       numPages: Number(entry.numPages) || 0,
       ocrQuality: quality.quality,
       qualityMessage: quality.message,
@@ -2259,6 +3066,7 @@
           },
           unitMeta: {
             kind: String(unitMeta.kind || "pdfjs-page").slice(0, 80),
+            sectionId: String(unitMeta.sectionId || id).slice(0, 160),
             pageNumber,
             pdfSectionType: String(unitMeta.pdfSectionType || metrics.pdfSectionType || "").slice(0, 80),
             ocrRole: String(unitMeta.ocrRole || metrics.ocrRole || "").slice(0, 80),
@@ -2275,8 +3083,12 @@
             ocrHighlightApproximate: Boolean(unitMeta.ocrHighlightApproximate),
             ocrVariantName: String(unitMeta.ocrVariantName || "").slice(0, 80),
             sourceLineIds: Array.isArray(unitMeta.sourceLineIds) ? unitMeta.sourceLineIds.map((id) => String(id).slice(0, 140)).filter(Boolean).slice(0, 120) : [],
+            ocrSourceLines: normalizePdfOcrSourceLines(unitMeta.ocrSourceLines),
             sourceLineTextSample: String(unitMeta.sourceLineTextSample || "").replace(/\s+/g, " ").trim().slice(0, 260),
+            sectionText: String(unitMeta.sectionText || text).slice(0, 7000),
             sectionTextSample: String(unitMeta.sectionTextSample || text.slice(0, 260)).replace(/\s+/g, " ").trim().slice(0, 260),
+            ocrPageWidth: Number(unitMeta.ocrPageWidth || unitMeta.pageWidth || 0) || 0,
+            ocrPageHeight: Number(unitMeta.ocrPageHeight || unitMeta.pageHeight || 0) || 0,
             cropOffset: unitMeta.cropOffset && typeof unitMeta.cropOffset === "object" ? unitMeta.cropOffset : null,
             renderScale: Number.isFinite(Number(unitMeta.renderScale)) ? Number(unitMeta.renderScale) : 0,
             rotation: Number.isFinite(Number(unitMeta.rotation)) ? Number(unitMeta.rotation) : 0,
@@ -2289,7 +3101,8 @@
             ocr: Boolean(unitMeta.ocr),
             syntheticTop: Number(unitMeta.syntheticTop) || pageNumber * 100000 + index * 1000,
             words: Number(unitMeta.words) || countPdfWords(text)
-          }
+          },
+          intelligence: normalizeSectionIntelligenceForPublic(section, "pdf")
         };
       })
       .filter(Boolean);
@@ -2334,7 +3147,8 @@
       isImportant: section.isImportant,
       isBest: section.isBest,
       metrics: section.metrics,
-      unitMeta: section.unitMeta
+      unitMeta: section.unitMeta,
+      intelligence: section.intelligence
     }));
     return normalizePdfMapSnapshot({
       version: 1,
@@ -2696,6 +3510,20 @@
       || /\b(?:dear|our\s+ref|your\s+ref|telephone|telex|yours sincerely|yours faithfully)\b/i.test(text)
     );
     const bodyChunks = chunks.filter((chunk) => normalizeRecoveredPdfOcrRole(chunk && chunk.ocrRole) === "body" && countWords(chunk.text) >= 8);
+    const strongContentRoles = ["body", "abstract", "results", "discussion", "conclusion", "report_summary", "recommendations", "form_notice", "table", "invoice_summary", "total_due"];
+    const researchRoles = ["title", "abstract", "introduction", "methods", "results", "discussion", "conclusion", "references"];
+    const reportRoles = ["report_summary", "results", "recommendations", "conclusion"];
+    const formRoles = ["form_notice", "table", "line_items", "total_due", "invoice_summary"];
+    const contentChunks = chunks.filter((chunk) => {
+      const role = normalizeRecoveredPdfOcrRole(chunk && chunk.ocrRole);
+      return strongContentRoles.includes(role) && countWords(chunk.text) >= (role === "total_due" ? 3 : 8);
+    });
+    const researchLike = researchRoles.filter((role) => roleCounts[role]).length >= 2
+      || /\b(?:abstract|introduction|methods?|results?|findings?|discussion|conclusions?|references|bibliography)\b/i.test(text);
+    const reportLike = reportRoles.filter((role) => roleCounts[role]).length >= 2
+      || /\b(?:executive summary|findings?|recommendations?|conclusions?|report)\b/i.test(text);
+    const formLike = formRoles.filter((role) => roleCounts[role]).length >= 1
+      || /\b(?:notice|form|determination|claim number|case number|respond by|deadline|invoice|receipt|total due|amount due)\b/i.test(text);
     const bodyWords = bodyChunks.reduce((sum, chunk) => sum + countWords(chunk.text), 0);
     const greetingLine = chunks.find((chunk) => normalizeRecoveredPdfOcrRole(chunk && chunk.ocrRole) === "greeting");
     const greetingOrder = greetingLine ? Number(greetingLine.lineEnd ?? greetingLine.lineStart ?? -1) : -1;
@@ -2705,7 +3533,8 @@
     });
     const administrativePrefix = bodyChunks.some((chunk) => startsWithRecoveredPdfOcrAdministrativeText(chunk.text));
     const oneLargeSection = sectionCount <= 1 && words >= PDF_RECOVERY_MIN_WORDS;
-    const usefulRoleCount = ["letterhead", "date_reference", "recipient", "greeting", "body", "closing", "signature"].filter((role) => roleCounts[role]).length;
+    const usefulRoleCount = ["letterhead", "date_reference", "recipient", "greeting", "body", "closing", "signature", "abstract", "results", "conclusion", "report_summary", "recommendations", "form_notice", "table", "invoice_summary", "total_due"].filter((role) => roleCounts[role]).length;
+    const meaningfulStructure = contentChunks.length >= 1 && sectionCount >= 2 && !oneLargeSection;
     let score = 35;
     if (words >= PDF_RECOVERY_MIN_WORDS) score += 10;
     if (words >= 100) score += 10;
@@ -2713,16 +3542,29 @@
     if (sectionCount >= 3) score += 16;
     if (bodyChunks.length) score += 18;
     if (bodyAfterGreeting) score += 14;
+    if (contentChunks.length >= 1) score += 14;
+    if (contentChunks.length >= 2) score += 10;
+    if (roleCounts.results || roleCounts.conclusion || roleCounts.recommendations) score += 12;
+    if (roleCounts.form_notice || roleCounts.total_due) score += 10;
     if (usefulRoleCount >= 3) score += 12;
     if (oneLargeSection) score -= 32;
     if (administrativePrefix) score -= 30;
     if (letterLike && !roleCounts.greeting) score -= 12;
     const complete = letterLike
-      ? Boolean(sectionCount >= 3 && bodyChunks.length && bodyAfterGreeting && !administrativePrefix && usefulRoleCount >= 3 && (words >= 150 || bodyWords >= 75))
-      : Boolean(sectionCount >= 1 && words >= PDF_RECOVERY_MIN_WORDS);
+      ? Boolean(sectionCount >= 3 && bodyChunks.length && bodyAfterGreeting && !administrativePrefix && usefulRoleCount >= 3 && (words >= 100 || bodyWords >= 55))
+      : researchLike
+        ? Boolean(meaningfulStructure && (roleCounts.results || roleCounts.conclusion || roleCounts.abstract) && words >= PDF_RECOVERY_MIN_WORDS)
+        : reportLike
+          ? Boolean(meaningfulStructure && (roleCounts.results || roleCounts.recommendations || roleCounts.conclusion || roleCounts.report_summary) && words >= PDF_RECOVERY_MIN_WORDS)
+          : formLike
+            ? Boolean(contentChunks.length >= 1 && sectionCount >= 2 && !oneLargeSection && words >= Math.min(PDF_RECOVERY_MIN_WORDS, 55))
+            : Boolean(sectionCount >= 2 && words >= PDF_RECOVERY_MIN_WORDS && !oneLargeSection);
     return {
       complete,
       letterLike,
+      researchLike,
+      reportLike,
+      formLike,
       score: Math.max(0, Math.min(100, Math.round(score))),
       sections: sectionCount,
       words,
@@ -2732,6 +3574,7 @@
       oneLargeSection,
       bodySections: bodyChunks.length,
       bodyWords,
+      contentSections: contentChunks.length,
       usefulRoleCount
     };
   }
@@ -3280,6 +4123,7 @@
       section.usefulScore = Number.isFinite(Number(section.usefulScore)) ? Number(section.usefulScore) : Math.max(30, Math.round(section.score * 0.62));
       section.importanceScore = Number.isFinite(Number(section.importanceScore)) ? Number(section.importanceScore) : section.score;
       section.label = String(section.label || "").trim();
+      section.intelligence = normalizeSectionIntelligenceForPublic(section, "pdf");
       return section;
     });
 
@@ -3608,6 +4452,7 @@
         usefulScore: section.usefulScore,
         importanceScore: section.importanceScore,
         label: section.label,
+        intelligence: normalizeSectionIntelligenceForPublic(section, "pdf"),
         isImportant: section.isImportant || importantIds.has(section.id),
         isBest: section.isBest || section.id === snapshot.bestSectionId
       };
@@ -3735,22 +4580,58 @@
       const text = cleanText(page && page.text);
       const words = countPdfWords(text);
       if (!text || words < 1) return;
+      const structuredChunks = buildRecoveredPdfOcrLetterChunks(page, cleanText, countPdfWords);
+      if (structuredChunks.length) {
+        structuredChunks.forEach((chunk, index) => {
+          fallbackChunks.push({
+            ...chunk,
+            pageNumber,
+            chunkIndex: fallbackChunks.length,
+            chunkCount: structuredChunks.length,
+            text: cleanText(chunk.text),
+            sectionText: cleanText(chunk.sectionText || chunk.text),
+            words: Number(chunk.words) || countPdfWords(chunk.text)
+          });
+        });
+        return;
+      }
+      const lineBacked = buildRecoveredPdfOcrLineBackedChunk(page && page.lines || [], "unknown", cleanText, countPdfWords, {
+        pageNumber,
+        chunkIndex: 0,
+        chunkCount: 1
+      });
+      if (lineBacked) {
+        fallbackChunks.push({
+          ...lineBacked,
+          pageNumber,
+          chunkIndex: 0,
+          chunkCount: 1,
+          text,
+          sectionText: text,
+          words
+        });
+        return;
+      }
       const ocrGeometry = mergePdfOcrGeometries(page && page.lines || []);
       fallbackChunks.push({
         pageNumber,
         chunkIndex: 0,
         chunkCount: 1,
         text,
+        sectionText: text,
         words,
         relativeY: ocrGeometry && Number.isFinite(ocrGeometry.relativeY) ? ocrGeometry.relativeY : 0.12,
         relativeYStart: ocrGeometry && Number.isFinite(ocrGeometry.relativeYStart) ? ocrGeometry.relativeYStart : 0.08,
         relativeYEnd: ocrGeometry && Number.isFinite(ocrGeometry.relativeYEnd) ? ocrGeometry.relativeYEnd : 0.9,
         ocrGeometry,
+        pageWidth: ocrGeometry && ocrGeometry.pageWidth || 0,
+        pageHeight: ocrGeometry && ocrGeometry.pageHeight || 0,
         ocrVariantName: ocrGeometry && ocrGeometry.ocrVariantName || page && page.recognitionVariant || "",
         sourceLineIds: ocrGeometry && ocrGeometry.sourceLineIds || [],
+        ocrSourceLines: normalizePdfOcrSourceLines(page && page.lines || []),
         sourceLineTextSample: ocrGeometry && ocrGeometry.sourceLineTextSample || text.slice(0, 260),
-        ocrGeometryExact: Boolean(ocrGeometry && ocrGeometry.exact && ocrGeometry.sourceLineIds && ocrGeometry.sourceLineIds.length),
-        ocrHighlightApproximate: !Boolean(ocrGeometry && ocrGeometry.exact && ocrGeometry.sourceLineIds && ocrGeometry.sourceLineIds.length)
+        ocrGeometryExact: Boolean(ocrGeometry && ocrGeometry.exact && ocrGeometry.sourceLineIds && ocrGeometry.sourceLineIds.length && isPdfOcrExactGeometryUsable(ocrGeometry)),
+        ocrHighlightApproximate: !Boolean(ocrGeometry && ocrGeometry.exact && ocrGeometry.sourceLineIds && ocrGeometry.sourceLineIds.length && isPdfOcrExactGeometryUsable(ocrGeometry))
       });
     });
     if (!fallbackChunks.length) return null;
@@ -3766,15 +4647,22 @@
       const sectionKind = ocrRole ? recoveredPdfOcrRoleKind(ocrRole) : "ocr_page";
       const sectionKindLabel = ocrRoleLabel || "OCR page";
       const selectionReason = ocrRole ? recoveredPdfOcrSelectionReason(ocrRole, chunk.text) : "simple OCR page fallback after parser/scoring failure";
-      const score = Math.max(58, Math.min(92, 68 + Math.min(14, Math.floor(chunk.words / 45)) - index + (ocrRole === "body" ? 16 : 0)));
+      const roleEvidence = getRecoveredPdfOcrRoleEvidence(ocrRole, chunk.text, {
+        sourceLines: chunk.ocrSourceLines,
+        words: chunk.words
+      });
+      const score = Math.max(24, Math.min(96, scoreRecoveredPdfChunk({ ...chunk, ocrRole }, index, fallbackChunks.length, "ocr_fallback")));
       const syntheticTop = chunk.pageNumber * 100000 + index * 1000;
       const id = `pp-pdf-ocr-fallback-${chunk.pageNumber}-${index}`;
       const unitMeta = {
         kind: "pdf-ocr",
+        sectionId: id,
         pageNumber: chunk.pageNumber,
         pdfSectionType: "ocr_fallback",
         ocrRole,
         ocrRoleLabel,
+        ocrRoleConfidence: roleEvidence.confidence,
+        ocrRoleReasons: roleEvidence.reasons,
         chunkIndex: index,
         chunkCount: 1,
         relativeY: chunk.relativeY,
@@ -3786,10 +4674,14 @@
         ocrHighlightApproximate: Boolean(chunk.ocrHighlightApproximate) || !Boolean(chunk.ocrGeometryExact && normalizePdfOcrGeometry(chunk.ocrGeometry || chunk) && normalizePdfOcrGeometry(chunk.ocrGeometry || chunk).exact),
         ocrVariantName: chunk.ocrVariantName || "",
         sourceLineIds: Array.isArray(chunk.sourceLineIds) ? chunk.sourceLineIds.slice(0, 120) : [],
+        ocrSourceLines: normalizePdfOcrSourceLines(chunk.ocrSourceLines),
         sourceLineTextSample: chunk.sourceLineTextSample || chunk.text.slice(0, 260),
-        sectionTextSample: chunk.text.slice(0, 260),
-        lineStart: 0,
-        lineEnd: 0,
+        sectionText: String(chunk.sectionText || chunk.text || "").slice(0, 7000),
+        sectionTextSample: String(chunk.sectionText || chunk.text || "").slice(0, 260),
+        ocrPageWidth: Number(chunk.pageWidth || chunk.ocrGeometry && chunk.ocrGeometry.pageWidth || 0) || 0,
+        ocrPageHeight: Number(chunk.pageHeight || chunk.ocrGeometry && chunk.ocrGeometry.pageHeight || 0) || 0,
+        lineStart: Number(chunk.lineStart) || 0,
+        lineEnd: Number(chunk.lineEnd) || 0,
         excerpt: chunk.text.slice(0, 240),
         navigationTarget: `#page=${chunk.pageNumber}`,
         synthetic: true,
@@ -3832,8 +4724,15 @@
           pdfSectionType: "ocr_fallback",
           ocrRole,
           ocrRoleLabel,
+          ocrRoleConfidence: roleEvidence.confidence,
+          ocrRoleReasons: roleEvidence.reasons,
           matched: {
-            ocrLetterBody: ocrRole === "body"
+            ocrLetterBody: ocrRole === "body",
+            ocrResults: ocrRole === "results",
+            ocrConclusion: ocrRole === "conclusion",
+            ocrRecommendations: ocrRole === "recommendations",
+            ocrFormNotice: ocrRole === "form_notice",
+            ocrTotalDue: ocrRole === "total_due"
           },
           selectionReason
         },
@@ -3846,7 +4745,7 @@
       };
     });
     const ranked = [...sections].sort(compareRecoveredPdfSections);
-    const best = ranked.find((section) => section.metrics && section.metrics.ocrRole === "body") || ranked[0] || sections[0];
+    const best = ranked.find((section) => isRecoveredPdfOcrStrongContentRole(section && section.metrics && section.metrics.ocrRole)) || ranked[0] || sections[0];
     const importantLimit = Math.min(9, Math.max(1, Math.ceil(sections.length * 0.35)));
     const importantIds = new Set(ranked.slice(0, importantLimit).map((section) => section.id));
     sections.forEach((section) => {
@@ -4094,8 +4993,12 @@
           ocrGeometry: entry.source === "ocr" ? normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)) : null,
           ocrVariantName: entry.source === "ocr" ? String(chunk && chunk.ocrVariantName || chunk && chunk.ocrGeometry && chunk.ocrGeometry.ocrVariantName || "").slice(0, 80) : "",
           sourceLineIds: entry.source === "ocr" && Array.isArray(chunk && chunk.sourceLineIds) ? chunk.sourceLineIds.map((id) => String(id).slice(0, 140)).filter(Boolean).slice(0, 120) : [],
+          ocrSourceLines: entry.source === "ocr" ? normalizePdfOcrSourceLines(chunk && chunk.ocrSourceLines) : [],
           sourceLineTextSample: entry.source === "ocr" ? String(chunk && (chunk.sourceLineTextSample || chunk.text) || "").replace(/\s+/g, " ").trim().slice(0, 260) : "",
-          ocrGeometryExact: entry.source === "ocr" ? Boolean(chunk && chunk.ocrGeometryExact !== false && normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)) && normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)).exact && Array.isArray(chunk && chunk.sourceLineIds) && chunk.sourceLineIds.length) : false,
+          sectionText: entry.source === "ocr" ? String(chunk && (chunk.sectionText || chunk.text) || "").slice(0, 7000) : "",
+          pageWidth: entry.source === "ocr" ? Number(chunk && (chunk.pageWidth || chunk.ocrGeometry && chunk.ocrGeometry.pageWidth) || 0) || 0 : 0,
+          pageHeight: entry.source === "ocr" ? Number(chunk && (chunk.pageHeight || chunk.ocrGeometry && chunk.ocrGeometry.pageHeight) || 0) || 0 : 0,
+          ocrGeometryExact: entry.source === "ocr" ? Boolean(chunk && chunk.ocrGeometryExact !== false && normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)) && normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)).exact && Array.isArray(chunk && chunk.sourceLineIds) && chunk.sourceLineIds.length && isPdfOcrExactGeometryUsable(normalizePdfOcrGeometry(chunk && (chunk.ocrGeometry || chunk)))) : false,
           ocrHighlightApproximate: entry.source === "ocr" ? Boolean(chunk && chunk.ocrHighlightApproximate) || !(Array.isArray(chunk && chunk.sourceLineIds) && chunk.sourceLineIds.length) : false,
           cropOffset: entry.source === "ocr" ? chunk && chunk.cropOffset || chunk && chunk.ocrGeometry && chunk.ocrGeometry.cropOffset || null : null,
           renderScale: entry.source === "ocr" ? Number(chunk && chunk.renderScale || chunk && chunk.ocrGeometry && chunk.ocrGeometry.renderScale || 0) || 0 : 0,
@@ -4133,10 +5036,13 @@
       const ocrGeometry = entry.source === "ocr" ? normalizePdfOcrGeometry(chunk.ocrGeometry || chunk) : null;
       const unitMeta = {
         kind: entry.source === "ocr" ? "pdf-ocr" : "pdfjs-page",
+        sectionId: id,
         pageNumber: chunk.pageNumber,
         pdfSectionType,
         ocrRole,
         ocrRoleLabel,
+        ocrRoleConfidence: Number(chunk.ocrRoleConfidence) || 0,
+        ocrRoleReasons: Array.isArray(chunk.ocrRoleReasons) ? chunk.ocrRoleReasons.slice(0, 4) : [],
         chunkIndex: chunk.chunkIndex,
         chunkCount: chunk.chunkCount,
         relativeY: chunk.relativeY,
@@ -4148,8 +5054,12 @@
         ocrHighlightApproximate: entry.source === "ocr" ? Boolean(chunk.ocrHighlightApproximate) || !Boolean(chunk.ocrGeometryExact !== false && ocrGeometry && ocrGeometry.exact && chunk.sourceLineIds && chunk.sourceLineIds.length) : false,
         ocrVariantName: chunk.ocrVariantName || ocrGeometry && ocrGeometry.ocrVariantName || "",
         sourceLineIds: Array.isArray(chunk.sourceLineIds) ? chunk.sourceLineIds.slice(0, 120) : [],
+        ocrSourceLines: normalizePdfOcrSourceLines(chunk.ocrSourceLines),
         sourceLineTextSample: chunk.sourceLineTextSample || chunk.text.slice(0, 260),
-        sectionTextSample: chunk.text.slice(0, 260),
+        sectionText: String(chunk.sectionText || chunk.text || "").slice(0, 7000),
+        sectionTextSample: String(chunk.sectionText || chunk.text || "").slice(0, 260),
+        ocrPageWidth: Number(chunk.pageWidth || ocrGeometry && ocrGeometry.pageWidth || 0) || 0,
+        ocrPageHeight: Number(chunk.pageHeight || ocrGeometry && ocrGeometry.pageHeight || 0) || 0,
         cropOffset: chunk.cropOffset || ocrGeometry && ocrGeometry.cropOffset || null,
         renderScale: Number(chunk.renderScale || ocrGeometry && ocrGeometry.renderScale || 0) || 0,
         rotation: Number(chunk.rotation || ocrGeometry && ocrGeometry.rotation || 0) || 0,
@@ -4184,6 +5094,8 @@
         metrics: buildRecoveredPdfMetrics(chunk, score, pdfSectionType, sectionKind, sectionKindLabel, {
           ocrRole,
           ocrRoleLabel,
+          ocrRoleConfidence: Number(chunk.ocrRoleConfidence) || 0,
+          ocrRoleReasons: Array.isArray(chunk.ocrRoleReasons) ? chunk.ocrRoleReasons.slice(0, 4) : [],
           selectionReason
         }),
         score,
@@ -4196,13 +5108,18 @@
     });
 
     const ranked = [...sections].sort(compareRecoveredPdfSections);
-    const usableOcrBody = entry.source === "ocr"
-      ? ranked.find((section) => section && section.metrics && section.metrics.ocrRole === "body" && Number(section.wordCount || 0) >= 25)
+    const usableOcrTarget = entry.source === "ocr"
+      ? ranked.find((section) => {
+          const role = normalizeRecoveredPdfOcrRole(section && section.metrics && section.metrics.ocrRole);
+          return isRecoveredPdfOcrStrongContentRole(role)
+            && Number(section && section.wordCount || 0) >= (role === "total_due" ? 3 : 14)
+            && !startsWithRecoveredPdfOcrAdministrativeText(section && section.text);
+        })
       : null;
-    const best = usableOcrBody || ranked.find((section) => !isRecoveredPdfLowValue(section)) || ranked[0] || sections[0];
+    const best = usableOcrTarget || ranked.find((section) => !isRecoveredPdfLowValue(section)) || ranked[0] || sections[0];
     const importantLimit = Math.min(9, Math.max(3, Math.ceil(sections.length * 0.35)));
     const importantPool = entry.source === "ocr"
-      ? ranked.filter((section) => Boolean(section.metrics && section.metrics.ocrRole === "body") || !isRecoveredPdfLowValue(section))
+      ? ranked.filter((section) => isRecoveredPdfOcrStrongContentRole(section && section.metrics && section.metrics.ocrRole) || !isRecoveredPdfLowValue(section))
       : ranked.filter((section) => !isRecoveredPdfLowValue(section));
     const importantIds = new Set(importantPool.slice(0, importantLimit).map((section) => section.id));
     sections.forEach((section) => {
@@ -4354,6 +5271,7 @@
           return {
             text,
             words: Number(line && line.words) || countWords(text),
+            pageNumber: Number(line && line.pageNumber || page && page.pageNumber) || 1,
             relativeY: safeRelativeY,
             relativeYStart: Number.isFinite(relativeYStart) ? Math.max(0, Math.min(1, relativeYStart)) : geometry && Number.isFinite(geometry.relativeYStart) ? geometry.relativeYStart : safeRelativeY,
             relativeYEnd: Number.isFinite(relativeYEnd) ? Math.max(0, Math.min(1, relativeYEnd)) : geometry && Number.isFinite(geometry.relativeYEnd) ? geometry.relativeYEnd : safeRelativeY,
@@ -4378,15 +5296,28 @@
     if (!sourceLines.length) return [];
     const greetingIndex = sourceLines.findIndex((line) => isRecoveredPdfOcrGreetingLine(line.text));
     const closingIndex = sourceLines.findIndex((line, index) => index > Math.max(-1, greetingIndex) && isRecoveredPdfOcrClosingLine(line.text));
+    const repeatedLineCounts = getRecoveredPdfOcrRepeatedLineCounts(sourceLines);
+    let activeDocumentRole = "";
     const roleLines = sourceLines.map((line, index) => {
-      const role = classifyRecoveredPdfOcrLineRole(line, {
+      let role = classifyRecoveredPdfOcrLineRole(line, {
         index,
         total: sourceLines.length,
         afterGreeting: greetingIndex >= 0 && index > greetingIndex,
         beforeGreeting: greetingIndex < 0 || index < greetingIndex,
         afterClosing: closingIndex >= 0 && index > closingIndex,
-        closingIndex
+        closingIndex,
+        repeatedLine: repeatedLineCounts.get(getRecoveredPdfOcrRepeatedLineKey(line.text)) >= 2
       });
+      const normalizedRole = normalizeRecoveredPdfOcrRole(role) || "unknown";
+      if (isRecoveredPdfOcrDocumentHeadingRole(normalizedRole)) {
+        activeDocumentRole = normalizedRole === "title" ? "" : normalizedRole;
+      } else if (
+        activeDocumentRole
+        && !["letterhead", "recipient", "date_reference", "greeting", "closing", "signature", "footer", "repeated_header", "repeated_footer", "noise"].includes(normalizedRole)
+        && !(greetingIndex >= 0 && index > greetingIndex && (closingIndex < 0 || index < closingIndex))
+      ) {
+        role = activeDocumentRole;
+      }
       return { ...line, ocrRole: role };
     });
     const chunks = [];
@@ -4398,35 +5329,8 @@
       const words = countWords(text);
       const role = getDominantRecoveredPdfOcrRole(bucket, text, words);
       if (words >= 14 || isMeaningfulShortRecoveredPdfOcrRole(role, text, words)) {
-        const ys = bucket.map((line) => line.relativeY).filter((value) => Number.isFinite(value));
-        const starts = bucket.map((line) => line.relativeYStart).filter((value) => Number.isFinite(value));
-        const ends = bucket.map((line) => line.relativeYEnd).filter((value) => Number.isFinite(value));
-        const center = ys.length ? ys.reduce((sum, value) => sum + value, 0) / ys.length : null;
-        const ocrGeometry = mergePdfOcrGeometries(bucket);
-        const sourceLineIds = Array.from(new Set(bucket.flatMap((line) => line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : [line.sourceLineId]).filter(Boolean))).slice(0, 120);
-        const variantNames = Array.from(new Set(bucket.map((line) => line.ocrVariantName).filter(Boolean)));
-        chunks.push({
-          text,
-          words,
-          ocrRole: role,
-          ocrRoleLabel: recoveredPdfOcrRoleLabel(role),
-          relativeY: ocrGeometry && Number.isFinite(ocrGeometry.relativeY) ? ocrGeometry.relativeY : center,
-          relativeYStart: ocrGeometry && Number.isFinite(ocrGeometry.relativeYStart) ? ocrGeometry.relativeYStart : starts.length ? Math.min(...starts) : Number.isFinite(center) ? Math.max(0, center - 0.025) : null,
-          relativeYEnd: ocrGeometry && Number.isFinite(ocrGeometry.relativeYEnd) ? ocrGeometry.relativeYEnd : ends.length ? Math.max(...ends) : Number.isFinite(center) ? Math.min(1, center + 0.09) : null,
-          ocrGeometry,
-          bbox: ocrGeometry && ocrGeometry.bbox || null,
-          wordBoxes: ocrGeometry && ocrGeometry.wordBoxes || [],
-          ocrVariantName: variantNames.length === 1 ? variantNames[0] : "",
-          sourceLineIds,
-          sourceLineTextSample: bucket.map((line) => line.sourceLineTextSample || line.text || "").join(" ").replace(/\s+/g, " ").trim().slice(0, 260),
-          ocrGeometryExact: Boolean(ocrGeometry && ocrGeometry.exact && sourceLineIds.length && variantNames.length <= 1),
-          ocrHighlightApproximate: !Boolean(ocrGeometry && ocrGeometry.exact && sourceLineIds.length && variantNames.length <= 1),
-          cropOffset: ocrGeometry && ocrGeometry.cropOffset || bucket.find((line) => line.cropOffset)?.cropOffset || null,
-          renderScale: Number(ocrGeometry && ocrGeometry.renderScale || bucket.find((line) => Number(line.renderScale) > 0)?.renderScale || 0),
-          rotation: Number(ocrGeometry && ocrGeometry.rotation || bucket.find((line) => Number.isFinite(Number(line.rotation)))?.rotation || 0),
-          lineStart: bucket[0].lineIndex,
-          lineEnd: bucket[bucket.length - 1].lineIndex
-        });
+        const chunk = buildRecoveredPdfOcrLineBackedChunk(bucket, role, cleanText, countWords);
+        if (chunk) chunks.push(chunk);
       }
       bucket = [];
       bucketWords = 0;
@@ -4440,8 +5344,8 @@
         && currentRole
         && nextRole !== currentRole
         && (
-          ["letterhead", "date_reference", "recipient", "greeting", "body", "closing", "signature", "footer"].includes(nextRole)
-          || ["letterhead", "date_reference", "recipient", "greeting", "body", "closing", "signature", "footer"].includes(currentRole)
+          isRecoveredPdfOcrBoundaryRole(nextRole)
+          || isRecoveredPdfOcrBoundaryRole(currentRole)
         )
       );
       if (forceBoundary || (looksLikeRecoveredPdfSemanticBoundary(line.text) && bucket.length && bucketWords >= 18)) {
@@ -4463,7 +5367,7 @@
     chunks.forEach((chunk) => {
       const role = normalizeRecoveredPdfOcrRole(chunk && chunk.ocrRole);
       const words = Number(chunk && chunk.words) || countWords(chunk && chunk.text);
-      const shouldMerge = words < 14 && !["date_reference", "body"].includes(role);
+      const shouldMerge = words < 14 && !isMeaningfulShortRecoveredPdfOcrRole(role, chunk && chunk.text, words);
       const previous = merged[merged.length - 1];
       if (shouldMerge && previous && (role === "signature" || role === "closing") && ["closing", "signature"].includes(previous.ocrRole)) {
         mergeRecoveredPdfOcrChunkInto(previous, chunk, cleanText, countWords);
@@ -4483,6 +5387,7 @@
 
   function mergeRecoveredPdfOcrChunkInto(target, addition, cleanText, countWords) {
     target.text = cleanText([target.text, addition && addition.text].filter(Boolean).join(" "));
+    target.sectionText = target.text;
     target.words = countWords(target.text);
     target.relativeYStart = Math.min(
       Number.isFinite(Number(target.relativeYStart)) ? Number(target.relativeYStart) : Number(target.relativeY) || 0.12,
@@ -4492,7 +5397,10 @@
       Number.isFinite(Number(target.relativeYEnd)) ? Number(target.relativeYEnd) : Number(target.relativeY) || 0.12,
       Number.isFinite(Number(addition && addition.relativeYEnd)) ? Number(addition.relativeYEnd) : Number(addition && addition.relativeY) || 0.12
     );
-    target.ocrGeometry = mergePdfOcrGeometries([target, addition]);
+    target.ocrSourceLines = normalizePdfOcrSourceLines([].concat(target.ocrSourceLines || [], addition && addition.ocrSourceLines || []));
+    target.ocrGeometry = target.ocrSourceLines.length
+      ? mergePdfOcrLineBackedGeometry(target.ocrSourceLines)
+      : mergePdfOcrGeometries([target, addition]);
     target.bbox = target.ocrGeometry && target.ocrGeometry.bbox || null;
     target.wordBoxes = target.ocrGeometry && target.ocrGeometry.wordBoxes || [];
     target.sourceLineIds = Array.from(new Set([].concat(target.sourceLineIds || [], addition && addition.sourceLineIds || []).filter(Boolean))).slice(0, 120);
@@ -4505,8 +5413,11 @@
     target.ocrVariantName = target.ocrVariantName && addition && addition.ocrVariantName && target.ocrVariantName === addition.ocrVariantName
       ? target.ocrVariantName
       : target.ocrGeometry && target.ocrGeometry.ocrVariantName || target.ocrVariantName || "";
-    target.ocrGeometryExact = Boolean(target.ocrGeometry && target.ocrGeometry.exact && target.sourceLineIds && target.sourceLineIds.length);
+    target.pageWidth = target.ocrGeometry && target.ocrGeometry.pageWidth || target.pageWidth || addition && addition.pageWidth || 0;
+    target.pageHeight = target.ocrGeometry && target.ocrGeometry.pageHeight || target.pageHeight || addition && addition.pageHeight || 0;
+    target.ocrGeometryExact = Boolean(target.ocrGeometry && target.ocrGeometry.exact && target.sourceLineIds && target.sourceLineIds.length && isPdfOcrExactGeometryUsable(target.ocrGeometry));
     target.ocrHighlightApproximate = !target.ocrGeometryExact;
+    target.lineStart = Math.min(Number(target.lineStart) || 0, Number(addition && addition.lineStart) || Number(target.lineStart) || 0);
     target.lineEnd = Math.max(Number(target.lineEnd) || 0, Number(addition && addition.lineEnd) || 0);
   }
 
@@ -4518,6 +5429,11 @@
       const text = cleanText(chunk && chunk.text);
       if (role !== "body" || !text || !startsWithRecoveredPdfOcrAdministrativeText(text)) {
         result.push({ ...chunk });
+        return;
+      }
+      const linePieces = splitRecoveredPdfOcrAdministrativePrefixChunkByLines(chunk, cleanText, countWords);
+      if (linePieces && linePieces.length >= 2) {
+        linePieces.forEach((piece) => result.push(piece));
         return;
       }
       const pieces = splitRecoveredPdfOcrLetterText(text, cleanText);
@@ -4534,6 +5450,44 @@
       ...chunk,
       chunkIndex: index,
       ocrRoleLabel: recoveredPdfOcrRoleLabel(chunk.ocrRole)
+    }));
+  }
+
+  function splitRecoveredPdfOcrAdministrativePrefixChunkByLines(chunk, cleanText, countWords) {
+    const sourceLines = normalizePdfOcrSourceLines(chunk && chunk.ocrSourceLines);
+    if (sourceLines.length < 2) return null;
+    const groups = [];
+    let bucket = [];
+    let bucketRole = "";
+    const flush = () => {
+      if (!bucket.length) return;
+      const built = buildRecoveredPdfOcrLineBackedChunk(bucket, bucketRole || "unknown", cleanText, countWords, {
+        parentChunkIndex: Number(chunk && chunk.chunkIndex) || 0
+      });
+      if (built) groups.push(built);
+      bucket = [];
+      bucketRole = "";
+    };
+    sourceLines.forEach((line, index) => {
+      const text = cleanText(line && line.text);
+      const role = normalizeRecoveredPdfOcrRole(
+        isRecoveredPdfOcrGreetingLine(text) ? "greeting"
+          : isRecoveredPdfOcrClosingLine(text) ? "signature"
+            : startsWithRecoveredPdfOcrAdministrativeText(text)
+              ? classifyRecoveredPdfOcrLineRole({ ...line, text }, { index, total: sourceLines.length, beforeGreeting: true })
+              : "body"
+      ) || "unknown";
+      if (bucket.length && role !== bucketRole) flush();
+      bucket.push(line);
+      bucketRole = role;
+    });
+    flush();
+    if (groups.length < 2 || !groups.some((group) => normalizeRecoveredPdfOcrRole(group.ocrRole) === "body")) return null;
+    return groups.map((group, index) => ({
+      ...group,
+      chunkIndex: index,
+      chunkCount: groups.length,
+      ocrRoleLabel: recoveredPdfOcrRoleLabel(group.ocrRole)
     }));
   }
 
@@ -4619,9 +5573,12 @@
     return {
       ...source,
       text: cleaned,
+      sectionText: cleaned,
       words,
       ocrRole: normalizeRecoveredPdfOcrRole(role) || "unknown",
       ocrRoleLabel: recoveredPdfOcrRoleLabel(role),
+      ocrRoleConfidence: getRecoveredPdfOcrRoleEvidence(role, cleaned, { sourceLines: [], words }).confidence,
+      ocrRoleReasons: getRecoveredPdfOcrRoleEvidence(role, cleaned, { sourceLines: [], words }).reasons,
       relativeY: Math.max(0, Math.min(1, (relativeYStart + relativeYEnd) / 2)),
       relativeYStart,
       relativeYEnd,
@@ -4629,13 +5586,18 @@
       bbox: null,
       wordBoxes: [],
       sourceLineIds: [],
+      ocrSourceLines: [],
       sourceLineTextSample: String(source && (source.sourceLineTextSample || source.text) || "").replace(/\s+/g, " ").trim().slice(0, 260),
       ocrVariantName: String(source && source.ocrVariantName || "").slice(0, 80),
       ocrGeometryExact: false,
       ocrHighlightApproximate: true,
+      pageWidth: Number(source && source.pageWidth || 0) || 0,
+      pageHeight: Number(source && source.pageHeight || 0) || 0,
       cropOffset: source && source.cropOffset || null,
       renderScale: Number(source && source.renderScale || 0) || 0,
       rotation: Number(source && source.rotation || 0) || 0,
+      lineStart: Number(source && source.lineStart) || 0,
+      lineEnd: Number(source && source.lineEnd) || 0,
       chunkIndex: index,
       chunkCount: safeTotal
     };
@@ -4655,8 +5617,27 @@
   }
 
   function normalizeRecoveredPdfOcrRole(role) {
-    const value = String(role || "").toLowerCase().replace(/[^a-z_]+/g, "_");
-    return /^(letterhead|recipient|date_reference|greeting|body|closing|signature|footer|unknown)$/.test(value) ? value : "";
+    const value = String(role || "").toLowerCase().replace(/[^a-z_]+/g, "_").replace(/^ocr_/, "");
+    const aliases = {
+      reference: "date_reference",
+      references_list: "references",
+      bibliography: "references",
+      works_cited: "references",
+      finding: "results",
+      findings: "results",
+      recommendation: "recommendations",
+      recommended_action: "recommendations",
+      form: "form_notice",
+      notice: "form_notice",
+      invoice: "invoice_summary",
+      receipt: "invoice_summary",
+      total: "total_due",
+      header: "repeated_header",
+      repeated: "repeated_header",
+      boilerplate: "noise"
+    };
+    const normalized = aliases[value] || value;
+    return /^(letterhead|recipient|date_reference|greeting|body|closing|signature|footer|title|abstract|introduction|methods|results|discussion|conclusion|references|report_summary|recommendations|form_notice|table|invoice_summary|line_items|total_due|repeated_header|repeated_footer|noise|unknown)$/.test(normalized) ? normalized : "";
   }
 
   function recoveredPdfOcrRoleLabel(role) {
@@ -4669,6 +5650,24 @@
       closing: "Closing",
       signature: "Signature block",
       footer: "Footer",
+      title: "Title",
+      abstract: "Abstract",
+      introduction: "Introduction",
+      methods: "Methods",
+      results: "Results",
+      discussion: "Discussion",
+      conclusion: "Conclusion",
+      references: "Reference list",
+      report_summary: "Report summary",
+      recommendations: "Recommendations",
+      form_notice: "Form or notice",
+      table: "Table",
+      invoice_summary: "Invoice or receipt",
+      line_items: "Line items",
+      total_due: "Total due",
+      repeated_header: "Repeated header",
+      repeated_footer: "Repeated footer",
+      noise: "OCR noise",
       unknown: "OCR section"
     };
     return labels[normalizeRecoveredPdfOcrRole(role)] || "";
@@ -4682,43 +5681,84 @@
     return normalized ? `ocr_${normalized}` : "";
   }
 
+  function isRecoveredPdfOcrBoundaryRole(role) {
+    const normalized = normalizeRecoveredPdfOcrRole(role);
+    return Boolean(normalized && normalized !== "unknown");
+  }
+
+  function isRecoveredPdfOcrDocumentHeadingRole(role) {
+    const normalized = normalizeRecoveredPdfOcrRole(role);
+    return /^(title|abstract|introduction|methods|results|discussion|conclusion|references|report_summary|recommendations|form_notice|table|invoice_summary|line_items|total_due)$/.test(normalized);
+  }
+
+  function isRecoveredPdfOcrStrongContentRole(role) {
+    const normalized = normalizeRecoveredPdfOcrRole(role);
+    return /^(body|abstract|results|discussion|conclusion|report_summary|recommendations|form_notice|invoice_summary|total_due|table)$/.test(normalized);
+  }
+
+  function isRecoveredPdfOcrLowValueRole(role) {
+    const normalized = normalizeRecoveredPdfOcrRole(role);
+    return /^(letterhead|recipient|date_reference|greeting|closing|signature|footer|title|references|repeated_header|repeated_footer|noise)$/.test(normalized);
+  }
+
   function classifyRecoveredPdfOcrRole(chunk, index = 0, total = 1, pdfSectionType = "") {
     const existing = normalizeRecoveredPdfOcrRole(chunk && chunk.ocrRole);
     if (existing && existing !== "unknown") return existing;
-    if (/^(abstract|methods|results|discussion|conclusion|form|table)$/i.test(String(pdfSectionType || ""))) return "";
-    const signals = getRecoveredPdfOcrLetterSignals(String(chunk && chunk.text || ""), {
+    const signals = getRecoveredPdfOcrDocumentSignals(String(chunk && chunk.text || ""), {
       index,
       total,
-      relativeY: chunk && chunk.relativeY
+      relativeY: chunk && chunk.relativeY,
+      pdfSectionType
     });
+    if (signals.noise) return "noise";
+    if (signals.repeatedFooter) return "repeated_footer";
+    if (signals.repeatedHeader) return "repeated_header";
     if (signals.footer) return "footer";
     if (signals.greeting) return "greeting";
     if (signals.closing) return "closing";
     if (signals.signatureOnly) return "signature";
     if (signals.dateReference) return "date_reference";
+    if (signals.headingRole) return signals.headingRole;
+    if (signals.totalDue) return "total_due";
+    if (signals.lineItems) return "line_items";
+    if (signals.invoiceSummary) return "invoice_summary";
+    if (signals.formNotice) return "form_notice";
+    if (signals.table) return "table";
     if (signals.body) return "body";
     if (signals.letterhead) return "letterhead";
     if (signals.recipient) return "recipient";
+    if (signals.title) return "title";
     return existing === "unknown" ? "unknown" : "";
   }
 
   function classifyRecoveredPdfOcrLineRole(line, context = {}) {
-    const signals = getRecoveredPdfOcrLetterSignals(String(line && line.text || ""), {
+    const signals = getRecoveredPdfOcrDocumentSignals(String(line && line.text || ""), {
       index: context.index,
       total: context.total,
       relativeY: line && line.relativeY,
       afterGreeting: context.afterGreeting,
       beforeGreeting: context.beforeGreeting,
-      afterClosing: context.afterClosing
+      afterClosing: context.afterClosing,
+      repeatedLine: context.repeatedLine
     });
+    if (signals.noise) return "noise";
+    if (signals.repeatedFooter) return "repeated_footer";
+    if (signals.repeatedHeader) return "repeated_header";
     if (signals.footer) return "footer";
     if (signals.greeting) return "greeting";
     if (signals.closing) return "closing";
     if (signals.signatureOnly || context.afterClosing && signals.words <= 12) return "signature";
     if (signals.dateReference) return "date_reference";
-    if (signals.body || context.afterGreeting && !context.afterClosing && signals.words >= 4) return "body";
+    if (signals.headingRole) return signals.headingRole;
+    if (signals.totalDue) return "total_due";
+    if (signals.lineItems) return "line_items";
+    if (signals.invoiceSummary) return "invoice_summary";
+    if (signals.formNotice) return "form_notice";
+    if (signals.table) return "table";
+    if (signals.body || context.afterGreeting && !context.afterClosing && signals.words >= 4 && !signals.administrative) return "body";
     if (signals.letterhead) return "letterhead";
     if (signals.recipient) return "recipient";
+    if (signals.title) return "title";
     return "unknown";
   }
 
@@ -4744,7 +5784,8 @@
       || words <= 18 && /\b(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?,?\s+\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{2,4})\b/i.test(compact);
     const bodyPhrase = /\b(?:permit me to introduce|i would like|please|enclosed|regarding|because|therefore|request|recommend|important|we are|we have|i am|i have|you will|this is to|in response|as discussed|can you|should|must)\b/i.test(compact);
     const bodyVerb = /\b(?:introduce|provide|confirm|explain|request|recommend|advise|enclose|attach|include|consider|arrange|agree|believe|understand|expect|require|propose|send|receive|review)\b/i.test(compact);
-    const body = !closing && !greeting && !dateReference && !initials && (
+    const administrative = Boolean(contact || address || company && early || mostlyUpper && early);
+    const body = !closing && !greeting && !dateReference && !initials && !administrative && (
       Boolean(options.afterGreeting && !options.afterClosing && words >= 4)
       || words >= 35
       || bodyPhrase
@@ -4769,8 +5810,123 @@
       signatureOnly,
       letterhead,
       recipient,
-      initials
+      initials,
+      administrative
     };
+  }
+
+  function getRecoveredPdfOcrDocumentSignals(text, options = {}) {
+    const compact = String(text || "").replace(/\s+/g, " ").trim();
+    const words = countPdfWords(compact);
+    const index = Number(options.index) || 0;
+    const total = Math.max(1, Number(options.total) || 1);
+    const relativeY = Number(options.relativeY);
+    const early = index <= 4 || Number.isFinite(relativeY) && relativeY < 0.24;
+    const late = index >= total - 3 || Number.isFinite(relativeY) && relativeY > 0.86;
+    const lower = compact.toLowerCase();
+    const letter = getRecoveredPdfOcrLetterSignals(compact, options);
+    const headingRole = getRecoveredPdfOcrHeadingRole(compact);
+    const title = early
+      && words >= 3
+      && words <= 22
+      && !letter.administrative
+      && !letter.dateReference
+      && !/[.!?]\s+\w/.test(compact)
+      && !/\b(?:abstract|introduction|methods?|results?|discussion|conclusion|references|notice|invoice|receipt|telephone|fax|email|ref)\b/i.test(compact);
+    const research = Boolean(headingRole && /^(abstract|introduction|methods|results|discussion|conclusion|references)$/.test(headingRole))
+      || /\b(?:abstract|methods?|methodology|results?|findings?|discussion|conclusions?|references|bibliography|doi|journal)\b/i.test(compact);
+    const report = Boolean(headingRole && /^(report_summary|recommendations)$/.test(headingRole))
+      || /\b(?:executive summary|findings?|recommendations?|action items?|management response|risk assessment|report)\b/i.test(compact);
+    const formNotice = /\b(?:notice|form|application|determination|claim number|case number|account number|respond by|reply by|deadline|due date|appeal|approved|denied|required response)\b/i.test(compact)
+      && !letter.signatureOnly;
+    const invoiceSummary = /\b(?:invoice|receipt|statement|bill to|sold to|remit to|account no|invoice no|receipt no)\b/i.test(compact);
+    const totalDue = /\b(?:total due|amount due|balance due|grand total|subtotal|tax|paid|payment due|amount payable)\b/i.test(compact)
+      && /\$?\d+(?:,\d{3})*(?:\.\d{2})?\b/.test(compact);
+    const lineItems = /\b(?:qty|quantity|item|description|unit price|amount|price|sku|hours?|rate)\b/i.test(compact)
+      && /\$?\d+(?:,\d{3})*(?:\.\d{2})?\b/.test(compact)
+      && words <= 90;
+    const table = /\b(?:table|figure|chart|column|row)\b/i.test(compact)
+      || lineItems
+      || ((compact.match(/\$?\d+(?:,\d{3})*(?:\.\d{2})?/g) || []).length >= 4 && words <= 100);
+    const repeatedHeader = Boolean(options.repeatedLine && early && words <= 18);
+    const repeatedFooter = Boolean(options.repeatedLine && late && words <= 20);
+    const noise = looksLikeRecoveredPdfNoise(compact, words)
+      || words <= 5 && /^(?:[|_~\-\s\d]+|page\s+\d+(?:\s+of\s+\d+)?)$/i.test(compact)
+      || /\b(?:scanned by|fax copy|duplicate copy)\b/i.test(compact) && words <= 12;
+    return {
+      ...letter,
+      words,
+      headingRole,
+      title,
+      research,
+      report,
+      formNotice,
+      invoiceSummary,
+      totalDue,
+      lineItems,
+      table,
+      repeatedHeader,
+      repeatedFooter,
+      noise,
+      administrative: Boolean(letter.administrative || letter.contact || letter.address || letter.dateReference || letter.recipient),
+      lower
+    };
+  }
+
+  function getRecoveredPdfOcrHeadingRole(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    const leading = /^(abstract|introduction|background|methods?|methodology|materials and methods|results?|findings?|outcomes?|discussion|conclusions?|references|bibliography|works cited|executive summary|summary|overview|recommendations?|recommended actions?|next steps|action items?|notice of determination|notice|required response|instructions|invoice|receipt|statement|line items?|charges|transactions?|total due|amount due|balance due)\b\s*[:.\-–—]/i.exec(value);
+    if (leading) {
+      const lead = leading[1].toLowerCase();
+      if (/^abstract$/.test(lead)) return "abstract";
+      if (/^(introduction|background)$/.test(lead)) return "introduction";
+      if (/^(methods?|methodology|materials and methods)$/.test(lead)) return "methods";
+      if (/^(results?|findings?|outcomes?)$/.test(lead)) return "results";
+      if (/^discussion$/.test(lead)) return "discussion";
+      if (/^conclusions?$/.test(lead)) return "conclusion";
+      if (/^(references|bibliography|works cited)$/.test(lead)) return "references";
+      if (/^(executive summary|summary|overview)$/.test(lead)) return "report_summary";
+      if (/^(recommendations?|recommended actions?|next steps|action items?)$/.test(lead)) return "recommendations";
+      if (/^(notice of determination|notice|required response|instructions)$/.test(lead)) return "form_notice";
+      if (/^(invoice|receipt|statement)$/.test(lead)) return "invoice_summary";
+      if (/^(line items?|charges|transactions?)$/.test(lead)) return "line_items";
+      if (/^(total due|amount due|balance due)$/.test(lead)) return "total_due";
+    }
+    const normalized = value.replace(/^\d+(?:\.\d+)*\s+/, "").replace(/[:.\-–—\s]+$/g, "").toLowerCase();
+    if (!normalized || normalized.length > 120) return "";
+    if (/^abstract$/.test(normalized)) return "abstract";
+    if (/^(introduction|background)$/.test(normalized)) return "introduction";
+    if (/^(methods?|methodology|materials and methods|experimental setup|procedure)$/.test(normalized)) return "methods";
+    if (/^(results?|findings?|outcomes?|analysis)$/.test(normalized)) return "results";
+    if (/^discussion$/.test(normalized)) return "discussion";
+    if (/^(conclusions?|summary and conclusions?|final remarks)$/.test(normalized)) return "conclusion";
+    if (/^(references|bibliography|works cited|literature cited)$/.test(normalized)) return "references";
+    if (/^(executive summary|summary|overview)$/.test(normalized)) return "report_summary";
+    if (/^(recommendations?|recommended actions?|next steps|action items?)$/.test(normalized)) return "recommendations";
+    if (/^(notice|notice of determination|required response|instructions|form instructions)$/.test(normalized)) return "form_notice";
+    if (/^(invoice|receipt|statement|bill|invoice summary|receipt summary)$/.test(normalized)) return "invoice_summary";
+    if (/^(table|line items?|items?|charges|transactions?)$/.test(normalized)) return "line_items";
+    if (/^(total|total due|amount due|balance due|grand total)$/.test(normalized)) return "total_due";
+    return "";
+  }
+
+  function getRecoveredPdfOcrRepeatedLineKey(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/\b\d{1,4}\b/g, "#")
+      .replace(/[^a-z#]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function getRecoveredPdfOcrRepeatedLineCounts(lines) {
+    const counts = new Map();
+    (Array.isArray(lines) ? lines : []).forEach((line) => {
+      const key = getRecoveredPdfOcrRepeatedLineKey(line && line.text);
+      if (!key || key.length < 4) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    return counts;
   }
 
   function isRecoveredPdfOcrGreetingLine(text) {
@@ -4778,7 +5934,7 @@
   }
 
   function isRecoveredPdfOcrClosingLine(text) {
-    return /^\s*(?:sincerely|yours faithfully|yours truly|respectfully|kind regards|best regards|regards|thank you|very truly yours)\b/i.test(String(text || "").trim());
+    return /^\s*(?:sincerely|yours sincerely|yours faithfully|yours truly|respectfully|kind regards|best regards|regards|thank you|very truly yours)\b/i.test(String(text || "").trim());
   }
 
   function getDominantRecoveredPdfOcrRole(lines, text = "", words = 0) {
@@ -4787,6 +5943,11 @@
       const role = normalizeRecoveredPdfOcrRole(line && line.ocrRole) || "unknown";
       counts.set(role, (counts.get(role) || 0) + (Number(line && line.words) || 1));
     });
+    const strongRoles = ["results", "conclusion", "recommendations", "form_notice", "total_due", "abstract", "report_summary", "discussion", "methods", "table", "invoice_summary"];
+    const strong = strongRoles
+      .map((role) => [role, counts.get(role) || 0])
+      .sort((a, b) => b[1] - a[1])[0];
+    if (strong && strong[1] > 0 && strong[1] >= (counts.get("body") || 0)) return strong[0];
     if (counts.get("body")) return "body";
     const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
     const role = sorted[0] && sorted[0][0] || "unknown";
@@ -4800,7 +5961,49 @@
     if (normalized === "date_reference") return words >= 3;
     if (normalized === "greeting") return words >= 2;
     if (normalized === "body") return words >= 8 || /\b(?:please|request|regarding|enclosed|important)\b/i.test(text);
+    if (normalized === "letterhead") return words >= 3 && /\b(?:phone|tel|telephone|telex|fax|ltd|limited|inc|corp|company|lane|road|street|avenue|office)\b/i.test(text);
+    if (normalized === "recipient") return words >= 3;
+    if (normalized === "signature" || normalized === "closing") return words >= 2;
+    if (/^(title|abstract|introduction|methods|results|discussion|conclusion|references|report_summary|recommendations|form_notice|table|invoice_summary|line_items|total_due)$/.test(normalized)) return words >= 1;
     return false;
+  }
+
+  function getRecoveredPdfOcrRoleEvidence(role, text, options = {}) {
+    const normalized = normalizeRecoveredPdfOcrRole(role) || "unknown";
+    const sourceLines = normalizePdfOcrSourceLines(options.sourceLines || []);
+    const lineBacked = sourceLines.length > 0;
+    const words = Number(options.words) || countPdfWords(text);
+    const signals = getRecoveredPdfOcrDocumentSignals(text, {
+      index: 0,
+      total: Math.max(1, sourceLines.length || 1),
+      relativeY: sourceLines[0] && sourceLines[0].relativeY
+    });
+    const reasons = [];
+    if (lineBacked) reasons.push("role is based on OCR source-line evidence");
+    if (normalized === "body" && signals.body) reasons.push("body text appears after the greeting or contains action/explanation language");
+    if (normalized === "letterhead" && (signals.contact || signals.company || signals.address)) reasons.push("letterhead/contact/address signals appear in the source lines");
+    if (normalized === "recipient" && signals.recipient) reasons.push("recipient/address block appears before the body");
+    if (normalized === "date_reference" && signals.dateReference) reasons.push("date or reference-code signal appears in the source lines");
+    if (normalized === "signature" && signals.signatureOnly) reasons.push("signature or initials pattern appears near the end");
+    if (normalized === "footer" || normalized === "repeated_footer") reasons.push("footer or page-number pattern appears near the page bottom");
+    if (normalized === "repeated_header") reasons.push("same short header text repeats near the page top");
+    if (normalized === "noise" && signals.noise) reasons.push("scan fragments or OCR-noise pattern detected");
+    if (normalized === signals.headingRole) reasons.push(`${recoveredPdfOcrRoleLabel(normalized)} heading appears in the source lines`);
+    if (normalized === "form_notice" && signals.formNotice) reasons.push("form or notice identifiers, deadlines, or instructions appear in the source lines");
+    if (normalized === "invoice_summary" && signals.invoiceSummary) reasons.push("invoice or receipt terms appear in the source lines");
+    if (normalized === "line_items" && signals.lineItems) reasons.push("line-item columns or amounts appear in the source lines");
+    if (normalized === "total_due" && signals.totalDue) reasons.push("total or amount-due value appears in the source lines");
+    if (normalized === "table" && signals.table) reasons.push("table-like rows, columns, or repeated values appear in the source lines");
+    if (normalized === "report_summary" || normalized === "recommendations") reasons.push(`${recoveredPdfOcrRoleLabel(normalized)} signal appears in the source lines`);
+    let confidence = lineBacked ? 68 : 42;
+    if (reasons.length > (lineBacked ? 1 : 0)) confidence += 16;
+    if (isRecoveredPdfOcrStrongContentRole(normalized) && words >= 25) confidence += 8;
+    if (isRecoveredPdfOcrLowValueRole(normalized)) confidence -= 6;
+    if (normalized === "unknown") confidence = lineBacked ? 35 : 24;
+    return {
+      confidence: Math.max(0, Math.min(100, Math.round(confidence))),
+      reasons: uniquePublicStrings(reasons.length ? reasons : [recoveredPdfOcrSelectionReason(normalized, text)]).slice(0, 4)
+    };
   }
 
   function recoveredPdfOcrSelectionReason(role, text) {
@@ -4813,6 +6016,24 @@
     if (normalized === "closing") return "closing line near the end of the scanned letter";
     if (normalized === "signature") return "signature or initials block, usually less important than the body";
     if (normalized === "footer") return "footer or repeated page noise";
+    if (normalized === "title") return "title or cover text, useful for context but usually not the best section";
+    if (normalized === "abstract") return "abstract section identified from OCR source lines";
+    if (normalized === "introduction") return "introduction or background section identified from OCR source lines";
+    if (normalized === "methods") return "methods or procedure section identified from OCR source lines";
+    if (normalized === "results") return "results or findings section identified from OCR source lines";
+    if (normalized === "discussion") return "discussion section identified from OCR source lines";
+    if (normalized === "conclusion") return "conclusion section identified from OCR source lines";
+    if (normalized === "references") return "reference list or citations, usually less important than findings";
+    if (normalized === "report_summary") return "summary or overview section identified from OCR source lines";
+    if (normalized === "recommendations") return "recommendations or action items identified from OCR source lines";
+    if (normalized === "form_notice") return "form or notice instructions with dates, names, or identifiers";
+    if (normalized === "table") return "table-like OCR section with structured details";
+    if (normalized === "invoice_summary") return "invoice or receipt summary identified from OCR source lines";
+    if (normalized === "line_items") return "invoice, receipt, or table line items from OCR source lines";
+    if (normalized === "total_due") return "total, amount due, or payment amount from OCR source lines";
+    if (normalized === "repeated_header") return "repeated page header, usually less important than document content";
+    if (normalized === "repeated_footer") return "repeated page footer or page-number noise";
+    if (normalized === "noise") return "OCR noise or scan fragments, down-ranked before selecting useful content";
     return recoveredPdfSelectionReason("", "", text);
   }
 
@@ -4990,6 +6211,24 @@
       ocr_greeting: "Greeting",
       ocr_closing: "Closing",
       ocr_footer: "Footer",
+      ocr_title: "Title",
+      ocr_abstract: "Abstract",
+      ocr_introduction: "Introduction",
+      ocr_methods: "Methods",
+      ocr_results: "Results",
+      ocr_discussion: "Discussion",
+      ocr_conclusion: "Conclusion",
+      ocr_references: "Reference list",
+      ocr_report_summary: "Report summary",
+      ocr_recommendations: "Recommendations",
+      ocr_form_notice: "Form or notice",
+      ocr_table: "Table",
+      ocr_invoice_summary: "Invoice or receipt",
+      ocr_line_items: "Line items",
+      ocr_total_due: "Total due",
+      ocr_repeated_header: "Repeated header",
+      ocr_repeated_footer: "Repeated footer",
+      ocr_noise: "OCR noise",
       useful_section: "Useful section"
     };
     return labels[kind] || labels.useful_section;
@@ -5007,7 +6246,7 @@
   function isRecoveredPdfLowValue(section) {
     const type = section && section.metrics ? section.metrics.pdfSectionType : "";
     const ocrRole = section && section.metrics ? normalizeRecoveredPdfOcrRole(section.metrics.ocrRole) : "";
-    if (/^(letterhead|recipient|date_reference|greeting|closing|signature|footer)$/i.test(ocrRole)) return true;
+    if (isRecoveredPdfOcrLowValueRole(ocrRole)) return true;
     return /^(works_cited|appendix|toc|title_page|boilerplate|signature)$/i.test(String(type || ""));
   }
 
@@ -5045,13 +6284,31 @@
       if ((chunk.words || 0) >= 40) score += 18;
       if (/\b(permit me to introduce|i would like|please|enclosed|regarding|because|therefore|request|recommend|important)\b/i.test(text)) score += 18;
     }
-    if (ocrRole === "letterhead") score -= 62;
-    if (ocrRole === "recipient") score -= 48;
-    if (ocrRole === "date_reference") score -= 26;
-    if (ocrRole === "greeting") score -= 34;
-    if (ocrRole === "closing") score -= 52;
-    if (ocrRole === "signature") score -= 78;
-    if (ocrRole === "footer") score -= 72;
+    if (ocrRole === "abstract") score += 30;
+    if (ocrRole === "results") score += 54;
+    if (ocrRole === "discussion") score += 26;
+    if (ocrRole === "conclusion") score += 48;
+    if (ocrRole === "report_summary") score += 34;
+    if (ocrRole === "recommendations") score += 52;
+    if (ocrRole === "form_notice") score += 40;
+    if (ocrRole === "table") score += 18;
+    if (ocrRole === "invoice_summary") score += 24;
+    if (ocrRole === "total_due") score += 36;
+    if (ocrRole === "line_items") score += 8;
+    if (ocrRole === "introduction") score += 6;
+    if (ocrRole === "methods") score += 10;
+    if (ocrRole === "letterhead") score -= 72;
+    if (ocrRole === "recipient") score -= 58;
+    if (ocrRole === "date_reference") score -= 34;
+    if (ocrRole === "greeting") score -= 38;
+    if (ocrRole === "closing") score -= 58;
+    if (ocrRole === "signature") score -= 86;
+    if (ocrRole === "footer") score -= 78;
+    if (ocrRole === "title") score -= 26;
+    if (ocrRole === "references") score -= 70;
+    if (ocrRole === "repeated_header") score -= 82;
+    if (ocrRole === "repeated_footer") score -= 90;
+    if (ocrRole === "noise") score -= 96;
     if (signals.semantic) score += 28;
     if (signals.semanticBody) score += 24;
     if (signals.deadline || signals.identifier) score += 18;
@@ -5079,8 +6336,8 @@
     if (pdfSectionType === "title_page") score -= 34;
     if (pdfSectionType === "boilerplate") score -= 66;
     if (pdfSectionType === "signature" || signals.signatureOnly) score -= 72;
-    if (signals.contactOnly) score -= 46;
-    if ((chunk.words || 0) < 25 && ocrRole && ocrRole !== "body") score -= 24;
+    if (signals.contactOnly) score -= 56;
+    if ((chunk.words || 0) < 25 && ocrRole && !isRecoveredPdfOcrStrongContentRole(ocrRole)) score -= 24;
     if (chunk.pageNumber <= 2 && !/\b(abstract|summary|introduction|thesis|claim)\b/i.test(text)) score -= 8;
     if (index === 0 && total > 2) score -= 4;
     return Math.max(12, Math.min(99, score));
@@ -5130,13 +6387,28 @@
     let score = 0;
     if (ocrRole === "body") score += 110;
     if (ocrRole === "body" && Number(section && section.wordCount || 0) >= 40) score += 24;
-    if (ocrRole === "letterhead") score -= 110;
-    if (ocrRole === "recipient") score -= 76;
-    if (ocrRole === "date_reference") score -= 32;
-    if (ocrRole === "greeting") score -= 48;
-    if (ocrRole === "closing") score -= 72;
-    if (ocrRole === "signature") score -= 116;
-    if (ocrRole === "footer") score -= 98;
+    if (ocrRole === "results") score += 118;
+    if (ocrRole === "conclusion") score += 112;
+    if (ocrRole === "recommendations") score += 116;
+    if (ocrRole === "form_notice") score += 94;
+    if (ocrRole === "total_due") score += 88;
+    if (ocrRole === "abstract") score += 72;
+    if (ocrRole === "report_summary") score += 76;
+    if (ocrRole === "discussion") score += 62;
+    if (ocrRole === "table") score += 38;
+    if (ocrRole === "invoice_summary") score += 34;
+    if (ocrRole === "letterhead") score -= 120;
+    if (ocrRole === "recipient") score -= 86;
+    if (ocrRole === "date_reference") score -= 40;
+    if (ocrRole === "greeting") score -= 52;
+    if (ocrRole === "closing") score -= 78;
+    if (ocrRole === "signature") score -= 124;
+    if (ocrRole === "footer") score -= 104;
+    if (ocrRole === "title") score -= 28;
+    if (ocrRole === "references") score -= 112;
+    if (ocrRole === "repeated_header") score -= 122;
+    if (ocrRole === "repeated_footer") score -= 128;
+    if (ocrRole === "noise") score -= 140;
     if (matched.conclusion || type === "conclusion") score += 42;
     if (matched.results || type === "results") score += 38;
     if (matched.summary || type === "abstract") score += 36;
@@ -5161,13 +6433,22 @@
     const text = String(chunk && chunk.text || "");
     const ocrRole = normalizeRecoveredPdfOcrRole(options.ocrRole || chunk && chunk.ocrRole);
     const ocrRoleLabel = options.ocrRoleLabel || recoveredPdfOcrRoleLabel(ocrRole);
+    const roleEvidence = options.ocrRoleConfidence || options.ocrRoleReasons
+      ? {
+          confidence: Number(options.ocrRoleConfidence) || 0,
+          reasons: Array.isArray(options.ocrRoleReasons) ? options.ocrRoleReasons : []
+        }
+      : getRecoveredPdfOcrRoleEvidence(ocrRole, text, {
+          sourceLines: chunk && chunk.ocrSourceLines,
+          words: chunk && chunk.words
+        });
     return {
       wordCount: chunk.words || countPdfWords(text),
       linkCount: 0,
       links: 0,
       codeBlocks: 0,
       tables: /\b(table|figure|chart)\b/i.test(text) ? 1 : 0,
-      fluffScore: /^(works_cited|appendix|toc|title_page|boilerplate|signature)$/i.test(pdfSectionType) || /\b(references|bibliography|appendix|works cited|copyright|all rights reserved)\b/i.test(text) ? 88 : 8,
+      fluffScore: /^(works_cited|appendix|toc|title_page|boilerplate|signature)$/i.test(pdfSectionType) || isRecoveredPdfOcrLowValueRole(ocrRole) || /\b(references|bibliography|appendix|works cited|copyright|all rights reserved)\b/i.test(text) ? 88 : 8,
       usefulScore: Math.max(30, Math.round(score * 0.62)),
       importanceScore: score,
       adapterScore: 0,
@@ -5176,6 +6457,8 @@
       pdfSectionType,
       ocrRole,
       ocrRoleLabel,
+      ocrRoleConfidence: roleEvidence.confidence,
+      ocrRoleReasons: roleEvidence.reasons,
       matched: {
         conciseAnswer: /\b(summary|abstract|conclusion|finding|result)\b/i.test(text),
         summary: /\b(summary|abstract|overview|key takeaway)\b/i.test(text),
@@ -5204,6 +6487,12 @@
         ocrRecipient: ocrRole === "recipient",
         ocrDateReference: ocrRole === "date_reference",
         ocrSignature: ocrRole === "signature",
+        ocrResults: ocrRole === "results",
+        ocrConclusion: ocrRole === "conclusion",
+        ocrRecommendations: ocrRole === "recommendations",
+        ocrFormNotice: ocrRole === "form_notice",
+        ocrTotalDue: ocrRole === "total_due",
+        ocrNoise: ocrRole === "noise" || ocrRole === "repeated_header" || ocrRole === "repeated_footer",
         codeExplanation: false,
         acceptedAnswer: false
       },
@@ -5292,6 +6581,10 @@
   function countPatternHits(text, pattern) {
     const matches = String(text || "").match(pattern);
     return matches ? matches.length : 0;
+  }
+
+  function isPdfOcrSourceType(source) {
+    return /^(ocr|tesseract|tesseract-direct|tesseract-direct-fallback|textdetector)$/i.test(String(source || ""));
   }
 
   function rememberRawPdfOcrText(options = {}) {
@@ -5401,7 +6694,21 @@
     const structure = entry.ocrStructure && typeof entry.ocrStructure === "object"
       ? entry.ocrStructure
       : getPdfOcrStructureCompleteness(entry);
-    return !(structure && structure.letterLike && !structure.complete);
+    const pages = Array.isArray(entry.pages) ? entry.pages : [];
+    const text = String(entry.text || pages.map((page) => page && page.text || "").filter(Boolean).join("\n\n"));
+    const lines = pages.flatMap((page) => Array.isArray(page && page.lines) ? page.lines : []);
+    const textQuality = entry.ocrTextQuality && typeof entry.ocrTextQuality === "object"
+      ? entry.ocrTextQuality
+      : evaluatePdfOcrTextQuality({
+        text,
+        lines,
+        words: Number(entry.words) || countPdfWords(text),
+        confidence: Number(entry.confidence) || averageLineConfidence(lines),
+        source: entry.source || "ocr",
+        recognitionVariant: entry.ocrMode || entry.adaptiveMode || ""
+      }, structure);
+    if (textQuality && (textQuality.corrupted || textQuality.missedRegionLikely)) return false;
+    return !(structure && !structure.complete);
   }
 
   function normalizePdfOcrDiagnosticMode(mode) {
@@ -6112,20 +7419,30 @@
     if (!Array.isArray(pages)) return [];
     return pages
       .map((page, index) => {
-        const text = String(page && page.text ? page.text : "")
+        const source = page && page.source || "";
+        const initialText = String(page && page.text ? page.text : "")
           .replace(/[^\S\n]+/g, " ")
           .replace(/\n{3,}/g, "\n\n")
           .trim();
-        if (!text) return null;
         const lines = normalizePdfRecoveryLines(page && page.lines);
+        const reconstructed = isPdfOcrSourceType(source) && lines.length
+          ? reconstructPdfOcrTextFromLines(lines, { fallbackText: initialText })
+          : null;
+        const text = reconstructed && reconstructed.text ? reconstructed.text : initialText;
+        if (!text) return null;
         return {
           pageNumber: Number(page && page.pageNumber) || index + 1,
           text,
+          rawText: String(page && page.rawText || reconstructed && reconstructed.rawText || initialText).slice(0, 60000),
+          reconstructedText: String(page && page.reconstructedText || reconstructed && reconstructed.reconstructedText || (isPdfOcrSourceType(source) ? text : "")).slice(0, 60000),
           words: Number(page && page.words) || countPdfWords(text),
           lines,
-          source: page && page.source || "",
+          source,
           recognitionVariant: String(page && (page.recognitionVariant || page.ocrVariantName) || "").slice(0, 80),
-          confidence: Number.isFinite(Number(page && page.confidence)) ? Math.round(Number(page.confidence)) : averageLineConfidence(lines)
+          confidence: Number.isFinite(Number(page && page.confidence)) ? Math.round(Number(page.confidence)) : averageLineConfidence(lines),
+          ocrTextQuality: page && page.ocrTextQuality && typeof page.ocrTextQuality === "object"
+            ? { ...page.ocrTextQuality }
+            : reconstructed && reconstructed.stats || null
         };
       })
       .filter(Boolean);
@@ -6202,7 +7519,7 @@
   }
 
   function getOcrRecognitionStats(result, fallbackConfidence = 0) {
-    const rawText = String(result && result.text !== undefined ? result.text : result || "");
+    const rawText = String(result && result.rawText !== undefined ? result.rawText : result && result.text !== undefined ? result.text : result || "");
     const confidence = Number.isFinite(Number(result && result.confidence))
       ? Math.round(Number(result.confidence))
       : Number.isFinite(Number(fallbackConfidence))
@@ -7129,6 +8446,10 @@
               sourceLineId: sourceLineIds[0] || makePdfOcrSourceLineId({ ...recognitionContext, source: "textdetector" }, index, text),
               sourceLineIds,
               rawText: text,
+              cropOffset: geometry && geometry.cropOffset || group.parts.find((part) => part.cropOffset)?.cropOffset || null,
+              renderScale: Number(geometry && geometry.renderScale || group.parts.find((part) => Number(part.renderScale) > 0)?.renderScale || 0),
+              rotation: Number(geometry && geometry.rotation || group.parts.find((part) => Number.isFinite(Number(part.rotation)))?.rotation || 0),
+              pageNumber: Number(recognitionContext.pageNumber) || 1,
               order: index
             };
           }).filter((line) => line.text);
@@ -7188,7 +8509,8 @@
     const pageGeometryExact = Boolean(context.exactGeometry !== false && (Number(context.fullPageHeight || context.sourcePageHeight || 0) || Number(data.pageHeight || data.imageHeight || data.height || 0)));
     const lines = rawLines
       .map((line, index) => {
-        const lineText = getTesseractLineText(line).replace(/\s+/g, " ").trim();
+        const rawLineText = getTesseractLineText(line).replace(/\s+/g, " ").trim();
+        const lineText = normalizePdfOcrLineTextSpacing(rawLineText);
         if (!lineText) return null;
         const box = line && (line.bbox || line.boundingBox) || {};
         const mappedBox = mapPdfOcrBBoxToFullPage(box, context, inferredPageWidth, inferredPageHeight);
@@ -7234,7 +8556,7 @@
           ocrVariantName: String(context.ocrVariantName || context.recognitionVariant || "").slice(0, 80),
           sourceLineId,
           sourceLineIds: [sourceLineId],
-          rawText: lineText,
+          rawText: rawLineText || lineText,
           sourceBBox: normalizePdfOcrBBox(box, inferredPageWidth, inferredPageHeight),
           cropOffset,
           renderScale: Number(context.renderScale || 0) || 0,
@@ -7244,16 +8566,21 @@
         };
       })
       .filter(Boolean);
-    const text = String(data.text || "").trim()
-      || lines.map((line) => line.text).join("\n").trim()
+    const flattenedRawText = String(data.text || "").trim()
+      || lines.map((line) => line.rawText || line.text).join("\n").trim()
       || getTesseractWordsText(data.words);
+    const reconstructed = reconstructPdfOcrTextFromLines(lines, { fallbackText: flattenedRawText });
+    const text = reconstructed.text || normalizePdfOcrLineTextSpacing(flattenedRawText);
     return {
       text,
-      lines,
+      rawText: flattenedRawText,
+      reconstructedText: text,
+      lines: reconstructed.lines && reconstructed.lines.length ? reconstructed.lines : lines,
       confidence: Number.isFinite(Number(data.confidence)) ? Math.round(Number(data.confidence)) : averageLineConfidence(lines),
       source: sourceName,
       recognitionVariant: String(context.recognitionVariant || context.ocrVariantName || "").slice(0, 80),
       ocrVariantName: String(context.ocrVariantName || context.recognitionVariant || "").slice(0, 80),
+      ocrTextQuality: reconstructed.stats || null,
       warnings: []
     };
   }
@@ -7517,7 +8844,18 @@
     const structure = fastResult && fastResult.source === "ocr"
       ? getPdfOcrStructureCompleteness(fastResult)
       : null;
-    return words > 0 && (words < 90 || qualityScore < 62 || structure && structure.letterLike && !structure.complete);
+    const primaryCandidate = getPdfOcrResultPrimaryCandidate(fastResult);
+    const textQuality = fastResult && fastResult.ocrTextQuality && typeof fastResult.ocrTextQuality === "object"
+      ? fastResult.ocrTextQuality
+      : evaluatePdfOcrTextQuality(primaryCandidate, structure);
+    return words > 0 && (
+      words < 90
+      || qualityScore < 62
+      || structure && !structure.complete
+      || textQuality.corrupted
+      || textQuality.missedRegionLikely
+      || !textQuality.complete
+    );
   }
 
   function getAdaptivePdfOcrRenderScale(page, options = {}) {
@@ -7904,24 +9242,39 @@
   }
 
   function normalizePdfPageOcrVariantResult(ocrResult, recognitionVariant, recognitionContext = {}) {
-    const cleanText = String(ocrResult && ocrResult.text || ocrResult || "")
+    const rawText = String(ocrResult && ocrResult.rawText !== undefined
+      ? ocrResult.rawText
+      : ocrResult && ocrResult.text !== undefined ? ocrResult.text : ocrResult || "");
+    const cleanText = String(ocrResult && (ocrResult.reconstructedText || ocrResult.text) || ocrResult || "")
       .replace(/[^\S\n]+/g, " ")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
-    const rawText = String(ocrResult && ocrResult.text !== undefined ? ocrResult.text : ocrResult || "");
     const words = countPdfWords(cleanText);
     const normalizedLines = normalizePdfRecoveryLines(ocrResult && Array.isArray(ocrResult.lines) ? ocrResult.lines : []);
     const lines = normalizedLines.length ? normalizedLines : pdfOcrLinesFromText(cleanText);
+    const confidence = Number.isFinite(Number(ocrResult && ocrResult.confidence)) ? Math.round(Number(ocrResult.confidence)) : averageLineConfidence(lines);
+    const ocrTextQuality = evaluatePdfOcrTextQuality({
+      text: cleanText,
+      lines,
+      words,
+      confidence,
+      source: ocrResult && ocrResult.source ? ocrResult.source : "ocr",
+      recognitionVariant,
+      ocrVariantName: String(recognitionContext.ocrVariantName || recognitionVariant || "").slice(0, 80)
+    });
     return {
       raw: ocrResult,
       text: cleanText,
+      rawText,
+      reconstructedText: cleanText,
       words,
       lines,
-      confidence: Number.isFinite(Number(ocrResult && ocrResult.confidence)) ? Math.round(Number(ocrResult.confidence)) : averageLineConfidence(lines),
+      confidence,
       source: ocrResult && ocrResult.source ? ocrResult.source : "ocr",
       recognitionVariant,
       ocrVariantName: String(recognitionContext.ocrVariantName || recognitionVariant || "").slice(0, 80),
       recognitionContext,
+      ocrTextQuality,
       rawTextLength: rawText.length,
       firstTextSample: rawText.slice(0, 240)
     };
@@ -7930,6 +9283,19 @@
   function isBetterPdfOcrVariant(candidate, current) {
     if (!candidate) return false;
     if (!current) return true;
+    const candidateQuality = candidate.ocrTextQuality && typeof candidate.ocrTextQuality === "object"
+      ? candidate.ocrTextQuality
+      : evaluatePdfOcrTextQuality(candidate);
+    const currentQuality = current.ocrTextQuality && typeof current.ocrTextQuality === "object"
+      ? current.ocrTextQuality
+      : evaluatePdfOcrTextQuality(current);
+    if (Boolean(candidateQuality.corrupted) !== Boolean(currentQuality.corrupted)) return !candidateQuality.corrupted;
+    if (Boolean(candidateQuality.missedRegionLikely) !== Boolean(currentQuality.missedRegionLikely)) return !candidateQuality.missedRegionLikely;
+    if (Math.abs((candidateQuality.score || 0) - (currentQuality.score || 0)) >= 12) return (candidateQuality.score || 0) > (currentQuality.score || 0);
+    if (Boolean(candidateQuality.complete) !== Boolean(currentQuality.complete)) return Boolean(candidateQuality.complete);
+    if (Math.abs((candidateQuality.textCompleteness || 0) - (currentQuality.textCompleteness || 0)) >= 0.14) return (candidateQuality.textCompleteness || 0) > (currentQuality.textCompleteness || 0);
+    if (Math.abs((candidateQuality.pageCoverage || 0) - (currentQuality.pageCoverage || 0)) >= 0.18) return (candidateQuality.pageCoverage || 0) > (currentQuality.pageCoverage || 0);
+    if (Math.abs((candidateQuality.paragraphContinuity || 0) - (currentQuality.paragraphContinuity || 0)) >= 0.16) return (candidateQuality.paragraphContinuity || 0) > (currentQuality.paragraphContinuity || 0);
     if (candidate.words !== current.words) return candidate.words > current.words;
     if ((candidate.rawTextLength || 0) !== (current.rawTextLength || 0)) return (candidate.rawTextLength || 0) > (current.rawTextLength || 0);
     if (candidate.lines.length !== current.lines.length) return candidate.lines.length > current.lines.length;
@@ -7975,11 +9341,25 @@
         error: String(error && error.message ? error.message : error)
       });
     }
-    const structure = getPdfOcrStructureCompleteness(entry, model);
-    const sections = Math.max(model && Array.isArray(model.sections) ? model.sections.length : 0, Number(structure.sections) || 0);
+    const pageStructure = getPdfOcrStructureCompleteness(entry, null);
+    const modelStructure = model ? getPdfOcrStructureCompleteness(entry, model) : null;
+    const structure = modelStructure && modelStructure.complete && Number(modelStructure.score || 0) >= Number(pageStructure && pageStructure.score || 0)
+      ? modelStructure
+      : pageStructure;
+    const sections = Math.max(model && Array.isArray(model.sections) ? model.sections.length : 0, Number(structure && structure.sections) || 0);
     const words = model ? Number(model.totalReadableWords || model.totalWords || entry.words || 0) : Number(entry && entry.words) || 0;
-    const usable = sections >= 1 && words >= PDF_RECOVERY_MIN_WORDS && (!structure.letterLike || structure.complete);
-    return { usable, sections, words, model, structure };
+    const ocrTextQuality = evaluatePdfOcrTextQuality({
+      text: candidate.text,
+      lines: Array.isArray(candidate.lines) ? candidate.lines : [],
+      words: Number(candidate.words) || words,
+      confidence: Number(candidate.confidence) || 0
+    }, structure);
+    const usable = sections >= 1
+      && words >= PDF_RECOVERY_MIN_WORDS
+      && (!structure || structure.complete)
+      && ocrTextQuality.readable
+      && !ocrTextQuality.corrupted;
+    return { usable, sections, words, model, structure, ocrTextQuality };
   }
 
   function getPdfOcrEarlyStopDecision(candidate, pagesSoFar, routeKey, mode) {
@@ -7987,10 +9367,110 @@
     const evaluation = evaluatePdfOcrCandidateUsability(candidate, pagesSoFar, routeKey, normalizedMode);
     const words = Number(candidate && candidate.words) || 0;
     const confidence = Number(candidate && candidate.confidence) || 0;
+    const textQuality = evaluation.ocrTextQuality || evaluatePdfOcrTextQuality(candidate, evaluation.structure);
     const strong = normalizedMode === "better"
-      ? words >= 100 && confidence >= 85 && evaluation.usable
-      : words >= PDF_OCR_WEAK_TEXT_WORDS && confidence >= 70 && evaluation.usable;
-    return { stop: Boolean(strong), ...evaluation };
+      ? words >= 100 && confidence >= 85 && evaluation.usable && textQuality.complete && !textQuality.missedRegionLikely
+      : words >= PDF_OCR_WEAK_TEXT_WORDS && confidence >= 70 && evaluation.usable && textQuality.complete && !textQuality.missedRegionLikely;
+    return { stop: Boolean(strong), ...evaluation, ocrTextQuality: textQuality };
+  }
+
+  function getPdfOcrResultPrimaryCandidate(result) {
+    const pages = Array.isArray(result && result.pages) ? result.pages : [];
+    const text = String(result && result.text || pages.map((page) => page && page.text || "").filter(Boolean).join("\n\n")).trim();
+    const lines = pages.flatMap((page) => Array.isArray(page && page.lines) ? page.lines : []);
+    const firstPage = pages.find((page) => page && String(page.text || "").trim()) || pages[0] || {};
+    return {
+      text,
+      rawText: String(result && result.rawText || pages.map((page) => page && page.rawText || "").filter(Boolean).join("\n\n") || text),
+      words: Number(result && result.words) || countPdfWords(text),
+      lines,
+      confidence: Number(result && result.confidence) || averageLineConfidence(lines),
+      source: String(result && result.source || firstPage.source || "ocr"),
+      recognitionVariant: String(result && (result.bestVariantName || result.recognitionVariant || result.adaptiveMode) || firstPage.recognitionVariant || firstPage.ocrVariantName || ""),
+      ocrVariantName: String(result && (result.bestVariantName || result.ocrVariantName || result.adaptiveMode) || firstPage.ocrVariantName || firstPage.recognitionVariant || ""),
+      pageNumber: Number(firstPage.pageNumber) || 1,
+      rawTextLength: String(result && result.rawText || text).length
+    };
+  }
+
+  function getPdfOcrImmediateReturnDecision(result, routeKey = getPdfDocumentRouteKey(), mode = "fast") {
+    const candidate = getPdfOcrResultPrimaryCandidate(result);
+    if (!candidate.text) {
+      return {
+        strong: false,
+        provisional: false,
+        words: 0,
+        confidence: 0,
+        ocrTextQuality: evaluatePdfOcrTextQuality(candidate),
+        reason: "OCR did not return text."
+      };
+    }
+    const pages = Array.isArray(result && result.pages) ? result.pages : [{
+      pageNumber: candidate.pageNumber,
+      text: candidate.text,
+      words: candidate.words,
+      lines: candidate.lines,
+      source: candidate.source,
+      confidence: candidate.confidence
+    }];
+    const structure = getPdfOcrStructureCompleteness({
+      text: candidate.text,
+      pages,
+      words: candidate.words,
+      source: "ocr"
+    });
+    const ocrTextQuality = result && result.ocrTextQuality && typeof result.ocrTextQuality === "object"
+      ? result.ocrTextQuality
+      : evaluatePdfOcrTextQuality(candidate, structure);
+    const normalizedMode = normalizePdfOcrDiagnosticMode(mode);
+    const minConfidence = normalizedMode === "better" ? 85 : 70;
+    const minWords = normalizedMode === "better" ? 100 : PDF_OCR_WEAK_TEXT_WORDS;
+    const strong = Boolean(
+      candidate.words >= minWords
+      && candidate.confidence >= minConfidence
+      && ocrTextQuality.readable
+      && ocrTextQuality.complete
+      && !ocrTextQuality.corrupted
+      && !ocrTextQuality.missedRegionLikely
+      && (!structure || structure.complete)
+    );
+    const provisional = Boolean(candidate.words > 0 && !strong);
+    return {
+      strong,
+      provisional,
+      words: candidate.words,
+      confidence: candidate.confidence,
+      lineCount: candidate.lines.length,
+      structure,
+      ocrTextQuality,
+      reason: strong ? "OCR result is complete enough to return immediately." : ocrTextQuality.selectedVariantReason || "OCR result needs comparison before returning.",
+      routeKey
+    };
+  }
+
+  function emitPdfOcrSelectedVariant(pageNumber, variant, details = {}) {
+    if (!variant) return;
+    const quality = variant.ocrTextQuality && typeof variant.ocrTextQuality === "object"
+      ? variant.ocrTextQuality
+      : evaluatePdfOcrTextQuality(variant);
+    emitDebug("pdf:ocr:selected-variant", {
+      pageNumber,
+      variantName: String(variant.recognitionVariant || variant.ocrVariantName || details.variantName || "unknown"),
+      mode: details.mode || runtime.pdfOcr && runtime.pdfOcr.mode || "",
+      source: variant.source || "ocr",
+      wordCount: Number(variant.words) || countPdfWords(variant.text || ""),
+      confidence: Number(variant.confidence) || 0,
+      lineCount: Array.isArray(variant.lines) ? variant.lines.length : 0,
+      readableWordRatio: quality.readableWordRatio || 0,
+      lineCoverage: quality.lineCoverage || 0,
+      pageCoverage: quality.pageCoverage || 0,
+      paragraphContinuity: quality.paragraphContinuity || 0,
+      textCompleteness: quality.textCompleteness || 0,
+      missedRegionLikely: Boolean(quality.missedRegionLikely),
+      corrupted: Boolean(quality.corrupted),
+      selectedVariantReason: quality.selectedVariantReason || "",
+      firstTextSample: String(variant.text || variant.rawText || "").slice(0, 240)
+    });
   }
 
   async function tryPdfOcrVariant(pageNumber, variant, currentBest, errors, resultsLog = null) {
@@ -8019,6 +9499,7 @@
         wordCount: result && result.words || 0,
         confidence: result && result.confidence || 0,
         firstTextSample: result && result.firstTextSample || "",
+        ocrTextQuality: result && result.ocrTextQuality || null,
         source: result && result.source || "ocr",
         selected
       };
@@ -8309,11 +9790,14 @@
           }
         }
         const cleanText = bestVariant ? bestVariant.text : "";
+        const rawText = bestVariant ? bestVariant.rawText || bestVariant.text || "" : "";
         const words = bestVariant ? bestVariant.words : 0;
         const lines = bestVariant ? bestVariant.lines : [];
         const confidence = bestVariant ? bestVariant.confidence : 0;
         const source = bestVariant ? bestVariant.source : "ocr";
         const recognitionVariant = bestVariant ? bestVariant.recognitionVariant : "none";
+        const ocrTextQuality = bestVariant ? bestVariant.ocrTextQuality || evaluatePdfOcrTextQuality(bestVariant) : null;
+        emitPdfOcrSelectedVariant(pageNumber, bestVariant, { mode: plan.mode, variantName: recognitionVariant });
         const everyVariantEmpty = variantResults.length > 0 && variantResults.every((variant) => Number(variant.rawTextLength || 0) === 0);
         if (everyVariantEmpty) {
           emitDebug("pdf:ocr:blank-or-unreadable-canvas", {
@@ -8340,6 +9824,7 @@
           recognitionVariant,
           renderScale: rendered && rendered.scale ? Math.round(rendered.scale * 100) / 100 : 0,
           lines: lines.length,
+          ocrTextQuality,
           canvasStats: rendered && rendered.canvasStats || null,
           variantResults,
           variantErrors,
@@ -8360,10 +9845,23 @@
           canvasStats: rendered && rendered.canvasStats || null,
           variantResults,
           variantErrors,
+          ocrTextQuality,
           success: words > 0
         });
         if (cleanText) {
-          pages.push({ pageNumber, text: cleanText, words, lines, source, confidence, recognitionVariant, ocrVariantName: recognitionVariant });
+          pages.push({
+            pageNumber,
+            text: cleanText,
+            rawText,
+            reconstructedText: cleanText,
+            words,
+            lines,
+            source,
+            confidence,
+            recognitionVariant,
+            ocrVariantName: recognitionVariant,
+            ocrTextQuality
+          });
           totalWords += words;
         }
         if (earlyStop.stop) {
@@ -8379,6 +9877,7 @@
             ocrCompletenessScore: Number(earlyStop.structure && earlyStop.structure.score) || 0,
             ocrRoleCounts: earlyStop.structure && earlyStop.structure.roleCounts || {},
             ocrBodyWords: Number(earlyStop.structure && earlyStop.structure.bodyWords) || 0,
+            ocrTextQuality: earlyStop.ocrTextQuality || null,
             exactIssue: "OCR stopped remaining variants/pages because the current candidate already produced usable OCR sections with strong text."
           });
           onProgress({
@@ -8418,14 +9917,16 @@
             }, null, captureErrors);
             if (captureResult && captureResult.text && captureResult.words > 0) {
               const cleanText = captureResult.text;
+              const rawText = captureResult.rawText || captureResult.text || "";
               const words = captureResult.words;
               const lines = captureResult.lines || [];
               const confidence = captureResult.confidence || 0;
+              const ocrTextQuality = captureResult.ocrTextQuality || evaluatePdfOcrTextQuality(captureResult);
               if (confidence > 0) {
                 confidenceTotal += confidence;
                 confidencePages += 1;
               }
-              pages.push({ pageNumber, text: cleanText, words, lines, source: captureResult.source || "ocr", confidence, recognitionVariant: captureResult.recognitionVariant || "visible-capture-after-render-timeout", ocrVariantName: captureResult.ocrVariantName || captureResult.recognitionVariant || "visible-capture-after-render-timeout" });
+              pages.push({ pageNumber, text: cleanText, rawText, reconstructedText: cleanText, words, lines, source: captureResult.source || "ocr", confidence, recognitionVariant: captureResult.recognitionVariant || "visible-capture-after-render-timeout", ocrVariantName: captureResult.ocrVariantName || captureResult.recognitionVariant || "visible-capture-after-render-timeout", ocrTextQuality });
               totalWords += words;
               pageDiagnostics.push({
                 pageNumber,
@@ -8435,6 +9936,7 @@
                 recognitionVariant: captureResult.recognitionVariant || "visible-capture-after-render-timeout",
                 renderScale: 0,
                 lines: lines.length,
+                ocrTextQuality,
                 variantErrors: captureErrors,
                 fallbackFromRenderTimeout: true
               });
@@ -8534,6 +10036,14 @@
     return {
       pages,
       text,
+      rawText: pages.map((page) => page.rawText || page.text || "").join("\n\n").trim(),
+      reconstructedText: text,
+      ocrTextQuality: evaluatePdfOcrTextQuality({
+        text,
+        lines: pages.flatMap((page) => page.lines || []),
+        words: totalWords,
+        confidence: confidencePages ? Math.round(confidenceTotal / confidencePages) : 0
+      }, getPdfOcrStructureCompleteness({ text, pages, words: totalWords, source: "ocr" })),
       numPages,
       pagesRead,
       words: totalWords,
@@ -8648,12 +10158,33 @@
         });
         const result = await tryPdfOcrVariant(1, variant, bestVariant, variantErrors, variantResults);
         if (isBetterPdfOcrVariant(result, bestVariant)) bestVariant = result;
-        if (bestVariant && isMeaningfulShortOcrText(bestVariant.text, [{ pageNumber: 1, lines: bestVariant.lines || [] }])) break;
+        if (bestVariant) {
+          const interimDecision = getPdfOcrImmediateReturnDecision({
+            pages: [{ pageNumber: 1, text: bestVariant.text, words: bestVariant.words, lines: bestVariant.lines || [], source: "visible-capture", confidence: bestVariant.confidence, recognitionVariant: bestVariant.recognitionVariant, ocrVariantName: bestVariant.ocrVariantName }],
+            text: bestVariant.text,
+            words: bestVariant.words,
+            confidence: bestVariant.confidence,
+            source: "ocr",
+            adaptiveMode: "ultra-fast",
+            ocrTextQuality: bestVariant.ocrTextQuality
+          }, getPdfDocumentRouteKey(), "fast");
+          if (interimDecision.strong) break;
+        }
       }
       const cleanText = String(bestVariant && bestVariant.text || "").trim();
       const words = countPdfWords(cleanText);
       const lines = bestVariant && bestVariant.lines || pdfOcrLinesFromText(cleanText);
       const confidence = bestVariant && bestVariant.confidence || 0;
+      const immediateDecision = getPdfOcrImmediateReturnDecision({
+        pages: cleanText ? [{ pageNumber: 1, text: cleanText, words, lines, source: "visible-capture", confidence, recognitionVariant: bestVariant && bestVariant.recognitionVariant || "visible-capture", ocrVariantName: bestVariant && bestVariant.ocrVariantName || bestVariant && bestVariant.recognitionVariant || "visible-capture" }] : [],
+        text: cleanText,
+        words,
+        confidence,
+        source: "ocr",
+        adaptiveMode: "ultra-fast",
+        ocrTextQuality: bestVariant && bestVariant.ocrTextQuality || null
+      }, getPdfDocumentRouteKey(), "fast");
+      if (bestVariant) emitPdfOcrSelectedVariant(1, bestVariant, { mode: "ultra-fast" });
       pageDiagnostics.push({
         pageNumber: 1,
         words,
@@ -8661,6 +10192,9 @@
         source: "visible-capture",
         confidence,
         recognitionVariant: bestVariant && bestVariant.recognitionVariant || "none",
+        ocrTextQuality: immediateDecision.ocrTextQuality || bestVariant && bestVariant.ocrTextQuality || null,
+        immediateReturn: Boolean(immediateDecision.strong),
+        provisional: Boolean(immediateDecision.provisional),
         variantResults,
         variantErrors
       });
@@ -8672,6 +10206,9 @@
         confidence,
         quality: quality.quality,
         qualityScore: quality.score,
+        ocrTextQuality: immediateDecision.ocrTextQuality || null,
+        immediateReturn: Boolean(immediateDecision.strong),
+        provisional: Boolean(immediateDecision.provisional),
         sample: cleanText.slice(0, 260),
         pageDiagnostics,
         exactIssue: words > 0
@@ -8700,6 +10237,7 @@
         qualityScore: quality.score,
         qualityMessage: quality.message,
         confidence,
+        ocrTextQuality: immediateDecision.ocrTextQuality || null,
         pageDiagnostics,
         adaptiveMode: "ultra-fast",
         adaptiveDevice: device,
@@ -8773,20 +10311,29 @@
     if (device.slow || fastPlan.viewportFirst) {
       ultraFastResult = await extractPdfTextWithVisibleViewportOcr(sourceUrl, { onProgress, attemptId });
       const ultraWords = Number(ultraFastResult && ultraFastResult.words) || countPdfWords(ultraFastResult && ultraFastResult.text || "");
-      if (ultraWords >= 1 && (isMeaningfulShortOcrText(ultraFastResult.text, ultraFastResult.pages) || ultraWords >= PDF_OCR_SHORT_MEANINGFUL_WORDS)) {
+      const ultraDecision = getPdfOcrImmediateReturnDecision(ultraFastResult, routeKey, fastPlan.mode);
+      if (ultraDecision.strong) {
         emitDebug("pdf:ocr:adaptive:ultra-fast-selected", {
           words: ultraWords,
           quality: ultraFastResult.ocrQuality || "",
           qualityScore: ultraFastResult.qualityScore || 0,
+          confidence: ultraDecision.confidence,
+          lineCount: ultraDecision.lineCount,
+          ocrTextQuality: ultraDecision.ocrTextQuality || null,
           device,
-          note: "Ultra Fast visible-page OCR produced usable partial text, so SkimRoute returns it instead of forcing heavier OCR on a low-power device."
+          note: "Ultra Fast visible-page OCR produced complete readable text, so SkimRoute returns it instead of forcing heavier OCR on a low-power device."
         });
         return ultraFastResult;
       }
       emitDebug("pdf:ocr:adaptive:ultra-fast-low-text", {
         words: ultraWords,
+        quality: ultraFastResult && ultraFastResult.ocrQuality || "",
+        qualityScore: ultraFastResult && ultraFastResult.qualityScore || 0,
+        confidence: ultraDecision.confidence,
+        lineCount: ultraDecision.lineCount,
+        ocrTextQuality: ultraDecision.ocrTextQuality || null,
         device,
-        note: "Ultra Fast OCR did not recover enough visible text, so SkimRoute is falling back to lightweight PDF page OCR."
+        note: "Ultra Fast OCR was incomplete or suspicious, so SkimRoute is falling back to lightweight PDF page OCR."
       });
     }
     assertPdfOcrNotCancelled(attemptId);
@@ -8828,10 +10375,16 @@
       }
       const fastResultWords = Number(fastResult && fastResult.words) || countPdfWords(fastResult && fastResult.text || "");
       const ultraResultWords = Number(ultraFastResult && ultraFastResult.words) || countPdfWords(ultraFastResult && ultraFastResult.text || "");
-      if (ultraFastResult && ultraResultWords > fastResultWords) {
+      const ultraKeepDecision = getPdfOcrImmediateReturnDecision(ultraFastResult, routeKey, fastPlan.mode);
+      const fastKeepDecision = getPdfOcrImmediateReturnDecision(fastResult, routeKey, fastPlan.mode);
+      const ultraCandidate = getPdfOcrResultPrimaryCandidate(ultraFastResult);
+      const fastCandidate = getPdfOcrResultPrimaryCandidate(fastResult);
+      if (ultraFastResult && ultraResultWords > fastResultWords && ultraKeepDecision.strong && isBetterPdfOcrVariant(ultraCandidate, fastCandidate)) {
         emitDebug("pdf:ocr:adaptive:ultra-fast-kept-after-fast", {
           ultraResultWords,
           fastResultWords,
+          ultraTextQuality: ultraKeepDecision.ocrTextQuality || null,
+          fastTextQuality: fastKeepDecision.ocrTextQuality || null,
           device,
           note: "The lightweight visible-page OCR result was better than the heavier PDF.js OCR result, so SkimRoute kept the visible-page result."
         });
@@ -9296,13 +10849,14 @@
         const recoveredPages = normalizePdfRecoveryPages(result && result.pages);
         runtime.pdfOcr.lastDiagnostics = Array.isArray(result && result.pageDiagnostics) ? result.pageDiagnostics.slice(0, 12) : [];
         if (allowOcr || source === "ocr") {
+          const rawOcrText = String(result && result.rawText || text);
           rememberRawPdfOcrText({
             ocrRunId: attemptId,
             routeKey,
             source,
-            text,
+            text: rawOcrText,
             pages: recoveredPages,
-            wordCount: textWords,
+            wordCount: countPdfWords(rawOcrText),
             confidence: result && result.confidence || 0
           });
         }
@@ -9324,6 +10878,9 @@
             qualityMessage: result && result.qualityMessage || "",
             confidence: result && result.confidence || 0,
             pageDiagnostics: result && result.pageDiagnostics || [],
+            rawText: result && result.rawText || text,
+            reconstructedText: result && result.reconstructedText || text,
+            ocrTextQuality: result && result.ocrTextQuality || null,
             fingerprint: result && result.fingerprint || null,
             fileName: getPdfFileNameFromRoute(routeKey),
             ocrMode: result && (result.adaptiveMode || result.ocrMode) || runtime.pdfOcr.mode || ""
@@ -10459,6 +12016,9 @@
           qualityMessage: result && result.qualityMessage || "",
           confidence: result && result.confidence || 0,
           pageDiagnostics: result && result.pageDiagnostics || [],
+          rawText: result && result.rawText || text,
+          reconstructedText: result && result.reconstructedText || text,
+          ocrTextQuality: result && result.ocrTextQuality || null,
           fingerprint: result && result.fingerprint || null,
           fileName: getPdfFileNameFromRoute(routeKey),
           ocrMode: result && (result.adaptiveMode || result.ocrMode) || runtime.pdfOcr.mode || ""
@@ -12799,12 +14359,31 @@
   function getPdfSectionOcrGeometry(section) {
     if (!section) return null;
     const unitMeta = section.unitMeta && typeof section.unitMeta === "object" ? section.unitMeta : {};
+    const sourceLineGeometry = mergePdfOcrLineBackedGeometry(unitMeta.ocrSourceLines);
+    if (sourceLineGeometry) {
+      const sourceLineIds = Array.isArray(unitMeta.sourceLineIds) && unitMeta.sourceLineIds.length
+        ? unitMeta.sourceLineIds
+        : sourceLineGeometry.sourceLineIds || [];
+      const exact = Boolean(sourceLineGeometry.exact && unitMeta.ocrExactGeometry !== false && !unitMeta.ocrHighlightApproximate && sourceLineIds.length && isPdfOcrExactGeometryUsable(sourceLineGeometry));
+      return {
+        ...sourceLineGeometry,
+        exact,
+        approximate: !exact,
+        ocrVariantName: unitMeta.ocrVariantName || sourceLineGeometry.ocrVariantName || "",
+        sourceLineIds,
+        sourceLineTextSample: unitMeta.sourceLineTextSample || sourceLineGeometry.sourceLineTextSample || "",
+        cropOffset: unitMeta.cropOffset || sourceLineGeometry.cropOffset || null,
+        renderScale: Number(unitMeta.renderScale || sourceLineGeometry.renderScale || 0) || 0,
+        rotation: Number(unitMeta.rotation || sourceLineGeometry.rotation || 0) || 0
+      };
+    }
     const direct = normalizePdfOcrGeometry(unitMeta.ocrGeometry || section.ocrGeometry || null);
     if (direct) {
+      const sourceLineObjects = normalizePdfOcrSourceLines(unitMeta.ocrSourceLines);
       const sourceLineIds = Array.isArray(unitMeta.sourceLineIds) && unitMeta.sourceLineIds.length
         ? unitMeta.sourceLineIds
         : direct.sourceLineIds || [];
-      const exact = Boolean(direct.exact && unitMeta.ocrExactGeometry !== false && !unitMeta.ocrHighlightApproximate && sourceLineIds.length);
+      const exact = Boolean(direct.exact && unitMeta.ocrExactGeometry !== false && !unitMeta.ocrHighlightApproximate && sourceLineIds.length && sourceLineObjects.length && isPdfOcrExactGeometryUsable(direct));
       return {
         ...direct,
         exact,
@@ -12812,6 +14391,7 @@
         ocrVariantName: unitMeta.ocrVariantName || direct.ocrVariantName || "",
         sourceLineIds,
         sourceLineTextSample: unitMeta.sourceLineTextSample || direct.sourceLineTextSample || "",
+        ocrSourceLines: sourceLineObjects,
         cropOffset: unitMeta.cropOffset || direct.cropOffset || null,
         renderScale: Number(unitMeta.renderScale || direct.renderScale || 0) || 0,
         rotation: Number(unitMeta.rotation || direct.rotation || 0) || 0
@@ -12833,9 +14413,10 @@
       rotation: unitMeta.rotation
     });
     if (bbox) {
+      const sourceLineObjects = normalizePdfOcrSourceLines(unitMeta.ocrSourceLines);
       const sourceLineIds = Array.isArray(unitMeta.sourceLineIds) ? unitMeta.sourceLineIds : [];
-      const exact = Boolean(bbox.exact && unitMeta.ocrExactGeometry !== false && !unitMeta.ocrHighlightApproximate && sourceLineIds.length);
-      return { ...bbox, exact, approximate: !exact, sourceLineIds };
+      const exact = Boolean(bbox.exact && unitMeta.ocrExactGeometry !== false && !unitMeta.ocrHighlightApproximate && sourceLineIds.length && sourceLineObjects.length && isPdfOcrExactGeometryUsable(bbox));
+      return { ...bbox, exact, approximate: !exact, sourceLineIds, ocrSourceLines: sourceLineObjects };
     }
     if (!isOcrPdfSection(section)) return null;
     const center = clampPdfRelativeValue(unitMeta.relativeY, 0.14);
@@ -12935,8 +14516,12 @@
       if ((!Array.isArray(section.unitMeta.sourceLineIds) || !section.unitMeta.sourceLineIds.length) && Array.isArray(geometry.sourceLineIds)) {
         section.unitMeta.sourceLineIds = geometry.sourceLineIds.slice(0, 120);
       }
+      if ((!Array.isArray(section.unitMeta.ocrSourceLines) || !section.unitMeta.ocrSourceLines.length) && Array.isArray(geometry.ocrSourceLines)) {
+        section.unitMeta.ocrSourceLines = normalizePdfOcrSourceLines(geometry.ocrSourceLines);
+      }
       if (!section.unitMeta.sourceLineTextSample && geometry.sourceLineTextSample) section.unitMeta.sourceLineTextSample = geometry.sourceLineTextSample;
     }
+    if (!section.unitMeta.sectionText) section.unitMeta.sectionText = String(section.text || "").slice(0, 7000);
     if (!section.unitMeta.sectionTextSample) section.unitMeta.sectionTextSample = String(section.text || "").replace(/\s+/g, " ").trim().slice(0, 260);
     section.unitMeta.synthetic = section.unitMeta.synthetic !== false;
     return section;
@@ -14032,8 +15617,8 @@
       quietReason: pdfTerminalCopy ? pdfTerminalCopy.bestReason : model.pageProfile.quietReason || model.pageProfile.reason || "",
       archetype: model.pageProfile.type,
       bestLabel: pdfTerminalCopy ? pdfTerminalCopy.bestLabel : loading ? "Scanning" : pdfRouteLocked && quietMode ? "PDF map" : model.bestLabel || (pdfLike && publicSections.length ? "PDF map ready" : ""),
-      bestKind: model.bestKind || "",
-      bestKindLabel: model.bestKindLabel || bestSection && bestSection.metrics && bestSection.metrics.sectionKindLabel || "",
+      bestKind: model.bestKind || bestSection && bestSection.intelligence && bestSection.intelligence.role || "",
+      bestKindLabel: model.bestKindLabel || bestSection && bestSection.intelligence && bestSection.intelligence.roleLabel || bestSection && bestSection.metrics && bestSection.metrics.sectionKindLabel || "",
       targetConfidenceReason: model.targetConfidenceReason || "",
       savedMinutes: model.savedMinutes
     };
@@ -14043,6 +15628,11 @@
   }
 
   function reasonForPublicSection(section) {
+    const intelligenceReason = section
+      && section.intelligence
+      && Array.isArray(section.intelligence.whyReasons)
+      && section.intelligence.whyReasons[0];
+    if (intelligenceReason) return intelligenceReason;
     const kindReason = reasonForPublicSectionKind(section);
     if (kindReason) return kindReason;
     if (section.unitMeta && section.unitMeta.diagnosticReason) return section.unitMeta.diagnosticReason;
@@ -15577,40 +17167,73 @@
     if (!isOcrPdfSection(section)) return { geometry: null, exact: false, reason: "not-ocr" };
     const unitMeta = section && section.unitMeta || {};
     const geometry = getPdfSectionOcrGeometry(section);
-    const sourceLineIds = Array.isArray(unitMeta.sourceLineIds) ? unitMeta.sourceLineIds.filter(Boolean) : geometry && geometry.sourceLineIds || [];
-    const sectionSample = String(unitMeta.sectionTextSample || section && section.text || "").replace(/\s+/g, " ").trim().slice(0, 260);
-    const sourceSample = String(unitMeta.sourceLineTextSample || geometry && geometry.sourceLineTextSample || "").replace(/\s+/g, " ").trim().slice(0, 260);
+    const sourceLines = normalizePdfOcrSourceLines(unitMeta.ocrSourceLines || geometry && geometry.ocrSourceLines || []);
+    const sourceLineIds = Array.isArray(unitMeta.sourceLineIds) && unitMeta.sourceLineIds.length
+      ? unitMeta.sourceLineIds.filter(Boolean)
+      : geometry && Array.isArray(geometry.sourceLineIds) ? geometry.sourceLineIds.filter(Boolean) : [];
+    const sourceLineIdSet = new Set(sourceLines.flatMap((line) => line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : [line.id]).filter(Boolean));
+    const sectionSample = String(unitMeta.sectionText || unitMeta.sectionTextSample || section && section.text || "").replace(/\s+/g, " ").trim().slice(0, 360);
+    const sourceSample = String(sourceLines.length ? sourceLines.map((line) => line.text).join(" ") : unitMeta.sourceLineTextSample || geometry && geometry.sourceLineTextSample || "").replace(/\s+/g, " ").trim().slice(0, 360);
+    const lineGeometry = sourceLines.length ? mergePdfOcrLineBackedGeometry(sourceLines) : null;
+    const verifiedGeometry = lineGeometry && lineGeometry.exact ? lineGeometry : geometry;
+    const unitVariant = String(unitMeta.ocrVariantName || "").trim();
+    const geometryVariant = String(verifiedGeometry && verifiedGeometry.ocrVariantName || "").trim();
+    const lineVariants = Array.from(new Set(sourceLines.map((line) => String(line.ocrVariantName || "").trim()).filter(Boolean)));
+    const idsMatch = Boolean(sourceLineIds.length && sourceLineIds.every((id) => sourceLineIdSet.has(id)));
+    const variantMatches = Boolean(
+      lineVariants.length <= 1
+      && (!unitVariant || !geometryVariant || unitVariant === geometryVariant)
+      && (!unitVariant || !lineVariants.length || lineVariants[0] === unitVariant)
+    );
+    const textMatches = pdfOcrTextSamplesOverlap(sectionSample, sourceSample);
+    const saneGeometry = isPdfOcrExactGeometryUsable(verifiedGeometry, { requireWords: sourceLines.some((line) => Array.isArray(line.wordBoxes) && line.wordBoxes.length) });
     const exact = Boolean(
+      sourceLines.length
+      &&
       geometry
-      && geometry.exact
+      && verifiedGeometry
+      && verifiedGeometry.exact
       && unitMeta.ocrExactGeometry !== false
       && !unitMeta.ocrHighlightApproximate
       && sourceLineIds.length
-      && pdfOcrTextSamplesOverlap(sectionSample, sourceSample)
+      && idsMatch
+      && variantMatches
+      && textMatches
+      && saneGeometry
     );
     if (!exact) {
+      const mismatchReason = !geometry ? "missing-geometry"
+        : !sourceLines.length ? "missing-source-line-objects"
+          : !sourceLineIds.length ? "missing-source-lines"
+            : !idsMatch ? "source-line-id-mismatch"
+              : !variantMatches ? "variant-mismatch"
+                : !textMatches ? "text-sample-mismatch"
+                  : !saneGeometry ? "invalid-or-blank-rectangle"
+                    : "geometry-marked-approximate";
       emitDebug("pdf:ocr:geometry-mismatch", {
         sectionId: section && section.id,
         pageNumber: getPdfSectionPageNumber(section),
-        variantName: unitMeta.ocrVariantName || geometry && geometry.ocrVariantName || "",
+        variantName: unitMeta.ocrVariantName || verifiedGeometry && verifiedGeometry.ocrVariantName || "",
         sourceLineIds,
+        verifiedSourceLineIds: Array.from(sourceLineIdSet),
         sectionTextSample: sectionSample,
         sourceLineTextSample: sourceSample,
-        rectangle: geometry && geometry.bbox || null,
-        renderScale: Number(unitMeta.renderScale || geometry && geometry.renderScale || 0) || 0,
-        cropOffset: unitMeta.cropOffset || geometry && geometry.cropOffset || null,
-        rotation: Number(unitMeta.rotation || geometry && geometry.rotation || 0) || 0,
-        mismatchReason: !geometry ? "missing-geometry" : !sourceLineIds.length ? "missing-source-lines" : !pdfOcrTextSamplesOverlap(sectionSample, sourceSample) ? "text-sample-mismatch" : "geometry-marked-approximate",
+        rectangle: verifiedGeometry && verifiedGeometry.bbox || null,
+        renderScale: Number(unitMeta.renderScale || verifiedGeometry && verifiedGeometry.renderScale || 0) || 0,
+        cropOffset: unitMeta.cropOffset || verifiedGeometry && verifiedGeometry.cropOffset || null,
+        rotation: Number(unitMeta.rotation || verifiedGeometry && verifiedGeometry.rotation || 0) || 0,
+        mismatchReason,
         exactIssue: "Exact OCR geometry could not be verified against the section text, so SkimRoute will use an approximate page highlight instead."
       });
     }
     return {
-      geometry,
+      geometry: exact ? verifiedGeometry : geometry,
       exact,
       sourceLineIds,
       sectionTextSample: sectionSample,
       sourceLineTextSample: sourceSample,
-      variantName: unitMeta.ocrVariantName || geometry && geometry.ocrVariantName || ""
+      variantName: unitMeta.ocrVariantName || verifiedGeometry && verifiedGeometry.ocrVariantName || "",
+      ocrSourceLines: sourceLines
     };
   }
 

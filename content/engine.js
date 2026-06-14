@@ -100,6 +100,18 @@
     summary: "Summary",
     conclusion: "Conclusion",
     steps: "Steps",
+    quick_start: "Quick start",
+    installation: "Installation",
+    usage: "Usage",
+    parameters: "Parameters",
+    troubleshooting: "Troubleshooting",
+    prerequisites: "Prerequisites",
+    setup: "Setup",
+    final_result: "Final result",
+    ingredients: "Ingredients",
+    instructions: "Instructions",
+    timing: "Timing",
+    tips: "Useful tips",
     definition: "Definition",
     code_block: "Code block",
     complete_code: "Complete code",
@@ -109,8 +121,8 @@
     key_explanation: "Key explanation",
     main_argument: "Main argument",
     key_evidence: "Key evidence",
-    results: "Results",
     abstract: "Abstract",
+    results: "Results",
     introduction: "Introduction",
     methods: "Methods",
     discussion: "Discussion",
@@ -124,6 +136,7 @@
     boilerplate: "Boilerplate",
     works_cited: "Works cited",
     appendix: "Appendix",
+    changelog: "Changelog",
     title_page: "Title page",
     prompt_echo: "Prompt",
     toc: "Contents",
@@ -143,6 +156,7 @@
     search_videos: "Videos",
     search_shopping: "Shopping",
     search_maps: "Maps",
+    search_related_searches: "Related searches",
     useful_section: "Useful section"
   };
 
@@ -158,6 +172,125 @@
     if (normalized === "signature") return "ocr_signature";
     return normalized ? `ocr_${normalized}` : "";
   }
+
+  const INTELLIGENCE_POSITIVE_SIGNALS = [
+    { key: "correctedAnswer", weight: 96, explanation: "Updated answer after a user correction." },
+    { key: "replacesFailedAttempt", weight: 88, explanation: "Newer answer replaces an earlier failed attempt." },
+    { key: "latestCompleteAssistantAnswer", weight: 84, explanation: "Newest complete assistant response." },
+    { key: "finalRecommendation", weight: 104, explanation: "Contains final recommendation language." },
+    { key: "finalAnswer", weight: 92, explanation: "Looks like the final answer." },
+    { key: "finalCode", weight: 90, explanation: "Marked as final usable code." },
+    { key: "completeAssistantAnswer", weight: 74, explanation: "Complete assistant response." },
+    { key: "completeCode", weight: 70, explanation: "Contains complete usable code." },
+    { key: "stepByStepAnswer", weight: 80, explanation: "Breaks the answer into steps." },
+    { key: "keyExplanation", weight: 66, explanation: "Explains the key reasoning." },
+    { key: "conciseAnswer", weight: 62, explanation: "Opens with a concise answer." },
+    { key: "answer", weight: 46, explanation: "Has a direct answer signal." },
+    { key: "procedure", weight: 42, explanation: "Contains procedural guidance." },
+    { key: "action", weight: 38, explanation: "Looks actionable." },
+    { key: "directAction", weight: 52, explanation: "Gives direct next actions." },
+    { key: "summary", weight: 52, explanation: "Summarizes useful content." },
+    { key: "quickStart", weight: 86, explanation: "Quick start section for getting oriented." },
+    { key: "installation", weight: 72, explanation: "Installation or setup instructions." },
+    { key: "usage", weight: 76, explanation: "Usage guidance with practical details." },
+    { key: "parameters", weight: 62, explanation: "Explains options, parameters, or API fields." },
+    { key: "troubleshooting", weight: 64, explanation: "Helps diagnose or fix issues." },
+    { key: "prerequisites", weight: 54, explanation: "Prerequisites or requirements before starting." },
+    { key: "setup", weight: 68, explanation: "Setup guidance before the main steps." },
+    { key: "finalResult", weight: 60, explanation: "Shows the final result or expected outcome." },
+    { key: "ingredients", weight: 66, explanation: "Lists required ingredients." },
+    { key: "instructions", weight: 82, explanation: "Recipe instructions or method steps." },
+    { key: "timing", weight: 48, explanation: "Contains timing details." },
+    { key: "tips", weight: 44, explanation: "Useful tips, notes, or substitutions." },
+    { key: "abstract", weight: 70, explanation: "Research abstract summarizes the paper." },
+    { key: "results", weight: 66, explanation: "Shows results or findings." },
+    { key: "mainArgument", weight: 74, explanation: "States a main argument or claim." },
+    { key: "keyEvidence", weight: 60, explanation: "Supports the main point with evidence." },
+    { key: "methods", weight: 40, explanation: "Explains a method or procedure." },
+    { key: "discussion", weight: 52, explanation: "Interprets findings or implications." },
+    { key: "conclusion", weight: 64, explanation: "Wraps up the useful takeaway." },
+    { key: "definition", weight: 52, explanation: "Defines a key term." },
+    { key: "recommendation", weight: 30, explanation: "Uses recommendation language." },
+    { key: "example", weight: 24, explanation: "Shows an example or comparison." },
+    { key: "acceptedAnswer", weight: 46, explanation: "Looks like a confirmed answer." },
+    { key: "latestAssistantAnswer", weight: 46, explanation: "Newest substantial assistant response." },
+    { key: "answersLatestUser", weight: 60, explanation: "Answers the latest user request." }
+  ];
+
+  const INTELLIGENCE_NEGATIVE_SIGNALS = [
+    { key: "incompleteAssistantAnswer", weight: -148, explanation: "Latest assistant turn is incomplete or not substantive." },
+    { key: "loadingOrFailedAnswer", weight: -138, explanation: "Looks like loading or failed-answer text." },
+    { key: "promptEcho", weight: -116, explanation: "Looks like the user prompt rather than the answer." },
+    { key: "boilerplate", weight: -114, explanation: "Looks like boilerplate or page chrome." },
+    { key: "references", weight: -112, explanation: "Looks like references or citations." },
+    { key: "citationOnly", weight: -92, explanation: "Mostly citation text." },
+    { key: "tableOfContents", weight: -80, explanation: "Looks like a table of contents." },
+    { key: "appendix", weight: -68, explanation: "Looks like appendix material." },
+    { key: "supersededDraft", weight: -66, explanation: "Looks like an older or superseded draft." },
+    { key: "shortConfirmation", weight: -54, explanation: "Too short to be a useful target." },
+    { key: "repeatedNoise", weight: -34, explanation: "Contains repeated OCR or page noise." },
+    { key: "headerOnly", weight: -26, explanation: "Looks like a header without enough body text." },
+    { key: "pageTypeClutter", weight: -96, explanation: "Looks like navigation, promotion, comments, or account UI." },
+    { key: "changelog", weight: -70, explanation: "Changelog or release-note material is usually secondary." }
+  ];
+
+  const INTELLIGENCE_ROLE_REASONS = {
+    ocr_letter_body: "This paragraph is the main body of the scanned letter, not the letterhead or signature.",
+    ocr_date_reference: "Reference or date details from the scanned letter.",
+    ocr_letterhead: "Letterhead or company contact block, usually less important than the body.",
+    ocr_recipient: "Recipient address block before the letter body.",
+    ocr_signature: "Signature or initials block, usually less important than the body.",
+    ocr_footer: "Footer or repeated page noise.",
+    search_ai_overview: "AI Overview is the highest-value search block.",
+    search_answer: "Search answer block gives a direct answer.",
+    search_sources: "Sources support the search answer.",
+    search_people_also_ask: "Related questions help refine the search.",
+    search_top_results: "Top organic results are the best next area.",
+    search_videos: "Video results may be useful for this query.",
+    search_maps: "Map or local results are useful for location-oriented queries.",
+    search_related_searches: "Related searches help refine the query.",
+    search_shopping: "Shopping results are specialized and usually secondary to answers or organic results.",
+    main_argument: "States the main argument.",
+    key_evidence: "Supports the main point with evidence.",
+    quick_start: "Quick start gets users to a working path quickly.",
+    installation: "Installation details are high-value documentation content.",
+    usage: "Usage guidance explains how to apply the feature.",
+    parameters: "Parameter or option details support implementation.",
+    troubleshooting: "Troubleshooting content helps resolve likely issues.",
+    prerequisites: "Prerequisites clarify what is needed before starting.",
+    setup: "Setup content prepares the tutorial workflow.",
+    final_result: "Final result shows the expected outcome.",
+    ingredients: "Ingredients are core recipe content.",
+    instructions: "Instructions are the actionable recipe method.",
+    timing: "Timing details help execute the recipe.",
+    tips: "Useful tips improve the recipe outcome.",
+    abstract: "Abstract summarizes the research page.",
+    results: "Shows results or findings.",
+    conclusion: "Wraps up the useful takeaway.",
+    definition: "Defines a key term.",
+    code_block: "Includes usable code.",
+    complete_code: "Includes usable code.",
+    latest_answer: "Newest complete assistant response.",
+    corrected_answer: "Updated answer after a correction.",
+    final_recommendation: "Gives the final recommendation.",
+    step_by_step: "Breaks the answer into clear steps.",
+    key_explanation: "Explains the key reasoning.",
+    form: "Form or notice with dates, names, or identifiers.",
+    table: "Table-like section with structured details.",
+    abstract: "Summarizes the PDF upfront.",
+    methods: "Explains the method or procedure.",
+    discussion: "Interprets the results."
+  };
+
+  const THEME_INTENT_STOPWORDS = new Set([
+    "about", "above", "after", "again", "against", "also", "because", "before", "being", "below",
+    "between", "both", "cannot", "could", "does", "doing", "down", "during", "each", "from",
+    "further", "have", "having", "here", "into", "just", "more", "most", "only", "other",
+    "over", "same", "should", "some", "such", "than", "that", "their", "then", "there",
+    "these", "they", "this", "through", "under", "very", "what", "when", "where", "which",
+    "while", "with", "would", "your", "page", "section", "article", "guide", "click",
+    "home", "menu", "navigation", "subscribe", "newsletter", "comment", "comments", "related"
+  ]);
 
   function createEngine(options) {
     const context = createContext(options);
@@ -205,11 +338,21 @@
       let rankedSections = rankSections(rawSections, pageProfile);
       pageProfile = finalizePageProfile(pageProfile, rankedSections, headingSections, fallbackSections, root);
       rankedSections = rankSections(rankedSections, pageProfile);
+      rankedSections = applyThemeIntentBoosts(
+        rankedSections,
+        pageProfile,
+        buildThemeIntentContext(rankedSections, pageProfile, {
+          title: context.document && context.document.title || "",
+          url: context.location && context.location.href || ""
+        })
+      );
+      rankedSections = rankSections(rankedSections, pageProfile);
       const sections = buildSectionHierarchy(rankedSections, collapsedSectionIds);
       refreshSectionPositions(sections);
       const importantSections = pickImportantSections(sections, pageProfile);
       const recommendation = buildRecommendation(sections, importantSections, pageProfile);
-      const targets = pickNavigationTargets(sections, importantSections, recommendation.bestSectionId);
+      attachSectionIntelligence(sections, pageProfile, recommendation);
+      const targets = pickNavigationTargets(sections, importantSections, recommendation.bestSectionId, pageProfile);
       const totalWords = helpers.countWords(rootText);
       const totalReadableWords = Math.max(totalWords, sections.reduce((sum, section) => sum + section.wordCount, 0));
       const routeKey = safeCall(() => adapter.routeKey(context), `${context.location.origin}${context.location.pathname}${context.location.search}`);
@@ -861,6 +1004,7 @@
     const hasAcceptedAnswer = /\b(accepted answer|top answer|top comment|marked as solution|solved|worked for me|this fixed it|confirmed fix)\b/i.test(fullText);
     const hasTroubleshooting = /\b(error|bug|issue|problem|fix|fixed|workaround|troubleshoot|root cause|resolved|solution)\b/i.test(fullText);
     const hasNegatedAnswer = /\b(?:not|isn'?t|is not|wasn'?t|was not|never|isn’t|wasn’t)\s+(?:the\s+)?(?:actual\s+)?(?:answer|solution|fix|final answer|recommended option)\b/i.test(fullText);
+    const hasRecommendationSignal = !hasNegatedAnswer && (POSITIVE_PATTERNS.recommendation.test(headingText) || POSITIVE_PATTERNS.recommendation.test(lower));
     const codeHasExplanation = (stats.codeBlocks || 0) > 0 && ((stats.paragraphs || 0) > 0 || /\b(example|usage|run|returns?|outputs?|copy|paste|configure|install)\b/i.test(fullText));
     const hasCompleteCode = (stats.codeBlocks || 0) > 0
       && /\b(final|complete|full|working version|copy and paste|paste this|production-ready|drop-in)\b/i.test(fullText);
@@ -896,20 +1040,66 @@
     const isDenseLinks = (stats.linkDensity || 0) > 0.34 || ((stats.links || 0) > 12 && wordCount < 180);
     const isLongSoftIntro = input.index <= 1 && wordCount > 240 && !hasConciseAnswer && !hasNumberedProcedure && !(stats.codeBlocks || 0) && !(stats.tables || 0);
     const profile = input.profile || {};
+    const contentRankType = getContentRankingType(profile, headingAndText);
+    const targetContentPage = Boolean(contentRankType);
+    const hasQuickStart = targetContentPage && /\b(quick start|getting started|get started|start here|first steps?)\b/i.test(headingAndText);
+    const hasInstallation = targetContentPage && /\b(install(?:ation)?|npm install|pip install|setup package|requirements?|dependencies)\b/i.test(headingAndText);
+    const hasUsage = targetContentPage && /\b(usage|how to use|using the|example request|api call|request body|response object|run this|copy(?: and paste)?)\b/i.test(headingAndText);
+    const hasParameters = targetContentPage && /\b(parameters?|options?|arguments?|props?|configuration|settings|schema|fields?|endpoint|api reference|return values?)\b/i.test(headingAndText);
+    const hasPrerequisites = targetContentPage && /\b(prerequisites?|requirements?|before you start|before starting|you'?ll need|what you need)\b/i.test(headingAndText);
+    const hasSetup = targetContentPage && /\b(setup|set up|configure|configuration|initialize|create the project|environment variables?)\b/i.test(headingAndText);
+    const hasFinalResult = targetContentPage && /\b(final result|result|expected output|finished|success|verify|what you should see|outcome)\b/i.test(headingAndText);
+    const hasIngredients = targetContentPage && /\b(ingredients?|what you need|for the recipe)\b/i.test(headingAndText);
+    const hasInstructions = targetContentPage && /\b(instructions?|directions?|method|preparation|steps?|how to make|cook|bake|simmer|stir|serve)\b/i.test(headingAndText);
+    const hasTiming = targetContentPage && /\b(prep time|cook time|total time|ready in|minutes?|hours?|bake for|simmer for|chill for)\b/i.test(headingAndText);
+    const hasTips = targetContentPage && /\b(tips?|notes?|variations?|substitutions?|storage|make ahead|serving suggestions?)\b/i.test(headingAndText);
+    const hasAbstract = targetContentPage && PDF_SECTION_PATTERNS.abstract.test(headingAndText);
+    const hasDiscussion = targetContentPage && PDF_SECTION_PATTERNS.discussion.test(headingAndText);
+    const hasChangelog = targetContentPage && /\b(changelog|release notes?|version history|what'?s new|breaking changes?|deprecated)\b/i.test(headingAndText);
+    const hasPageTypeClutter = targetContentPage && (
+      /\b(navigation|menu|breadcrumb|sidebar|footer|advertisement|sponsored|sponsor|newsletter|subscribe|sign up|author bio|about the author|comments?|reviews?|related links?|related posts?|recommended articles?|cookie|account|login|create account|privacy policy|terms of service)\b/i.test(headingAndText)
+      || /\b(nav|menu|breadcrumb|footer|sidebar|share|social|related|comment|promo|newsletter|subscribe|advert|sponsor|affiliate|cookie|consent|byline|author|account|login)\b/i.test(input.classTrail || "")
+    );
     const searchBlockType = unitMeta.searchBlockType || "";
     const isAssistantResponse = unitMeta.role === "assistant";
-    const hasLatestAssistantAnswer = Boolean(isAssistantResponse && unitMeta.isLatestAssistant && wordCount >= 12);
-    const hasCorrectedAnswer = Boolean(isAssistantResponse && (unitMeta.isAfterUserCorrection || (hasLatestAssistantAnswer && unitMeta.hasRevision)));
     const answersLatestUser = Boolean(isAssistantResponse && unitMeta.answersLatestUser);
-    const hasFinalAnswer = Boolean(isAssistantResponse && (unitMeta.hasFinalAnswer || hasConciseAnswer || /\b(final answer|final version|bottom line|in short|short answer|here'?s the answer|the answer is)\b/i.test(fullText.slice(0, 900))));
-    const hasFinalRecommendation = Boolean(isAssistantResponse && (hasFinalAnswer || conclusionHit || unitMeta.hasFinalAnswer) && /\b(recommend|recommended|best option|best choice|use this|choose|go with|my recommendation)\b/i.test(fullText));
-    const hasStepByStepAnswer = Boolean(isAssistantResponse && (hasNumberedProcedure || /\b(step-by-step|step by step|first,|next,|then,|finally,)\b/i.test(fullText)) && wordCount >= 24);
-    const hasKeyExplanation = Boolean(isAssistantResponse && /\b(here'?s why|why this works|the reason|because|key point|important part|what matters|explanation)\b/i.test(fullText) && wordCount >= 40);
     const isShortConfirmation = Boolean(isAssistantResponse && wordCount <= 18 && /^(yes|no|ok|okay|sure|done|got it|sounds good|correct|thanks|you'?re welcome)[.! ]*$/i.test(fullText));
     const isLoadingOrFailedAnswer = Boolean(isAssistantResponse && (
       /\b(generating response|thinking\.\.\.|loading response|still loading|something went wrong|network error|failed to generate|try again|regenerate response|error occurred)\b/i.test(fullText)
       || /^(loading|thinking|generating)\.?\s*$/i.test(fullText.trim())
     ));
+    const hasRawFinalAnswer = Boolean(isAssistantResponse && (unitMeta.hasFinalAnswer || hasConciseAnswer || /\b(final answer|final version|bottom line|in short|short answer|here'?s the answer|the answer is)\b/i.test(fullText.slice(0, 900))));
+    const hasStepByStepAnswer = Boolean(isAssistantResponse && !isLoadingOrFailedAnswer && (unitMeta.hasStepByStep || hasNumberedProcedure || /\b(step-by-step|step by step|first,|next,|then,|finally,)\b/i.test(fullText)) && wordCount >= 24);
+    const hasKeyExplanation = Boolean(isAssistantResponse && !isLoadingOrFailedAnswer && (unitMeta.hasKeyExplanation || /\b(here'?s why|why this works|the reason|because|key point|important part|what matters|explanation)\b/i.test(fullText)) && wordCount >= 40);
+    const hasSummarySignal = Boolean(isAssistantResponse && hasSummary && !isLoadingOrFailedAnswer && wordCount >= 24);
+    const completeCodeUsable = Boolean(isAssistantResponse && !isLoadingOrFailedAnswer && hasCompleteCode);
+    const completeAssistantAnswer = Boolean(isAssistantResponse
+      && !isLoadingOrFailedAnswer
+      && !isShortConfirmation
+      && !hasCitationOnly
+      && wordCount >= 24
+      && (
+        unitMeta.isCompleteAssistantAnswer
+        || hasRawFinalAnswer
+        || hasSummarySignal
+        || completeCodeUsable
+        || unitMeta.hasRecommendation
+        || hasRecommendationSignal
+        || hasStepByStepAnswer
+        || hasKeyExplanation
+        || codeHasExplanation
+        || wordCount >= 45
+      ));
+    const hasLatestAssistantAnswer = Boolean(isAssistantResponse && unitMeta.isLatestAssistant && completeAssistantAnswer);
+    const hasLatestCompleteAssistantAnswer = Boolean(isAssistantResponse && completeAssistantAnswer && (unitMeta.isLatestCompleteAssistant || unitMeta.isLatestAssistant));
+    const replacesFailedAttempt = Boolean(isAssistantResponse && completeAssistantAnswer && (
+      unitMeta.replacesFailedAttempt
+      || /\b(previous(?: answer| attempt)? (?:failed|was wrong|didn'?t work)|that failed|failed attempt|fix(?:ed)? (?:the|that|previous) attempt|try this instead|use this instead)\b/i.test(fullText)
+    ));
+    const hasCorrectedAnswer = Boolean(isAssistantResponse && completeAssistantAnswer && (unitMeta.isAfterUserCorrection || unitMeta.hasRevision || (hasLatestCompleteAssistantAnswer && unitMeta.hasRevision)));
+    const hasFinalAnswer = Boolean(hasRawFinalAnswer && completeAssistantAnswer);
+    const hasFinalRecommendation = Boolean(isAssistantResponse && completeAssistantAnswer && (hasFinalAnswer || conclusionHit || unitMeta.hasFinalAnswer) && /\b(recommend|recommended|best option|best choice|use this|choose|go with|my recommendation)\b/i.test(fullText));
+    const incompleteAssistantAnswer = Boolean(isAssistantResponse && unitMeta.isLatestAssistant && !completeAssistantAnswer && (isLoadingOrFailedAnswer || isShortConfirmation || hasCitationOnly || wordCount < 24));
     const hasPromptEcho = Boolean(unitMeta.role === "user" || unitMeta.isPromptEcho)
       || (profile.type === "chat" && /^(user|you|human|prompt|question|q)\s*[:\-]/i.test(fullText.slice(0, 180)));
 
@@ -920,7 +1110,7 @@
       definition: POSITIVE_PATTERNS.definition.test(headingText) || POSITIVE_PATTERNS.definition.test(lower),
       warning: POSITIVE_PATTERNS.warning.test(headingText) || POSITIVE_PATTERNS.warning.test(lower),
       example: POSITIVE_PATTERNS.example.test(headingText) || POSITIVE_PATTERNS.example.test(lower),
-      recommendation: !hasNegatedAnswer && (POSITIVE_PATTERNS.recommendation.test(headingText) || POSITIVE_PATTERNS.recommendation.test(lower)),
+      recommendation: hasRecommendationSignal,
       finality: !hasNegatedAnswer && (POSITIVE_PATTERNS.finality.test(headingText) || POSITIVE_PATTERNS.finality.test(lower) || conclusionHit),
       procedure: hasNumberedProcedure,
       conciseAnswer: hasConciseAnswer,
@@ -928,7 +1118,7 @@
       directAction: hasDirectAction,
       comparison: hasComparison,
       codeExplanation: codeHasExplanation,
-      completeCode: hasCompleteCode,
+      completeCode: completeCodeUsable,
       acceptedAnswer: hasAcceptedAnswer,
       troubleshooting: hasTroubleshooting,
       revision: Boolean(unitMeta.hasRevision),
@@ -937,17 +1127,36 @@
       finalRecommendation: hasFinalRecommendation,
       stepByStepAnswer: hasStepByStepAnswer,
       keyExplanation: hasKeyExplanation,
+      completeAssistantAnswer,
       shortConfirmation: isShortConfirmation,
       loadingOrFailedAnswer: isLoadingOrFailedAnswer,
+      incompleteAssistantAnswer,
       latestAssistantAnswer: hasLatestAssistantAnswer,
+      latestCompleteAssistantAnswer: hasLatestCompleteAssistantAnswer,
       correctedAnswer: hasCorrectedAnswer,
+      replacesFailedAttempt,
       answersLatestUser,
       supersededDraft: hasSupersededDraft,
       mainArgument: hasMainArgument,
       keyEvidence: hasKeyEvidence,
+      quickStart: hasQuickStart,
+      installation: hasInstallation,
+      usage: hasUsage,
+      parameters: hasParameters,
+      prerequisites: hasPrerequisites,
+      setup: hasSetup,
+      finalResult: hasFinalResult,
+      ingredients: hasIngredients,
+      instructions: hasInstructions,
+      timing: hasTiming,
+      tips: hasTips,
+      abstract: hasAbstract,
       methods: hasMethods,
       results: hasResults,
+      discussion: hasDiscussion,
       conclusion: hasConclusion,
+      changelog: hasChangelog,
+      pageTypeClutter: hasPageTypeClutter,
       references: hasReferences,
       appendix: hasAppendix,
       tableOfContents: hasTableOfContents,
@@ -1006,13 +1215,50 @@
     if (matched.mainArgument) usefulScore += 42;
     if (matched.keyEvidence) usefulScore += 34;
     if (matched.methods) usefulScore += 22;
+    if (contentRankType === "article") {
+      if (matched.mainArgument) usefulScore += 30;
+      if (matched.keyEvidence) usefulScore += 24;
+      if (matched.summary) usefulScore += 18;
+      if (matched.conclusion) usefulScore += 26;
+    }
+    if (contentRankType === "docs") {
+      if (matched.quickStart) usefulScore += 58;
+      if (matched.installation) usefulScore += 42;
+      if (matched.usage) usefulScore += 48;
+      if (matched.example || matched.codeExplanation || (stats.codeBlocks || 0) > 0) usefulScore += 34;
+      if (matched.parameters) usefulScore += 34;
+      if (matched.troubleshooting) usefulScore += 34;
+    }
+    if (contentRankType === "tutorial") {
+      if (matched.prerequisites) usefulScore += 28;
+      if (matched.setup || matched.installation) usefulScore += 42;
+      if (matched.procedure || matched.directAction || matched.action) usefulScore += 46;
+      if (matched.codeExplanation || (stats.codeBlocks || 0) > 0) usefulScore += 34;
+      if (matched.finalResult) usefulScore += 34;
+    }
+    if (contentRankType === "recipe") {
+      if (matched.ingredients) usefulScore += 42;
+      if (matched.instructions || matched.procedure) usefulScore += 82;
+      if (matched.timing) usefulScore += 24;
+      if (matched.tips) usefulScore += 20;
+    }
+    if (contentRankType === "research") {
+      if (matched.abstract) usefulScore += 42;
+      if (matched.methods) usefulScore += 24;
+      if (matched.results) usefulScore += 54;
+      if (matched.discussion) usefulScore += 36;
+      if (matched.conclusion) usefulScore += 50;
+    }
     if (matched.revision) usefulScore += 28;
     if (matched.finalAnswer) usefulScore += 58;
     if (matched.finalRecommendation) usefulScore += 66;
     if (matched.stepByStepAnswer) usefulScore += 52;
     if (matched.keyExplanation) usefulScore += 42;
+    if (matched.completeAssistantAnswer) usefulScore += 30;
     if (matched.latestAssistantAnswer) usefulScore += 28;
+    if (matched.latestCompleteAssistantAnswer) usefulScore += 44;
     if (matched.correctedAnswer) usefulScore += 62;
+    if (matched.replacesFailedAttempt) usefulScore += 58;
     if (matched.answersLatestUser) usefulScore += 38;
     if (matched.finalCode) usefulScore += 54;
     if ((stats.codeBlocks || 0) > 0) usefulScore += 24;
@@ -1033,9 +1279,12 @@
     if (searchBlockType === "answer") usefulScore += 50;
     if (searchBlockType === "top_results") usefulScore += 30;
     if (searchBlockType === "people_also_ask" || searchBlockType === "sources") usefulScore += 24;
-    if (["videos", "shopping", "maps"].includes(searchBlockType)) usefulScore += 16;
+    if (searchBlockType === "videos" || searchBlockType === "maps") usefulScore += 16;
+    if (searchBlockType === "related_searches") usefulScore += 10;
+    if (searchBlockType === "shopping") usefulScore += 6;
     if (matched.shortConfirmation) usefulScore -= 54;
     if (matched.loadingOrFailedAnswer) usefulScore -= 82;
+    if (matched.incompleteAssistantAnswer) usefulScore -= 76;
     if (matched.supersededDraft) usefulScore -= 38;
     if (matched.promptEcho) usefulScore -= 72;
     if (matched.citationOnly) usefulScore -= 56;
@@ -1043,6 +1292,8 @@
     if (matched.appendix) usefulScore -= 36;
     if (matched.tableOfContents) usefulScore -= 48;
     if (matched.boilerplate) usefulScore -= 70;
+    if (matched.changelog) usefulScore -= 58;
+    if (matched.pageTypeClutter) usefulScore -= 82;
     if (sectionKind.kind === "title_page") usefulScore -= 42;
     if (isHeaderOnly) usefulScore -= 26;
     if (hasRepeatedNoise) usefulScore -= 34;
@@ -1056,6 +1307,40 @@
     if (matched.mainArgument) importanceScore += 32;
     if (matched.keyEvidence) importanceScore += 26;
     if (matched.methods) importanceScore += 18;
+    if (contentRankType === "article") {
+      if (matched.mainArgument) importanceScore += 24;
+      if (matched.keyEvidence) importanceScore += 20;
+      if (matched.summary) importanceScore += 12;
+      if (matched.conclusion) importanceScore += 20;
+    }
+    if (contentRankType === "docs") {
+      if (matched.quickStart) importanceScore += 36;
+      if (matched.installation) importanceScore += 24;
+      if (matched.usage) importanceScore += 30;
+      if (matched.example || matched.codeExplanation || (stats.codeBlocks || 0) > 0) importanceScore += 22;
+      if (matched.parameters) importanceScore += 22;
+      if (matched.troubleshooting) importanceScore += 24;
+    }
+    if (contentRankType === "tutorial") {
+      if (matched.prerequisites) importanceScore += 18;
+      if (matched.setup || matched.installation) importanceScore += 24;
+      if (matched.procedure || matched.directAction || matched.action) importanceScore += 32;
+      if (matched.codeExplanation || (stats.codeBlocks || 0) > 0) importanceScore += 22;
+      if (matched.finalResult) importanceScore += 24;
+    }
+    if (contentRankType === "recipe") {
+      if (matched.ingredients) importanceScore += 28;
+      if (matched.instructions || matched.procedure) importanceScore += 54;
+      if (matched.timing) importanceScore += 16;
+      if (matched.tips) importanceScore += 14;
+    }
+    if (contentRankType === "research") {
+      if (matched.abstract) importanceScore += 30;
+      if (matched.methods) importanceScore += 18;
+      if (matched.results) importanceScore += 42;
+      if (matched.discussion) importanceScore += 26;
+      if (matched.conclusion) importanceScore += 38;
+    }
     if (matched.directAction) importanceScore += 18;
     if (matched.completeCode) importanceScore += 22;
     if (matched.troubleshooting && (matched.answer || matched.action || matched.procedure)) importanceScore += 18;
@@ -1064,8 +1349,11 @@
     if (matched.finalRecommendation) importanceScore += 38;
     if (matched.stepByStepAnswer) importanceScore += 28;
     if (matched.keyExplanation) importanceScore += 24;
+    if (matched.completeAssistantAnswer) importanceScore += 18;
     if (matched.latestAssistantAnswer) importanceScore += 18;
+    if (matched.latestCompleteAssistantAnswer) importanceScore += 28;
     if (matched.correctedAnswer) importanceScore += 34;
+    if (matched.replacesFailedAttempt) importanceScore += 30;
     if (matched.answersLatestUser) importanceScore += 22;
     if (unitMeta.pdfSectionType === "form") importanceScore += 28;
     if (unitMeta.pdfSectionType === "table") importanceScore += 20;
@@ -1083,14 +1371,20 @@
     if (searchBlockType === "answer") importanceScore += 30;
     if (searchBlockType === "top_results") importanceScore += 20;
     if (searchBlockType === "people_also_ask" || searchBlockType === "sources") importanceScore += 18;
+    if (searchBlockType === "videos" || searchBlockType === "maps") importanceScore += 10;
+    if (searchBlockType === "related_searches") importanceScore += 6;
+    if (searchBlockType === "shopping") importanceScore += 2;
     if (matched.shortConfirmation) importanceScore -= 34;
     if (matched.loadingOrFailedAnswer) importanceScore -= 56;
+    if (matched.incompleteAssistantAnswer) importanceScore -= 46;
     if (matched.supersededDraft) importanceScore -= 28;
     if (matched.promptEcho) importanceScore -= 44;
     if (matched.citationOnly) importanceScore -= 36;
     if (matched.references) importanceScore -= 50;
     if (matched.appendix || matched.tableOfContents) importanceScore -= 32;
     if (matched.boilerplate) importanceScore -= 44;
+    if (matched.changelog) importanceScore -= 36;
+    if (matched.pageTypeClutter) importanceScore -= 54;
     if (startsWithQuestion) importanceScore += 10;
     if ((stats.listItems || 0) >= 3) structureScore += Math.min(34, 12 + stats.listItems * 2);
     if ((stats.codeBlocks || 0) > 0) structureScore += 28;
@@ -1138,6 +1432,7 @@
       isDenseLinks,
       sectionKind: sectionKind.kind,
       sectionKindLabel: sectionKind.label,
+      selectionReason: getSelectionReason(matched, unitMeta, profile, contentRankType),
       pdfSectionType: sectionKind.pdfSectionType,
       ocrRole: pdfOcrRole,
       ocrRoleLabel: pdfOcrRole ? SECTION_KIND_LABELS[pdfOcrRoleKind(pdfOcrRole)] || "" : "",
@@ -1147,6 +1442,87 @@
     };
   }
 
+  function getContentRankingType(profile, text) {
+    const type = String(profile && profile.type || "").toLowerCase();
+    const label = String(profile && profile.label || "").toLowerCase();
+    const haystack = `${label} ${String(text || "").toLowerCase()}`;
+    if (type === "chat" || type === "pdf" || type === "search_results" || LOW_CONFIDENCE_PAGE_TYPES.has(type)) return "";
+    if (type === "docs" || /\b(docs?|documentation|api reference|developer guide)\b/.test(label)) return "docs";
+    if (type === "tutorial" || /\b(tutorial|walkthrough|lesson)\b/.test(label)) return "tutorial";
+    if (type === "recipe" || /\b(recipe|ingredients|cook time|prep time|directions)\b/.test(haystack)) return "recipe";
+    if (type === "research" || /\b(research|paper|abstract|methods|results|discussion|references)\b/.test(haystack)) return "research";
+    if (type === "article" || /\b(article|story|essay|post)\b/.test(label)) return "article";
+    return "";
+  }
+
+  function getSelectionReason(matched, unitMeta, profile, contentRankType) {
+    if (!matched) return "";
+    if (profile && profile.type === "chat") return getChatSelectionReason(matched, unitMeta, profile);
+    return getContentSelectionReason(matched, contentRankType);
+  }
+
+  function getChatSelectionReason(matched, unitMeta, profile) {
+    if (!matched || !profile || profile.type !== "chat") return "";
+    const meta = unitMeta || {};
+    if (meta.role === "user" || matched.promptEcho) return "User prompt is down-ranked before assistant answers";
+    if (matched.loadingOrFailedAnswer) return "Loading or failed assistant response is down-ranked";
+    if (matched.incompleteAssistantAnswer) return "Latest assistant turn is incomplete, so a complete answer is preferred";
+    if (matched.shortConfirmation) return "Short assistant confirmation is down-ranked";
+    if (matched.citationOnly) return "Citation-only block is down-ranked";
+    if (matched.finalCode) return "Final usable code block from the assistant";
+    if (matched.completeCode) return "Complete code answer after the latest request";
+    if (matched.finalRecommendation) return "Final recommendation from the assistant";
+    if (matched.correctedAnswer) return "Updated answer after user correction";
+    if (matched.replacesFailedAttempt) return "Newer assistant answer replaces an earlier failed attempt";
+    if (matched.stepByStepAnswer) return "Step-by-step assistant answer";
+    if (matched.summary) return "Summary or recap from the assistant";
+    if (matched.latestCompleteAssistantAnswer || matched.latestAssistantAnswer) return "Newest complete assistant response";
+    if (matched.answersLatestUser) return "Answers the latest user request";
+    if (matched.completeAssistantAnswer) return "Complete assistant response with enough substance";
+    return "";
+  }
+
+  function getContentSelectionReason(matched, contentRankType) {
+    if (!contentRankType) return "";
+    if (matched.pageTypeClutter) return "Navigation, promotion, comments, or account UI is down-ranked";
+    if (matched.changelog) return "Changelog material is secondary to current usage guidance";
+    if (contentRankType === "article") {
+      if (matched.mainArgument) return "Main claim section has the strongest article signal";
+      if (matched.keyEvidence) return "Key evidence supports the article's main point";
+      if (matched.summary) return "Summary section captures the article's useful takeaway";
+      if (matched.conclusion) return "Conclusion wraps up the article's useful takeaway";
+    }
+    if (contentRankType === "docs") {
+      if (matched.quickStart) return "Quick start helps readers get working fastest";
+      if (matched.usage) return "Usage section explains how to apply the documentation";
+      if (matched.installation) return "Installation details are a core documentation target";
+      if (matched.parameters) return "Parameter and option details are useful implementation guidance";
+      if (matched.troubleshooting) return "Troubleshooting section helps resolve likely issues";
+      if (matched.example || matched.codeExplanation) return "Example code makes the documentation actionable";
+    }
+    if (contentRankType === "tutorial") {
+      if (matched.procedure || matched.directAction || matched.action) return "Actionable tutorial steps are the main path through the page";
+      if (matched.setup || matched.installation) return "Setup section prepares the tutorial workflow";
+      if (matched.prerequisites) return "Prerequisites clarify what is needed before starting";
+      if (matched.finalResult) return "Final result shows what the tutorial should produce";
+      if (matched.codeExplanation) return "Code section makes the tutorial actionable";
+    }
+    if (contentRankType === "recipe") {
+      if (matched.instructions || matched.procedure) return "Recipe instructions provide the actionable method";
+      if (matched.ingredients) return "Ingredients are core recipe content";
+      if (matched.timing) return "Timing details help execute the recipe";
+      if (matched.tips) return "Useful tips improve the recipe outcome";
+    }
+    if (contentRankType === "research") {
+      if (matched.results) return "Results section contains the main findings";
+      if (matched.conclusion) return "Conclusion states the research takeaway";
+      if (matched.abstract) return "Abstract summarizes the research page";
+      if (matched.methods) return "Methods explain how the research was done";
+      if (matched.discussion) return "Discussion interprets the research findings";
+    }
+    return "";
+  }
+
   function classifySectionKind(details) {
     const matched = details.matched || {};
     const stats = details.stats || {};
@@ -1154,6 +1530,7 @@
     const profile = details.profile || {};
     const pdfSectionType = unitMeta.pdfSectionType || (profile.type === "pdf" ? inferPdfSectionType(details) : "");
     const pdfOcrRole = profile.type === "pdf" ? normalizePdfOcrRole(unitMeta.ocrRole || details.ocrRole) : "";
+    const contentRankType = getContentRankingType(profile, details.headingAndText || details.lower || details.headingText || "");
     const pdfOcrKind = pdfOcrRole && !["abstract", "methods", "results", "discussion", "conclusion", "form", "table"].includes(pdfSectionType)
       ? pdfOcrRoleKind(pdfOcrRole)
       : "";
@@ -1164,17 +1541,37 @@
     else if (matched.boilerplate) kind = "boilerplate";
     else if (matched.promptEcho) kind = "prompt_echo";
     else if (matched.citationOnly) kind = "works_cited";
+    else if (contentRankType && matched.changelog) kind = "changelog";
     else if (matched.finalCode) kind = "final_code";
-    else if (matched.finalRecommendation) kind = "final_recommendation";
     else if (matched.correctedAnswer) kind = "corrected_answer";
-    else if (matched.finalAnswer) kind = "final_answer";
+    else if (matched.replacesFailedAttempt) kind = "corrected_answer";
+    else if (matched.finalRecommendation) kind = "final_recommendation";
     else if (matched.completeCode) kind = "complete_code";
+    else if (contentRankType && matched.quickStart) kind = "quick_start";
+    else if (contentRankType === "tutorial" && (matched.procedure || matched.directAction || matched.action)) kind = "steps";
+    else if (contentRankType && matched.installation) kind = "installation";
+    else if (contentRankType && matched.usage) kind = "usage";
+    else if (contentRankType && matched.parameters) kind = "parameters";
+    else if (contentRankType && matched.troubleshooting) kind = "troubleshooting";
+    else if (contentRankType && matched.prerequisites) kind = "prerequisites";
+    else if (contentRankType && matched.setup) kind = "setup";
+    else if (contentRankType && matched.finalResult) kind = "final_result";
+    else if (contentRankType && matched.instructions) kind = "instructions";
+    else if (contentRankType && matched.ingredients) kind = "ingredients";
+    else if (contentRankType && matched.timing) kind = "timing";
+    else if (contentRankType && matched.tips) kind = "tips";
+    else if (contentRankType && matched.abstract) kind = "abstract";
+    else if (contentRankType === "research" && matched.results) kind = "results";
+    else if (contentRankType === "research" && matched.conclusion) kind = "conclusion";
+    else if (contentRankType === "research" && matched.methods) kind = "methods";
+    else if (contentRankType && matched.discussion) kind = "discussion";
     else if ((stats.codeBlocks || 0) > 0) kind = "code_block";
-    else if (matched.latestAssistantAnswer && !matched.summary && !matched.conclusion && !matched.results) kind = "latest_answer";
     else if (matched.stepByStepAnswer) kind = "step_by_step";
+    else if (matched.finalAnswer) kind = "final_answer";
+    else if (matched.summary) kind = "summary";
+    else if ((matched.latestCompleteAssistantAnswer || matched.latestAssistantAnswer) && !matched.conclusion && !matched.results) kind = "latest_answer";
     else if (matched.keyExplanation) kind = "key_explanation";
     else if (matched.conciseAnswer || matched.answer || matched.acceptedAnswer) kind = "answer";
-    else if (matched.summary) kind = "summary";
     else if (matched.conclusion || matched.finality) kind = "conclusion";
     else if (matched.procedure || matched.directAction || matched.action) kind = "steps";
     else if (matched.definition) kind = "definition";
@@ -1214,9 +1611,25 @@
       top_results: "search_top_results",
       videos: "search_videos",
       shopping: "search_shopping",
-      maps: "search_maps"
+      maps: "search_maps",
+      related_searches: "search_related_searches"
     };
     return map[type] || "";
+  }
+
+  function searchPriorityForType(type) {
+    const priorities = {
+      ai_overview: 0,
+      answer: 1,
+      sources: 2,
+      top_results: 3,
+      people_also_ask: 4,
+      videos: 5,
+      maps: 6,
+      related_searches: 7,
+      shopping: 8
+    };
+    return Number.isFinite(priorities[type]) ? priorities[type] : 99;
   }
 
   function inferPdfSectionType(details) {
@@ -1280,6 +1693,8 @@
     if (metrics.matched.tableOfContents) fluffScore += 70;
     if (metrics.matched.appendix) fluffScore += 48;
     if (metrics.matched.boilerplate) fluffScore += 92;
+    if (metrics.matched.changelog) fluffScore += 46;
+    if (metrics.matched.pageTypeClutter) fluffScore += 76;
     if (metrics.isElementLowValue) fluffScore += 66;
     if (/\b(nav|menu|breadcrumb|toc|footer|sidebar|share|social|related|comment|promo|newsletter|subscribe|advert|sponsor|affiliate|cookie|consent|byline|author)\b/i.test(metrics.classTrail)) {
       fluffScore += 40;
@@ -1300,6 +1715,333 @@
       section.score += adapterScore;
       section.usefulScore += Math.max(0, adapterScore * 0.5);
     });
+  }
+
+  function buildThemeIntentContext(sections, pageProfile, source) {
+    const title = source && source.title || "";
+    const url = source && source.url || "";
+    return {
+      themeTerms: extractThemeTerms(sections, title, url),
+      intent: inferIntent(pageProfile, sections)
+    };
+  }
+
+  function extractThemeTerms(sections, title, url) {
+    const terms = new Map();
+    const addTerm = (value, source, weight) => {
+      const normalized = normalizeThemeTerm(value);
+      if (!normalized) return;
+      const current = terms.get(normalized);
+      if (current) {
+        current.weight = Math.max(current.weight, weight);
+        if (!current.sources.includes(source)) current.sources.push(source);
+      } else {
+        terms.set(normalized, { term: normalized, source, sources: [source], weight });
+      }
+    };
+    const addTokenTerms = (text, source, weight) => {
+      getThemeTokens(text).forEach((token) => addTerm(token, source, weight));
+      getThemePhrases(text, 2).slice(0, 12).forEach((phrase) => addTerm(phrase, source, weight + 1));
+    };
+
+    addTokenTerms(title, "title", 4);
+    getUrlThemeTerms(url).forEach((term) => addTerm(term, "url", 2));
+
+    const phraseCounts = new Map();
+    const technicalCandidates = [];
+    (sections || []).forEach((section) => {
+      addTokenTerms(section && section.title || "", "heading", 3);
+      getThemePhrases(`${section && section.title || ""} ${String(section && section.text || "").slice(0, 900)}`, 2)
+        .concat(getThemePhrases(`${section && section.title || ""} ${String(section && section.text || "").slice(0, 900)}`, 3))
+        .forEach((phrase) => phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1));
+      technicalCandidates.push(...getTechnicalThemeTerms(`${section && section.title || ""} ${String(section && section.text || "").slice(0, 700)}`));
+    });
+
+    Array.from(phraseCounts.entries())
+      .filter((entry) => entry[1] >= 2)
+      .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+      .slice(0, 10)
+      .forEach(([phrase, count]) => addTerm(phrase, "repeated_phrase", Math.min(5, 2 + count)));
+
+    uniqueStrings(technicalCandidates)
+      .slice(0, 12)
+      .forEach((term) => addTerm(term, "technical", 3));
+
+    const latestUserSections = (sections || [])
+      .filter((section) => section && section.unitMeta && section.unitMeta.role === "user")
+      .sort((a, b) => (Number(b.unitMeta.turnIndex) || b.index || 0) - (Number(a.unitMeta.turnIndex) || a.index || 0))
+      .slice(0, 2);
+    latestUserSections.forEach((section) => addTokenTerms(section.text || section.title || "", "latest_question", 4));
+
+    return Array.from(terms.values())
+      .sort((a, b) => b.weight - a.weight || b.term.length - a.term.length)
+      .slice(0, 18);
+  }
+
+  function normalizeThemeTerm(value) {
+    const normalized = String(value || "")
+      .toLowerCase()
+      .replace(/https?:\/\/\S+/g, " ")
+      .replace(/[_-]+/g, " ")
+      .replace(/[^a-z0-9./+#\s]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!normalized) return "";
+    const parts = normalized.split(" ").filter((part) => part && !THEME_INTENT_STOPWORDS.has(part));
+    if (!parts.length) return "";
+    if (parts.length === 1) {
+      const term = parts[0];
+      if (term.length < 3 || THEME_INTENT_STOPWORDS.has(term)) return "";
+      return term;
+    }
+    const phrase = parts.join(" ");
+    return phrase.length >= 7 ? phrase : "";
+  }
+
+  function getThemeTokens(text) {
+    const matches = String(text || "").match(/[A-Za-z][A-Za-z0-9_./+#-]{2,}/g) || [];
+    return uniqueStrings(matches.map((token) => normalizeThemeTerm(token))).filter(Boolean).slice(0, 24);
+  }
+
+  function getThemePhrases(text, size) {
+    const tokens = getThemeTokens(text).filter((token) => !token.includes(" "));
+    const phrases = [];
+    for (let index = 0; index <= tokens.length - size; index += 1) {
+      const phraseTokens = tokens.slice(index, index + size);
+      if (phraseTokens.some((token) => THEME_INTENT_STOPWORDS.has(token))) continue;
+      phrases.push(phraseTokens.join(" "));
+    }
+    return uniqueStrings(phrases).slice(0, 40);
+  }
+
+  function getTechnicalThemeTerms(text) {
+    const raw = String(text || "");
+    const matches = raw.match(/\b(?:[A-Z]{2,}(?:-[A-Z0-9]{2,})*|[A-Za-z]+[A-Z][A-Za-z0-9]*|[A-Za-z]+[-_][A-Za-z0-9_-]+|[A-Za-z]+[0-9][A-Za-z0-9./-]*|[A-Za-z]+\.[A-Za-z0-9.]+)\b/g) || [];
+    return matches.map((match) => normalizeThemeTerm(match)).filter(Boolean);
+  }
+
+  function getUrlThemeTerms(url) {
+    const text = String(url || "")
+      .replace(/^https?:\/\//i, " ")
+      .replace(/[?#].*$/, " ")
+      .replace(/\.[a-z]{2,}(?:\/|$)/gi, " ")
+      .replace(/[\/_-]+/g, " ");
+    return getThemeTokens(text).concat(getThemePhrases(text, 2)).slice(0, 16);
+  }
+
+  function inferIntent(pageProfile, sections) {
+    const type = String(pageProfile && pageProfile.type || "").toLowerCase();
+    if (type === "search_results") {
+      const blockTypes = (sections || []).map((section) => section && section.unitMeta && section.unitMeta.searchBlockType || "");
+      const preferredSearchBlocks = blockTypes.includes("ai_overview")
+        ? ["ai_overview"]
+        : blockTypes.includes("answer")
+          ? ["answer"]
+          : ["top_results"];
+      return {
+        intent: "ai_overview_or_best_result",
+        preferredKinds: preferredSearchBlocks.map((blockType) => searchSectionKind(blockType)).filter(Boolean),
+        preferredSignals: [],
+        preferredSearchBlocks,
+        reason: "Matches the search intent: AI Overview, direct answer, or best result.",
+        sectionCount: (sections || []).length
+      };
+    }
+    const byType = {
+      chat: {
+        intent: "latest_useful_answer",
+        preferredKinds: ["latest_answer", "corrected_answer", "complete_code", "final_code", "step_by_step", "final_recommendation", "summary", "final_answer"],
+        preferredSignals: ["latestCompleteAssistantAnswer", "correctedAnswer", "replacesFailedAttempt", "finalRecommendation", "completeCode", "finalCode", "stepByStepAnswer", "summary", "answersLatestUser"],
+        reason: "Matches the chat intent: latest useful answer."
+      },
+      docs: {
+        intent: "quick_start_or_usage",
+        preferredKinds: ["quick_start", "usage", "installation", "parameters", "troubleshooting", "code_block"],
+        preferredSignals: ["quickStart", "usage", "installation", "parameters", "troubleshooting", "codeExplanation"],
+        reason: "Matches the documentation intent: quick start or usage guidance."
+      },
+      tutorial: {
+        intent: "first_actionable_step",
+        preferredKinds: ["setup", "steps", "installation", "prerequisites", "code_block", "final_result"],
+        preferredSignals: ["setup", "procedure", "directAction", "action", "installation", "prerequisites", "codeExplanation", "finalResult"],
+        reason: "Matches the tutorial intent: first actionable step."
+      },
+      article: {
+        intent: "main_claim_or_summary",
+        preferredKinds: ["main_argument", "summary", "conclusion", "key_evidence"],
+        preferredSignals: ["mainArgument", "summary", "conclusion", "keyEvidence"],
+        reason: "Matches the article intent: main claim or summary."
+      },
+      research: {
+        intent: "abstract_results_or_conclusion",
+        preferredKinds: ["abstract", "results", "conclusion", "discussion", "methods"],
+        preferredSignals: ["abstract", "results", "conclusion", "discussion", "methods"],
+        reason: "Matches the research intent: abstract, results, or conclusion."
+      },
+      pdf: {
+        intent: "abstract_results_or_conclusion",
+        preferredKinds: ["abstract", "results", "conclusion", "discussion", "methods", "ocr_letter_body"],
+        preferredSignals: ["abstract", "results", "conclusion", "discussion", "methods"],
+        preferredOcrRoles: ["body"],
+        reason: "Matches the PDF intent: abstract, results, conclusion, or useful body text."
+      },
+      recipe: {
+        intent: "ingredients_or_instructions",
+        preferredKinds: ["ingredients", "instructions", "timing", "tips", "steps"],
+        preferredSignals: ["ingredients", "instructions", "timing", "tips", "procedure"],
+        reason: "Matches the recipe intent: ingredients or instructions."
+      },
+    };
+    const intent = byType[type] || {
+      intent: "useful_section",
+      preferredKinds: [],
+      preferredSignals: [],
+      reason: "Matches the local page intent."
+    };
+    return {
+      ...intent,
+      sectionCount: (sections || []).length
+    };
+  }
+
+  function applyThemeIntentBoosts(sections, pageProfile, context) {
+    if (!sections || !sections.length || !context) return sections || [];
+    const themeTerms = Array.isArray(context.themeTerms) ? context.themeTerms : [];
+    const intent = context.intent || inferIntent(pageProfile, sections);
+    if (pageProfile && pageProfile.quietMode) {
+      sections.forEach((section) => {
+        if (section && section.metrics) section.metrics.themeIntent = buildEmptyThemeIntent(intent, themeTerms);
+      });
+      return sections;
+    }
+
+    sections.forEach((section) => {
+      if (!section || !section.metrics) return;
+      const empty = buildEmptyThemeIntent(intent, themeTerms);
+      if (shouldSkipThemeIntentBoost(section, pageProfile)) {
+        section.metrics.themeIntent = empty;
+        return;
+      }
+
+      const matchedTerms = getMatchedThemeTerms(section, themeTerms);
+      const intentMatch = getIntentMatch(section, pageProfile, intent);
+      if (!matchedTerms.length && !intentMatch) {
+        section.metrics.themeIntent = empty;
+        return;
+      }
+
+      const baseEvidence = section.score >= 30
+        || section.usefulScore >= 24
+        || section.importanceScore >= 20
+        || getSignalCount(section.metrics) > 0
+        || Boolean(section.unitMeta && section.unitMeta.searchBlockType);
+      const themeBoost = matchedTerms.length
+        ? Math.min(8, matchedTerms.reduce((sum, item) => sum + Math.max(1, Number(item.weight) || 1), 0) * 0.7)
+        : 0;
+      const intentBoost = intentMatch ? Math.min(10, intentMatch.weight) : 0;
+      let boost = Math.min(18, Math.round(themeBoost + intentBoost));
+      if (!baseEvidence) boost = Math.min(boost, 4);
+      if (boost <= 0) {
+        section.metrics.themeIntent = empty;
+        return;
+      }
+
+      const reasons = [];
+      if (intentMatch) reasons.push(intentMatch.reason || intent.reason);
+      if (matchedTerms.length) {
+        reasons.push(`Matches local theme terms: ${matchedTerms.slice(0, 3).map((term) => term.term).join(", ")}.`);
+      }
+
+      section.score += boost;
+      section.usefulScore += Math.min(10, Math.ceil(boost * 0.56));
+      section.importanceScore += Math.min(8, Math.ceil(boost * 0.44));
+      section.metrics.themeIntent = {
+        intent: intent.intent,
+        themeTerms: themeTerms.map((term) => term.term).slice(0, 12),
+        matchedTerms: matchedTerms.map((term) => term.term).slice(0, 8),
+        intentMatch: Boolean(intentMatch),
+        boost,
+        usefulBoost: Math.min(10, Math.ceil(boost * 0.56)),
+        importanceBoost: Math.min(8, Math.ceil(boost * 0.44)),
+        reasons: uniqueStrings(reasons)
+      };
+    });
+
+    return sections;
+  }
+
+  function buildEmptyThemeIntent(intent, themeTerms) {
+    return {
+      intent: intent && intent.intent || "",
+      themeTerms: (themeTerms || []).map((term) => term.term).slice(0, 12),
+      matchedTerms: [],
+      intentMatch: false,
+      boost: 0,
+      reasons: []
+    };
+  }
+
+  function shouldSkipThemeIntentBoost(section, pageProfile) {
+    const metrics = section && section.metrics || {};
+    const matched = metrics.matched || {};
+    const unitMeta = section && section.unitMeta || {};
+    const searchBlockType = String(unitMeta.searchBlockType || "").toLowerCase();
+    const negativeKeys = [
+      "boilerplate", "references", "citationOnly", "tableOfContents", "appendix", "supersededDraft",
+      "shortConfirmation", "loadingOrFailedAnswer", "incompleteAssistantAnswer", "promptEcho",
+      "headerOnly", "pageTypeClutter", "changelog"
+    ];
+    if (negativeKeys.some((key) => matched[key])) return true;
+    if (matched.repeatedNoise
+      && !["ai_overview", "answer"].includes(searchBlockType)
+      && (normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "") === "footer" || section.score < 20)) {
+      return true;
+    }
+    if (metrics.fluffScore >= 82 || metrics.negativePatternHit) return true;
+    if (metrics.isDenseLinks && section.wordCount < 140) return true;
+    if (isLowValueSectionKind(section)) return true;
+    const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (["letterhead", "recipient", "date_reference", "greeting", "closing", "signature", "footer"].includes(ocrRole)) return true;
+    if (searchBlockType === "shopping" || searchBlockType === "ads" || searchBlockType === "sponsored") return true;
+    const sourceType = getSectionSourceType(section, unitMeta, metrics);
+    if (sourceType === "chat" && unitMeta.role === "user") return true;
+    if (pageProfile && pageProfile.type === "shopping_product") return true;
+    return false;
+  }
+
+  function getMatchedThemeTerms(section, themeTerms) {
+    if (!themeTerms || !themeTerms.length) return [];
+    const haystack = ` ${normalizeThemeTerm(`${section.title || ""} ${section.text || ""}`)} `;
+    return themeTerms.filter((item) => {
+      const term = item && item.term || "";
+      if (!term || term.length < 3) return false;
+      return term.includes(" ")
+        ? haystack.includes(` ${term} `)
+        : new RegExp(`\\b${escapeRegExp(term)}\\b`, "i").test(haystack);
+    }).slice(0, 8);
+  }
+
+  function getIntentMatch(section, pageProfile, intent) {
+    if (!intent || !intent.intent) return null;
+    const metrics = section && section.metrics || {};
+    const matched = metrics.matched || {};
+    const unitMeta = section && section.unitMeta || {};
+    const role = getSectionIntelligenceRole(section, pageProfile);
+    const kind = metrics.sectionKind || "";
+    const sectionKindMatches = (intent.preferredKinds || []).includes(kind) || (intent.preferredKinds || []).includes(role);
+    const signalMatches = (intent.preferredSignals || []).some((signal) => matched[signal]);
+    const searchMatches = (intent.preferredSearchBlocks || []).includes(unitMeta.searchBlockType || "");
+    const ocrMatches = (intent.preferredOcrRoles || []).includes(normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || ""));
+    if (!sectionKindMatches && !signalMatches && !searchMatches && !ocrMatches) return null;
+    const weight = searchMatches ? 10 : sectionKindMatches ? 9 : signalMatches ? 8 : 7;
+    return {
+      weight,
+      reason: intent.reason || "Matches the local page intent."
+    };
+  }
+
+  function escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   function rankSections(sections, profile) {
@@ -1330,12 +2072,30 @@
         || section.metrics.matched.summary
         || section.metrics.matched.directAction
         || section.metrics.matched.completeCode
+        || section.metrics.matched.completeAssistantAnswer
+        || section.metrics.matched.latestCompleteAssistantAnswer
+        || section.metrics.matched.correctedAnswer
+        || section.metrics.matched.replacesFailedAttempt
         || section.metrics.matched.definition
         || section.metrics.matched.methods
         || section.metrics.matched.conclusion
         || section.metrics.matched.results
         || section.metrics.matched.mainArgument
         || section.metrics.matched.keyEvidence
+        || section.metrics.matched.quickStart
+        || section.metrics.matched.installation
+        || section.metrics.matched.usage
+        || section.metrics.matched.parameters
+        || section.metrics.matched.troubleshooting
+        || section.metrics.matched.prerequisites
+        || section.metrics.matched.setup
+        || section.metrics.matched.finalResult
+        || section.metrics.matched.ingredients
+        || section.metrics.matched.instructions
+        || section.metrics.matched.timing
+        || section.metrics.matched.tips
+        || section.metrics.matched.abstract
+        || section.metrics.matched.discussion
         || section.metrics.matched.finalCode
         || profile.type === "search_results"
         || (section.metrics.codeBlocks > 0 && profile.type !== "search_results");
@@ -1367,17 +2127,34 @@
     if (section.unitMeta && section.unitMeta.searchBlockType) {
       return SECTION_KIND_LABELS[searchSectionKind(section.unitMeta.searchBlockType)] || "";
     }
+    if (section.metrics.sectionKind && [
+      "quick_start",
+      "installation",
+      "usage",
+      "parameters",
+      "troubleshooting",
+      "prerequisites",
+      "setup",
+      "final_result",
+      "ingredients",
+      "instructions",
+      "timing",
+      "tips",
+      "abstract",
+      "discussion"
+    ].includes(section.metrics.sectionKind)) {
+      return SECTION_KIND_LABELS[section.metrics.sectionKind] || "";
+    }
     if (section.metrics.matched.finalCode) return "Final code";
+    if (section.metrics.matched.correctedAnswer || section.metrics.matched.replacesFailedAttempt) return "Corrected answer";
     if (section.metrics.matched.finalRecommendation) return "Final recommendation";
-    if (section.unitMeta && (section.unitMeta.isAfterUserCorrection || (section.unitMeta.hasRevision && section.unitMeta.isLatestAssistant))) return "Corrected answer";
-    if (section.metrics.matched.finalAnswer) return "Final answer";
     if (section.metrics.matched.completeCode) return "Complete code";
-    if (section.unitMeta && section.unitMeta.answersLatestUser && section.unitMeta.role === "assistant") return "Latest answer";
-    if (section.unitMeta && section.unitMeta.isLatestAssistant && section.unitMeta.role === "assistant") return "Latest answer";
     if (section.metrics.matched.stepByStepAnswer) return "Step-by-step answer";
+    if (section.metrics.matched.finalAnswer) return "Final answer";
+    if (section.metrics.matched.summary) return "Summary";
+    if (section.metrics.matched.latestCompleteAssistantAnswer || section.metrics.matched.latestAssistantAnswer) return "Latest answer";
     if (section.metrics.matched.keyExplanation) return "Key explanation";
     if (section.metrics.matched.conciseAnswer || section.metrics.matched.acceptedAnswer) return "Answer";
-    if (section.metrics.matched.summary) return "Summary";
     if (section.metrics.matched.conclusion || section.metrics.matched.finality) return "Conclusion";
     if (section.metrics.matched.procedure || section.metrics.matched.action || section.metrics.matched.directAction) return "Steps";
     if (section.metrics.matched.definition) return "Definition";
@@ -1391,9 +2168,209 @@
     return "";
   }
 
+  function attachSectionIntelligence(sections, pageProfile, recommendation) {
+    (sections || []).forEach((section) => {
+      if (!section) return;
+      section.intelligence = buildSectionIntelligence(section, pageProfile, recommendation);
+    });
+    return sections;
+  }
+
+  function buildSectionIntelligence(section, pageProfile, recommendation) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const role = getSectionIntelligenceRole(section, pageProfile);
+    const roleLabel = getSectionIntelligenceRoleLabel(section, role);
+    return {
+      role,
+      roleLabel,
+      pageType: pageProfile && pageProfile.type || "",
+      roleConfidence: getSectionRoleConfidence(section),
+      whyReasons: getSectionWhyReasons(section, role, recommendation),
+      scoreDetails: getSectionScoreDetails(section, role),
+      themeIntent: metrics.themeIntent || null,
+      sourceType: getSectionSourceType(section, unitMeta, metrics)
+    };
+  }
+
+  function getSectionIntelligenceRole(section, pageProfile) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (ocrRole) return pdfOcrRoleKind(ocrRole);
+    if (unitMeta.searchBlockType) return searchSectionKind(unitMeta.searchBlockType) || "search_result";
+    if (metrics.pdfSectionType || unitMeta.pdfSectionType) return String(metrics.pdfSectionType || unitMeta.pdfSectionType);
+    if (metrics.sectionKind) return String(metrics.sectionKind);
+    if (pageProfile && pageProfile.type === "chat" && unitMeta.role === "assistant") return "latest_answer";
+    if (unitMeta.kind) return String(unitMeta.kind);
+    return "useful_section";
+  }
+
+  function getSectionIntelligenceRoleLabel(section, role) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (ocrRole) return metrics.ocrRoleLabel || unitMeta.ocrRoleLabel || SECTION_KIND_LABELS[pdfOcrRoleKind(ocrRole)] || SECTION_KIND_LABELS.useful_section;
+    if (metrics.sectionKindLabel && metrics.sectionKindLabel !== "Useful section") return metrics.sectionKindLabel;
+    const signalLabel = labelForSectionBySignals(section);
+    if (signalLabel) return signalLabel;
+    if (role && SECTION_KIND_LABELS[role]) return SECTION_KIND_LABELS[role];
+    return metrics.sectionKindLabel || SECTION_KIND_LABELS.useful_section;
+  }
+
+  function getSectionRoleConfidence(section) {
+    const score = Number(section && section.score) || 0;
+    const usefulScore = Number(section && section.usefulScore) || 0;
+    const importanceScore = Number(section && section.importanceScore) || 0;
+    let confidence = Math.round(Math.max(0, Math.min(100, (score + 24) * 0.55 + usefulScore * 0.18 + importanceScore * 0.08)));
+    if (section && section.isBest) confidence += 6;
+    else if (section && section.isImportant) confidence += 3;
+    return Math.max(0, Math.min(100, confidence));
+  }
+
+  function getSectionWhyReasons(section, role, recommendation) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const reasons = [];
+    if (recommendation && recommendation.bestSectionId === section.id && recommendation.targetConfidenceReason) {
+      reasons.push(recommendation.targetConfidenceReason);
+    }
+    if (unitMeta.diagnosticReason) reasons.push(unitMeta.diagnosticReason);
+    if (metrics.selectionReason) reasons.push(metrics.selectionReason);
+    if (metrics.themeIntent && Array.isArray(metrics.themeIntent.reasons)) {
+      metrics.themeIntent.reasons.slice(0, 2).forEach((reason) => reasons.push(reason));
+    }
+    if (INTELLIGENCE_ROLE_REASONS[role]) reasons.push(INTELLIGENCE_ROLE_REASONS[role]);
+    getSectionSignalReasons(section).forEach((reason) => reasons.push(reason));
+    if (!reasons.length && metrics.sectionKindLabel) reasons.push(`${metrics.sectionKindLabel} signal with enough confidence`);
+    if (!reasons.length) reasons.push("Looks like a useful section");
+    return uniqueStrings(reasons).slice(0, 5);
+  }
+
+  function getSectionSignalReasons(section) {
+    const metrics = section && section.metrics || {};
+    const matched = metrics.matched || {};
+    const reasons = [];
+    INTELLIGENCE_POSITIVE_SIGNALS.forEach((signal) => {
+      if (matched[signal.key]) reasons.push(signal.explanation);
+    });
+    if (metrics.codeBlocks > 0) reasons.push("Includes a practical example.");
+    if (metrics.tables > 0) reasons.push("Table-like section with structured details.");
+    if (metrics.listItems >= 3) reasons.push("Structured for quick scanning.");
+    if (metrics.hasNumbers) reasons.push("Contains concrete details.");
+    return reasons;
+  }
+
+  function getSectionScoreDetails(section, role) {
+    const metrics = section && section.metrics || {};
+    const matched = metrics.matched || {};
+    const unitMeta = section && section.unitMeta || {};
+    const positive = [];
+    const negative = [];
+    const addPositive = (signal, weight, explanation) => {
+      positive.push({ signal, weight, explanation });
+    };
+    const addNegative = (signal, weight, explanation) => {
+      negative.push({ signal, weight, explanation });
+    };
+
+    INTELLIGENCE_POSITIVE_SIGNALS.forEach((signal) => {
+      if (matched[signal.key]) addPositive(signal.key, signal.weight, signal.explanation);
+    });
+    INTELLIGENCE_NEGATIVE_SIGNALS.forEach((signal) => {
+      if (matched[signal.key]) addNegative(signal.key, signal.weight, signal.explanation);
+    });
+
+    const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (ocrRole === "body") addPositive("ocrRole.body", 136, "OCR role identifies this as scanned letter body text.");
+    if (ocrRole === "letterhead") addNegative("ocrRole.letterhead", -136, "Letterhead is usually less useful than the body.");
+    if (ocrRole === "recipient") addNegative("ocrRole.recipient", -82, "Recipient address block is usually not the main content.");
+    if (ocrRole === "date_reference") addNegative("ocrRole.date_reference", -32, "Reference or date block is usually supporting context.");
+    if (ocrRole === "signature") addNegative("ocrRole.signature", -144, "Signature blocks are usually less useful than the body.");
+    if (ocrRole === "footer") addNegative("ocrRole.footer", -122, "Footer or repeated page noise.");
+
+    const pdfSectionType = metrics.pdfSectionType || unitMeta.pdfSectionType || "";
+    if (pdfSectionType === "form") addPositive("pdfSectionType.form", 70, "Form or notice with structured identifiers.");
+    if (pdfSectionType === "table") addPositive("pdfSectionType.table", 50, "Table-like PDF section.");
+    if (pdfSectionType === "signature") addPositive("pdfSectionType.signature", 24, "Signature area was identified.");
+
+    const searchBlockType = unitMeta.searchBlockType || "";
+    if (searchBlockType === "ai_overview") addPositive("searchBlock.ai_overview", 92, "AI Overview is the highest-value search block.");
+    if (searchBlockType === "answer") addPositive("searchBlock.answer", 80, "Search answer block gives a direct answer.");
+    if (searchBlockType === "top_results") addPositive("searchBlock.top_results", 50, "Top organic results are useful search targets.");
+    if (searchBlockType === "people_also_ask" || searchBlockType === "sources") addPositive(`searchBlock.${searchBlockType}`, 42, "Search supporting block is useful context.");
+    if (searchBlockType === "videos") addPositive("searchBlock.videos", 28, "Video results may be useful for this query.");
+    if (searchBlockType === "maps") addPositive("searchBlock.maps", 28, "Map or local results are useful for location-oriented queries.");
+    if (searchBlockType === "related_searches") addPositive("searchBlock.related_searches", 20, "Related searches help refine the query.");
+    if (searchBlockType === "shopping") addPositive("searchBlock.shopping", 12, "Shopping results are specialized and secondary to answer blocks.");
+
+    if (metrics.codeBlocks > 0) addPositive("structure.codeBlocks", 52, "Includes code or a practical example.");
+    if (metrics.tables > 0) addPositive("structure.tables", 38, "Contains table-like structured details.");
+    if (metrics.listItems >= 3) addPositive("structure.listItems", Math.min(34, 12 + metrics.listItems * 2), "Structured list is easy to scan.");
+    if (metrics.hasNumbers) addPositive("structure.numbers", 12, "Contains concrete numbers or dates.");
+    if (metrics.themeIntent && metrics.themeIntent.boost > 0) {
+      if (metrics.themeIntent.intentMatch) {
+        addPositive(`intent.${metrics.themeIntent.intent}`, Math.min(12, metrics.themeIntent.boost), (metrics.themeIntent.reasons || [])[0] || "Matches the local page intent.");
+      }
+      if (Array.isArray(metrics.themeIntent.matchedTerms) && metrics.themeIntent.matchedTerms.length) {
+        addPositive("theme.match", Math.min(8, metrics.themeIntent.boost), `Matches local theme terms: ${metrics.themeIntent.matchedTerms.slice(0, 3).join(", ")}.`);
+      }
+    }
+    if (metrics.fluffScore >= 82) addNegative("fluff.high", -metrics.fluffScore, "High boilerplate or fluff score.");
+    if (metrics.negativePatternHit) addNegative("pattern.negative", -34, "Matches low-value page text.");
+    if (metrics.fluffPatternHit) addNegative("pattern.fluff", -22, "Matches soft intro or filler text.");
+
+    const themeIntentSignals = positive
+      .filter((signal) => /^theme\.|^intent\./.test(signal.signal))
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 2);
+    const primaryPositiveSignals = positive
+      .filter((signal) => !/^theme\.|^intent\./.test(signal.signal))
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, Math.max(3, 5 - themeIntentSignals.length));
+    let signals = primaryPositiveSignals
+      .concat(themeIntentSignals)
+      .concat(negative.sort((a, b) => a.weight - b.weight).slice(0, 2));
+    if (!signals.length && role) {
+      signals = [{
+        signal: `role.${role}`,
+        weight: Number(section && section.score) || 0,
+        explanation: `${getSectionIntelligenceRoleLabel(section, role)} role from existing section metadata.`
+      }];
+    }
+
+    return {
+      score: Number(section && section.score) || 0,
+      usefulScore: Number(section && section.usefulScore) || 0,
+      importanceScore: Number(section && section.importanceScore) || 0,
+      fluffScore: Number(metrics.fluffScore) || 0,
+      signals
+    };
+  }
+
+  function getSectionSourceType(section, unitMeta, metrics) {
+    if (unitMeta.ocr) return "ocr";
+    if (section && section.source === "pdf" || unitMeta.pdfjs || unitMeta.pageNumber || metrics.pdfSectionType) return "pdf";
+    if (unitMeta.searchBlockType || unitMeta.kind === "search-block") return "search";
+    if (unitMeta.role === "assistant" || unitMeta.role === "user" || metrics.chatRole) return "chat";
+    if (unitMeta.kind) return String(unitMeta.kind);
+    return section && section.source || "dom";
+  }
+
+  function uniqueStrings(values) {
+    const seen = new Set();
+    return values.map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .filter((value) => {
+        const key = value.toLowerCase();
+        if (!value || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
   function isLowValueSectionKind(section) {
     const kind = section && section.metrics ? section.metrics.sectionKind : "";
-    return kind === "works_cited" || kind === "appendix" || kind === "title_page" || kind === "toc" || kind === "boilerplate" || kind === "prompt_echo";
+    return kind === "works_cited" || kind === "appendix" || kind === "title_page" || kind === "toc" || kind === "boilerplate" || kind === "prompt_echo" || kind === "changelog";
   }
 
   function finalizePageProfile(profile, sections, headingSections, fallbackSections, root) {
@@ -1489,6 +2466,9 @@ function resolvePageProfile(profile, sections, details) {
       || section.metrics.codeBlocks > 0
       || matched.finalCode
       || matched.completeCode
+      || matched.latestCompleteAssistantAnswer
+      || matched.correctedAnswer
+      || matched.replacesFailedAttempt
       || matched.revision
       || matched.conciseAnswer
       || matched.summary
@@ -1875,6 +2855,16 @@ function getPageEvidence(details) {
       }
     });
 
+    if (profile.type === "search_results") {
+      return selected.sort((a, b) => {
+        const aMeta = a.unitMeta || {};
+        const bMeta = b.unitMeta || {};
+        const aPriority = Number.isFinite(Number(aMeta.searchPriority)) ? Number(aMeta.searchPriority) : searchPriorityForType(aMeta.searchBlockType);
+        const bPriority = Number.isFinite(Number(bMeta.searchPriority)) ? Number(bMeta.searchPriority) : searchPriorityForType(bMeta.searchBlockType);
+        return aPriority - bPriority || (Number(aMeta.resultIndex) || 0) - (Number(bMeta.resultIndex) || 0) || a.top - b.top;
+      });
+    }
+
     return selected.sort((a, b) => a.top - b.top);
   }
 
@@ -2013,14 +3003,16 @@ function getPageEvidence(details) {
       if (blockType === "answer") return "Search answer";
       if (blockType === "people_also_ask") return "People also ask";
       if (blockType === "top_results") return "Top results";
+      if (blockType === "related_searches") return "Related searches";
       return SECTION_KIND_LABELS[searchSectionKind(blockType)] || "Search result";
     }
     if (section.metrics.matched.finalCode) return "Jump to the final code";
+    if (pageProfile.type === "chat" && (section.metrics.matched.correctedAnswer || section.metrics.matched.replacesFailedAttempt)) return "Jump to the corrected answer";
     if (section.metrics.matched.finalRecommendation) return "Final recommendation";
-    if (pageProfile.type === "chat" && section.unitMeta && (section.unitMeta.isAfterUserCorrection || (section.unitMeta.hasRevision && section.unitMeta.isLatestAssistant))) return "Jump to the corrected answer";
-    if (pageProfile.type === "chat" && section.metrics.matched.finalAnswer) return "Jump to the final answer";
-    if (pageProfile.type === "chat" && section.unitMeta && section.unitMeta.isLatestAssistant) return "Jump to the latest answer";
+    if (pageProfile.type === "chat" && section.metrics.matched.completeCode) return "Complete code";
     if (pageProfile.type === "chat" && section.metrics.matched.stepByStepAnswer) return "Step-by-step answer";
+    if (pageProfile.type === "chat" && section.metrics.matched.finalAnswer) return "Jump to the final answer";
+    if (pageProfile.type === "chat" && (section.metrics.matched.latestCompleteAssistantAnswer || section.metrics.matched.latestAssistantAnswer)) return "Jump to the latest answer";
     if (pageProfile.type === "chat" && section.metrics.matched.keyExplanation) return "Key explanation";
     if (section.metrics.sectionKindLabel && section.metrics.sectionKindLabel !== "Useful section") return section.metrics.sectionKindLabel;
     if (tier === "medium") return "This looks useful";
@@ -2037,14 +3029,14 @@ function getPageEvidence(details) {
     if (!section || !section.metrics) return "";
     if (section.metrics.sectionKind) return section.metrics.sectionKind;
     if (section.metrics.matched.finalCode) return "final_code";
+    if (section.metrics.matched.correctedAnswer || section.metrics.matched.replacesFailedAttempt || section.unitMeta && section.unitMeta.hasRevision) return "corrected_answer";
     if (section.metrics.matched.finalRecommendation) return "final_recommendation";
-    if (section.unitMeta && section.unitMeta.hasRevision) return "corrected_answer";
-    if (section.metrics.matched.finalAnswer) return "final_answer";
-    if (section.unitMeta && section.unitMeta.isLatestAssistant) return "latest_answer";
     if (section.metrics.matched.completeCode) return "complete_code";
+    if (section.metrics.matched.stepByStepAnswer) return "step_by_step";
+    if (section.metrics.matched.finalAnswer) return "final_answer";
+    if (section.metrics.matched.latestCompleteAssistantAnswer || section.metrics.matched.latestAssistantAnswer) return "latest_answer";
     if (section.metrics.matched.conciseAnswer || section.metrics.matched.answer) return "answer";
     if (section.metrics.matched.summary) return "summary";
-    if (section.metrics.matched.stepByStepAnswer) return "step_by_step";
     if (section.metrics.matched.keyExplanation) return "key_explanation";
     if (section.metrics.matched.procedure || section.metrics.matched.directAction) return "steps";
     if (section.metrics.matched.codeExplanation || section.metrics.codeBlocks > 0) return "code_example";
@@ -2067,17 +3059,19 @@ function getPageEvidence(details) {
     if (details.bestSection.unitMeta && details.bestSection.unitMeta.searchBlockType) return details.bestSection.unitMeta.diagnosticReason || "Search result block has the strongest signal";
     if (details.bestSection.metrics.ocrRole === "body") return "This paragraph is the main body of the scanned letter, not the letterhead or signature";
     if (details.bestSection.unitMeta && details.bestSection.unitMeta.diagnosticReason) return details.bestSection.unitMeta.diagnosticReason;
+    if (details.bestSection.metrics.selectionReason) return details.bestSection.metrics.selectionReason;
     if (details.bestSection.metrics.matched.finalCode) return "Final code signal with enough confidence";
+    if (details.bestSection.metrics.matched.correctedAnswer || details.bestSection.unitMeta && details.bestSection.unitMeta.isAfterUserCorrection) return "Updated answer after user correction has the strongest signal";
+    if (details.bestSection.metrics.matched.replacesFailedAttempt) return "Newer answer replacing an earlier failed attempt has the strongest signal";
     if (details.bestSection.metrics.matched.finalRecommendation) return "Final recommendation signal with enough confidence";
-    if (details.bestSection.unitMeta && details.bestSection.unitMeta.isAfterUserCorrection) return "Answer after the latest correction has the strongest signal";
-    if (details.bestSection.unitMeta && details.bestSection.unitMeta.hasRevision) return "Latest corrected answer has the strongest signal";
+    if (details.bestSection.metrics.matched.completeCode) return "Complete code answer after the latest request has the strongest signal";
+    if (details.bestSection.metrics.matched.stepByStepAnswer) return "Step-by-step assistant answer has the strongest signal";
+    if (details.bestSection.metrics.matched.summary) return "Summary or recap has the strongest signal";
+    if (details.bestSection.unitMeta && details.bestSection.unitMeta.hasRevision) return "Corrected answer has the strongest signal";
+    if (details.bestSection.metrics.matched.latestCompleteAssistantAnswer || details.bestSection.metrics.matched.latestAssistantAnswer) return "Newest complete assistant response has the strongest signal";
     if (details.bestSection.unitMeta && details.bestSection.unitMeta.answersLatestUser) return "Answer after the latest user request has the strongest signal";
     if (details.bestSection.metrics.matched.finalAnswer) return "Final answer signal with enough confidence";
-    if (details.bestSection.unitMeta && details.bestSection.unitMeta.isLatestAssistant) return "Latest assistant answer has the strongest signal";
     if (details.bestSection.metrics.matched.conciseAnswer) return "Concise answer signal with enough confidence";
-    if (details.bestSection.metrics.matched.summary) return "Summary signal with enough confidence";
-    if (details.bestSection.metrics.matched.completeCode) return "Complete code signal with enough confidence";
-    if (details.bestSection.metrics.matched.stepByStepAnswer) return "Step-by-step answer signal with enough confidence";
     if (details.bestSection.metrics.matched.keyExplanation) return "Key explanation signal with enough confidence";
     return details.ambiguousPage ? "Strong useful signal on an ambiguous page" : "Strong useful signal";
   }
@@ -2088,7 +3082,13 @@ function getPageEvidence(details) {
       "useful", "answer", "action", "definition", "warning", "example", "recommendation",
       "finality", "procedure", "conciseAnswer", "summary", "directAction", "comparison",
       "codeExplanation", "completeCode", "acceptedAnswer", "troubleshooting", "revision",
-      "finalCode", "finalAnswer", "finalRecommendation", "stepByStepAnswer", "keyExplanation", "latestAssistantAnswer", "correctedAnswer", "answersLatestUser", "mainArgument", "keyEvidence", "methods", "results", "conclusion"
+      "finalCode", "finalAnswer", "finalRecommendation", "stepByStepAnswer", "keyExplanation",
+      "completeAssistantAnswer", "latestAssistantAnswer", "latestCompleteAssistantAnswer",
+      "correctedAnswer", "replacesFailedAttempt", "answersLatestUser",
+      "mainArgument", "keyEvidence", "quickStart", "installation", "usage", "parameters",
+      "troubleshooting", "prerequisites", "setup", "finalResult", "ingredients",
+      "instructions", "timing", "tips", "abstract", "methods", "results",
+      "discussion", "conclusion"
     ];
     return positiveSignals.reduce((sum, key) => sum + (metrics.matched[key] ? 1 : 0), 0)
       + (metrics.listItems >= 3 ? 1 : 0)
@@ -2105,9 +3105,18 @@ function getPageEvidence(details) {
     return Math.max(0, Math.floor(wordsBefore / READING_SPEED_WPM));
   }
 
-  function pickNavigationTargets(sections, importantSections, bestSectionId) {
+  function pickNavigationTargets(sections, importantSections, bestSectionId, pageProfile) {
     if (!sections.length) {
       return { nextImportantId: null, skipTargetId: null };
+    }
+    if (pageProfile && pageProfile.type === "search_results") {
+      const nextImportant = importantSections.find((section) => section.id !== bestSectionId)
+        || sections.find((section) => section.id !== bestSectionId && section.isImportant)
+        || null;
+      return {
+        nextImportantId: nextImportant ? nextImportant.id : null,
+        skipTargetId: pickSkipTarget(sections, importantSections)
+      };
     }
     const currentMarker = window.scrollY + Math.min(window.innerHeight * 0.45, 420);
     const nextImportant = importantSections.find((section) => section.top > currentMarker + 80 && section.id !== bestSectionId)
@@ -2371,8 +3380,19 @@ function getPageEvidence(details) {
       ranked = rankSections(ranked, pageProfile);
     }
 
+    ranked = applyThemeIntentBoosts(
+      ranked,
+      pageProfile,
+      buildThemeIntentContext(ranked, pageProfile, {
+        title: fixture.title || fixture.label || "",
+        url: fixture.url || ""
+      })
+    );
+    ranked = rankSections(ranked, pageProfile);
+
     const importantSections = pickImportantSections(ranked, pageProfile);
     const recommendation = buildRecommendation(ranked, importantSections, pageProfile);
+    attachSectionIntelligence(ranked, pageProfile, recommendation);
     return {
       pageProfile,
       sections: ranked,
