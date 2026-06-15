@@ -1503,6 +1503,291 @@ const cases = [
     }
   ),
   runFixture(
+    "Google Docs essay main argument beats title intro and closing notes",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 720,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 5 },
+      sections: [
+        {
+          title: "College essay draft",
+          text: repeated("College essay draft title page student name application notes.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 1 }
+        },
+        {
+          title: "Introduction",
+          text: repeated("Introduction gives background about the student and explains the setting before the essay reaches the central argument.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Main claim",
+          text: repeated("Main claim: the essay argues that responsibility became meaningful through repeated community work, concrete reflection, and revised choices.", 9),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Closing note",
+          text: repeated("Closing note reminder to revise commas and check the document formatting later.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Main claim/i,
+      bestKind: /main_argument/,
+      label: /Main argument/i,
+      why: /Main argument in the Google Docs document/i,
+      junkTitle: /College essay draft|Closing note/i
+    }
+  ),
+  runFixture(
+    "Google Docs research draft prioritizes results over references and appendix",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 860,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 7 },
+      sections: [
+        {
+          title: "Abstract",
+          text: repeated("Summary of the research draft explains the question, methods, measured evidence, and the expected contribution.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 1 }
+        },
+        {
+          title: "Results and findings",
+          text: repeated("Results show that the intervention improved attendance, increased completion rates, and produced stronger findings across the measured groups.", 9),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "References",
+          text: repeated("References bibliography citations journal article DOI retrieved from volume issue pages.", 12),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Appendix",
+          text: repeated("Appendix supplemental table raw notes extra survey instrument supporting details.", 10),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Results/i,
+      bestKind: /results/,
+      label: /Results/i,
+      why: /Results or findings/i,
+      junkTitle: /References|Appendix/i
+    }
+  ),
+  runFixture(
+    "Google Docs class notes summary and evidence beat headers",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 620,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 5 },
+      sections: [
+        {
+          title: "History 210 notes",
+          text: repeated("History 210 notes header week four class meeting.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 1 }
+        },
+        {
+          title: "Summary",
+          text: repeated("Summary: the lecture argues that industrial growth changed city planning because transportation, housing, and public health pressures converged.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Key evidence",
+          text: repeated("Evidence includes census data, a city map, and two primary source examples that support the central claim.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Summary|Key evidence/i,
+      bestKind: /summary|key_evidence/,
+      label: /Summary|Key evidence/i,
+      why: /Summary|Evidence/i,
+      junkTitle: /History 210 notes/i
+    }
+  ),
+  runFixture(
+    "Google Docs step by step plan selects actionable steps",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 690,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 6 },
+      sections: [
+        {
+          title: "Project plan overview",
+          text: repeated("Overview explains why the team is planning the project and what the document will cover.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 1 }
+        },
+        {
+          title: "Steps",
+          text: repeated("Step 1 gather requirements. Step 2 assign owners. Step 3 create the timeline. Step 4 verify risks and publish the plan.", 8),
+          numberedItems: 4,
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Expected result",
+          text: repeated("Conclusion: the completed plan gives the team clear owners, deadlines, evidence for each decision, and a final recommendation for launch.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Editor instructions",
+          text: repeated("Type @ to insert smart chips accept suggestion resolve comment share toolbar menu editing mode.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Steps/i,
+      bestKind: /steps/,
+      label: /Steps/i,
+      why: /Actionable steps|Google Docs guidance/i,
+      junkTitle: /Editor instructions/i
+    }
+  ),
+  runFixture(
+    "Google Docs references and appendix are down-ranked",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 760,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 6 },
+      sections: [
+        {
+          title: "Findings",
+          text: repeated("Findings show that the pilot program reduced delays, improved communication, and gave the team evidence for the next recommendation.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Conclusion",
+          text: repeated("Conclusion explains that the pilot should continue because the findings support a clearer workflow and measurable improvements.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "References",
+          text: repeated("References bibliography DOI retrieved citation journal article source list volume pages.", 13),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        },
+        {
+          title: "Appendix",
+          text: repeated("Appendix raw notes spreadsheet export supplemental details page footer repeated header.", 11),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Findings|Conclusion/i,
+      bestKind: /results|key_evidence|conclusion/,
+      label: /Results|Key evidence|Conclusion/i,
+      why: /Results|Evidence|findings|Conclusion/i,
+      junkTitle: /References|Appendix/i
+    }
+  ),
+  runFixture(
+    "Google Docs no-heading document still promotes substantial body",
+    {
+      type: "docs",
+      label: "Google Docs",
+      adapterName: "google-docs",
+      googleDocsPartial: true,
+      quietMode: true,
+      readingConfidence: 38,
+      words: 640,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 5 },
+      sections: [
+        {
+          title: "Section 1",
+          text: repeated("The document argues that a mentorship program would improve first year retention because students need clearer planning, earlier feedback, and stronger peer support.", 8),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 3 }
+        },
+        {
+          title: "Section 2",
+          text: repeated("A second paragraph gives evidence from advising meetings, attendance records, and student reflections that support the recommendation.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 3 }
+        },
+        {
+          title: "Section 3",
+          text: repeated("The final paragraph concludes that the mentorship program should launch with weekly check-ins and clear evaluation goals.", 7),
+          unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 3 }
+        }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Section 1|Section 2|Section 3/i,
+      bestKind: /main_argument|key_evidence|conclusion/,
+      label: /Main argument|Key evidence|Conclusion/i,
+      why: /Main argument|Evidence|Substantial Google Docs section|Conclusion/i
+    }
+  ),
+  {
+    name: "Google Docs partial readable map uses partial message",
+    run() {
+      const result = analyze({
+        type: "docs",
+        label: "Google Docs",
+        adapterName: "google-docs",
+        googleDocsPartial: true,
+        quietMode: true,
+        readingConfidence: 38,
+        words: 420,
+        pageEvidence: { articleEvidence: 2, quietEvidence: 2, paragraphs: 3 },
+        sections: [
+          {
+            title: "Conclusion",
+            text: repeated("Conclusion states the key takeaway and explains why the final recommendation matters for the document.", 8),
+            unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+          },
+          {
+            title: "Evidence",
+            text: repeated("Evidence includes examples, data, and supporting details for the central claim.", 7),
+            unitMeta: { kind: "google-docs", source: "google-docs", googleDocsPartial: true, headingLevel: 2 }
+          }
+        ]
+      });
+      assert(result.pageProfile.type === "docs", "expected Google Docs docs profile");
+      assert(!result.pageProfile.quietMode, "expected partial Google Docs map to be active");
+      assert(/currently available in the editor/i.test(result.pageProfile.reason), `unexpected partial reason ${result.pageProfile.reason}`);
+      assert(result.recommendation.hasStrongTarget, "expected partial readable Google Docs map to have a target");
+    }
+  },
+  runFixture(
     "Theme terms do not create a target on quiet dashboard",
     {
       type: "app_dashboard",

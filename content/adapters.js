@@ -118,6 +118,7 @@
       makePdfAdapter(),
       makeSearchAdapter(),
       ...AI_PLATFORMS.map((platform) => makeAiAdapter(platform)),
+      makeGoogleDocsAdapter(),
       makeProductAdapter(),
       makeDashboardAdapter(),
       makeRecipeAdapter(),
@@ -366,6 +367,1137 @@
           + (meta.finalCode ? 30 : 0);
       }
     };
+  }
+
+  function makeGoogleDocsAdapter() {
+    const unreadableReason = "Google Docs is open, but SkimRoute cannot read enough document text yet.";
+    const canvasReason = getGoogleDocsCanvasRenderingReason();
+    return {
+      name: "google-docs",
+      family: "docs",
+      type: "docs",
+      label: "Google Docs",
+      authoritativeUnits: true,
+      matches(context) {
+        return Boolean(getGoogleDocsDocumentId(context));
+      },
+      getRoot(context) {
+        return getGoogleDocsContentRoots(context, {
+          querySelectorAllDeep(root, selector) {
+            return Array.from(root.querySelectorAll ? root.querySelectorAll(selector) : []);
+          }
+        })[0] || createGoogleDocsEmptyRoot(context);
+      },
+      collectUnits(root, context, helpers) {
+        return getGoogleDocsExtraction(root, context, helpers).units;
+      },
+      classifyUnit(unit) {
+        return unit.meta || {};
+      },
+      diagnostics(context, helpers, root) {
+        return getGoogleDocsExtraction(root || createGoogleDocsEmptyRoot(context), context, helpers).diagnostics;
+      },
+      routeKey(context) {
+        const documentId = getGoogleDocsDocumentId(context) || "unknown";
+        const tabId = getGoogleDocsTabId(context) || "default";
+        return `google-docs:${documentId}:${tabId}`;
+      },
+      profile(context, helpers, root) {
+        const extraction = getGoogleDocsExtraction(root, context, helpers);
+        const units = extraction.units;
+        const words = units.reduce((sum, unit) => sum + helpers.countWords(unit.text || ""), 0);
+        const readable = words >= 80;
+        const reason = readable
+          ? "Google Docs document text found"
+          : extraction.renderingCapability === "canvas-only"
+            ? canvasReason
+            : unreadableReason;
+        return {
+          type: "docs",
+          label: "Google Docs",
+          readingConfidence: readable ? 82 : 38,
+          quietMode: !readable,
+          reason,
+          quietReason: readable ? "" : reason,
+          adapterName: "google-docs",
+          googleDocsMode: extraction.mode,
+          googleDocsPartial: extraction.partial,
+          googleDocsActiveTab: extraction.activeTab,
+          googleDocsFailureReason: extraction.failureReason,
+          googleDocsRenderingCapability: extraction.renderingCapability
+        };
+      },
+      scoreAdjustments(section) {
+        const text = `${section.title} ${section.text}`.toLowerCase();
+        let score = 0;
+        if (/\b(summary|conclusion|key takeaway|quick start|usage|steps?|recommendation|results?|findings?)\b/.test(text)) score += 28;
+        if (section.metrics && section.metrics.codeBlocks > 0) score += 18;
+        return score;
+      }
+    };
+  }
+
+  function getGoogleDocsDocumentId(context) {
+    const location = context && context.location;
+    const host = String(location && location.hostname || "").toLowerCase();
+    const pathname = String(location && location.pathname || "");
+    if (host !== "docs.google.com") return "";
+    const match = pathname.match(/^\/document\/d\/([^/?#]+)/i);
+    return match && match[1] ? sanitizeGoogleDocsRoutePart(match[1]) : "";
+  }
+
+  function getGoogleDocsTabId(context) {
+    const location = context && context.location;
+    const search = String(location && location.search || "");
+    const hash = String(location && location.hash || "");
+    const queryTab = getUrlParam(search, "tab") || getUrlParam(hash.replace(/^#/, "?"), "tab");
+    if (queryTab) return sanitizeGoogleDocsRoutePart(queryTab);
+
+    const doc = context && context.document;
+    const selectedTab = doc && doc.querySelector && doc.querySelector("[role='tab'][aria-selected='true'], [aria-selected='true'][data-tab-id], [aria-current='page'][data-tab-id], [data-tab-id][aria-selected='true']");
+    if (!selectedTab || !selectedTab.getAttribute) return "default";
+    const attr = selectedTab.getAttribute("data-tab-id")
+      || selectedTab.getAttribute("data-id")
+      || selectedTab.getAttribute("id")
+      || selectedTab.getAttribute("aria-label");
+    return sanitizeGoogleDocsRoutePart(attr) || "default";
+  }
+
+  function getUrlParam(search, name) {
+    try {
+      const params = new URLSearchParams(search || "");
+      return params.get(name) || "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function sanitizeGoogleDocsRoutePart(value) {
+    return String(value || "").trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 160);
+  }
+
+  function getGoogleDocsContentRoots(context, helpers) {
+    const doc = context && context.document;
+    if (!doc) return [];
+    const selectors = [
+      ".kix-appview-editor",
+      ".docs-editor-container",
+      ".kix-page",
+      ".kix-page-content",
+      ".kix-page-content-wrapper",
+      "[aria-label='Document content']",
+      "[aria-label*='Document content' i]",
+      "[role='document']",
+      "[role='textbox'][contenteditable='true']",
+      ".docs-editor-container [contenteditable='true']"
+    ];
+    const entries = getGoogleDocsDocumentEntries(context, helpers).entries;
+    const roots = uniqueElements(entries.flatMap((entry) => (
+      selectors.flatMap((selector) => queryGoogleDocsDeep(entry.document, selector, helpers))
+    )))
+      .filter((node) => node && !isGoogleDocsChromeNode(node))
+      .filter((node) => isGoogleDocsActiveTabNode(node, getGoogleDocsTabId(context)));
+    return roots.length ? roots : [];
+  }
+
+  function createGoogleDocsEmptyRoot(context) {
+    const doc = context && context.document;
+    if (doc && typeof doc.createElement === "function") {
+      const element = doc.createElement("div");
+      element.setAttribute("data-pagepilot-google-docs-empty-root", "true");
+      return element;
+    }
+    return {
+      nodeType: 1,
+      tagName: "DIV",
+      id: "",
+      className: "pagepilot-google-docs-empty-root",
+      ownerDocument: doc || null,
+      childNodes: [],
+      children: [],
+      innerText: "",
+      textContent: "",
+      getAttribute() { return ""; },
+      setAttribute() {},
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+      closest() { return null; },
+      matches() { return false; },
+      getBoundingClientRect() {
+        return { top: 0, left: 0, right: 1, bottom: 1, width: 1, height: 1 };
+      }
+    };
+  }
+
+  function getGoogleDocsDocumentEntries(context, helpers) {
+    const doc = context && context.document;
+    if (!doc) {
+      return {
+        entries: [],
+        iframeCount: 0,
+        sameOriginIframeDocuments: 0,
+        inaccessibleIframeCount: 0,
+        iframeTextWords: 0
+      };
+    }
+    const entries = [{ document: doc, source: "main", iframe: null }];
+    const iframeSelectors = [
+      ".docs-texteventtarget-iframe",
+      "iframe.docs-texteventtarget-iframe",
+      "iframe[title*='Google Docs' i]",
+      "iframe[aria-label*='Google Docs' i]",
+      "iframe[aria-label*='document' i]",
+      "iframe[src*='docs.google.com/document' i]"
+    ].join(",");
+    const iframeCandidates = uniqueElements(queryGoogleDocsLocal(doc, iframeSelectors)
+      .concat(queryGoogleDocsLocal(doc, "iframe")))
+      .filter((iframe) => iframe && String(iframe.tagName || "").toLowerCase() === "iframe");
+    let sameOriginIframeDocuments = 0;
+    let inaccessibleIframeCount = 0;
+    let iframeTextWords = 0;
+    iframeCandidates.forEach((iframe) => {
+      let iframeDoc = null;
+      try {
+        iframeDoc = iframe.contentDocument || iframe.contentWindow && iframe.contentWindow.document || null;
+      } catch (error) {
+        inaccessibleIframeCount += 1;
+        return;
+      }
+      if (!iframeDoc || !iframeDoc.body) {
+        inaccessibleIframeCount += 1;
+        return;
+      }
+      sameOriginIframeDocuments += 1;
+      entries.push({ document: iframeDoc, source: "iframe", iframe });
+      try {
+        iframeTextWords += helpers && helpers.countWords
+          ? helpers.countWords(getGoogleDocsDocumentTextForDiagnostics(iframeDoc, helpers).slice(0, 12000))
+          : 0;
+      } catch (error) {
+        // Keep iframe diagnostics best-effort.
+      }
+    });
+    return {
+      entries,
+      iframeCount: iframeCandidates.length,
+      sameOriginIframeDocuments,
+      inaccessibleIframeCount,
+      iframeTextWords
+    };
+  }
+
+  function queryGoogleDocsLocal(root, selector) {
+    try {
+      return Array.from(root && root.querySelectorAll ? root.querySelectorAll(selector) : []);
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function queryGoogleDocsDeep(root, selector, helpers) {
+    try {
+      if (helpers && typeof helpers.querySelectorAllDeep === "function") {
+        return Array.from(helpers.querySelectorAllDeep(root, selector) || []);
+      }
+    } catch (error) {
+      // Fall through to local query.
+    }
+    return queryGoogleDocsLocal(root, selector);
+  }
+
+  function getGoogleDocsSelectorDiagnostics(context, helpers, entries) {
+    const docs = entries && entries.length ? entries : getGoogleDocsDocumentEntries(context, helpers).entries;
+    const count = (selector) => uniqueElements(docs.flatMap((entry) => queryGoogleDocsDeep(entry.document, selector, helpers)))
+      .filter((node) => node && !isGoogleDocsChromeNode(node)).length;
+    return {
+      accessibility: count(".kix-lineview, .kix-paragraphrenderer, .kix-lineview-content, .kix-wordhtmlgenerator-word-node, [role='heading'], [role='paragraph'], [role='listitem']"),
+      editor: count(".docs-editor-container [contenteditable='true'], [role='textbox'][contenteditable='true'], [aria-label*='Document content' i][contenteditable='true']"),
+      viewer: count("[role='document'], [aria-label*='Document content' i], .docs-viewer, .kix-document-viewer, .kix-appview-editor[aria-readonly='true']"),
+      canvas: count(".kix-appview-editor canvas, .kix-page canvas, .kix-canvas-tile-content, canvas[aria-label*='page' i], canvas[aria-label*='document' i]")
+    };
+  }
+
+  function getGoogleDocsShellWords(context, helpers) {
+    const doc = context && context.document;
+    if (!doc || !doc.body || !helpers || !helpers.countWords || !helpers.getReadableText) return 0;
+    try {
+      return helpers.countWords(helpers.getReadableText(doc.body).slice(0, 12000));
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  function getGoogleDocsDocumentTextForDiagnostics(doc, helpers) {
+    if (!doc || !helpers) return "";
+    const parts = [];
+    try {
+      if (doc.body && helpers.getReadableText) {
+        parts.push(helpers.getReadableText(doc.body));
+      }
+    } catch (error) {
+      // Keep diagnostics best-effort.
+    }
+    try {
+      queryGoogleDocsLocal(doc, "[aria-label], [data-text], [data-content], [data-value], [title]")
+        .forEach((node) => {
+          if (isGoogleDocsChromeNode(node)) return;
+          ["aria-label", "data-text", "data-content", "data-value", "title"].forEach((attr) => {
+            const value = node.getAttribute && node.getAttribute(attr);
+            if (value) parts.push(value);
+          });
+        });
+    } catch (error) {
+      // Keep diagnostics best-effort.
+    }
+    return helpers.cleanText ? helpers.cleanText(parts.join(" ")) : String(parts.join(" ")).replace(/\s+/g, " ").trim();
+  }
+
+  function classifyGoogleDocsRenderingCapability(details) {
+    if (details.renderedLineUnits && details.renderedLineUnits.length) return "accessibility-dom";
+    if (details.editorUnits && details.editorUnits.length) return "editor-dom";
+    if (details.viewerUnits && details.viewerUnits.length) return "viewer-dom";
+    if (details.visibleUnits && details.visibleUnits.length) return "editor-dom";
+    if (details.outlineUnits && details.outlineUnits.length) return "outline-only";
+    if (details.selectorDiagnostics && details.selectorDiagnostics.canvas > 0) return "canvas-only";
+    if (details.contentRoots && details.contentRoots.length) return "unsupported";
+    return "unsupported";
+  }
+
+  function getGoogleDocsCanvasRenderingReason() {
+    return "Google Docs is using canvas rendering. Turn on screen-reader support in Google Docs, then select Rescan. Windows: Ctrl+Alt+Z. Mac: Command+Option+Z. Or use Tools → Accessibility settings.";
+  }
+
+  function getGoogleDocsExtraction(root, context, helpers) {
+    const mode = detectGoogleDocsMode(context, helpers);
+    const activeTab = getGoogleDocsTabId(context) || "default";
+    const documentEntries = getGoogleDocsDocumentEntries(context, helpers);
+    const contentRoots = getGoogleDocsContentRoots(context, helpers);
+    const selectorDiagnostics = getGoogleDocsSelectorDiagnostics(context, helpers, documentEntries.entries);
+    const shellWords = getGoogleDocsShellWords(context, helpers);
+    const diagnostics = {
+      googleDocsMatched: Boolean(getGoogleDocsDocumentId(context)),
+      googleDocsMode: mode,
+      googleDocsActiveTab: activeTab,
+      googleDocsGenuineContentRoots: contentRoots.length,
+      googleDocsIframeCount: documentEntries.iframeCount,
+      googleDocsSameOriginIframeDocuments: documentEntries.sameOriginIframeDocuments,
+      googleDocsInaccessibleIframeCount: documentEntries.inaccessibleIframeCount,
+      googleDocsIframeTextWords: documentEntries.iframeTextWords,
+      googleDocsAccessibilitySelectorMatches: selectorDiagnostics.accessibility,
+      googleDocsEditorSelectorMatches: selectorDiagnostics.editor,
+      googleDocsViewerSelectorMatches: selectorDiagnostics.viewer,
+      googleDocsCanvasNodes: selectorDiagnostics.canvas,
+      googleDocsRenderingCapability: "unsupported",
+      googleDocsGenuineDocumentWords: 0,
+      googleDocsRejectedShellWords: 0,
+      googleDocsOutlineUnits: 0,
+      googleDocsRenderedLineUnits: 0,
+      googleDocsRenderedLineCount: 0,
+      googleDocsEditorUnits: 0,
+      googleDocsViewerUnits: 0,
+      googleDocsVisibleBlockUnits: 0,
+      googleDocsDuplicatesRemoved: 0,
+      googleDocsPartial: true,
+      googleDocsSourceMix: "",
+      googleDocsExtractionFailureReason: ""
+    };
+
+    const outlineUnits = collectGoogleDocsOutlineUnits(root, context, helpers, mode, activeTab);
+    const renderedLineUnits = collectGoogleDocsRenderedLineUnits(root, context, helpers, mode, activeTab);
+    const editorUnits = collectGoogleDocsTextUnits(root, context, helpers, mode, activeTab, "editor");
+    const viewerUnits = collectGoogleDocsTextUnits(root, context, helpers, mode, activeTab, "viewer");
+    const visibleUnits = collectGoogleDocsTextUnits(root, context, helpers, mode, activeTab, "visible-block");
+    const deduped = dedupeGoogleDocsUnits(outlineUnits.concat(renderedLineUnits, editorUnits, viewerUnits, visibleUnits));
+    const genuineDocumentWords = deduped.units.reduce((sum, unit) => sum + helpers.countWords(unit.text || ""), 0);
+    const renderingCapability = classifyGoogleDocsRenderingCapability({
+      outlineUnits,
+      renderedLineUnits,
+      editorUnits,
+      viewerUnits,
+      visibleUnits,
+      selectorDiagnostics,
+      contentRoots
+    });
+    const units = deduped.units.map((unit, index) => normalizeGoogleDocsUnit(unit, index, {
+      context,
+      helpers,
+      mode,
+      activeTab,
+      renderingCapability,
+      partial: isGoogleDocsPartialMap({
+        outlineUnits,
+        renderedLineUnits,
+        editorUnits,
+        viewerUnits,
+        visibleUnits,
+        allUnits: deduped.units
+      })
+    })).filter(Boolean);
+
+    diagnostics.googleDocsOutlineUnits = outlineUnits.length;
+    diagnostics.googleDocsRenderedLineUnits = renderedLineUnits.length;
+    diagnostics.googleDocsRenderedLineCount = renderedLineUnits.reduce((sum, unit) => sum + ((unit.sourceLineIds && unit.sourceLineIds.length) || 1), 0);
+    diagnostics.googleDocsEditorUnits = editorUnits.length;
+    diagnostics.googleDocsViewerUnits = viewerUnits.length;
+    diagnostics.googleDocsVisibleBlockUnits = visibleUnits.length;
+    diagnostics.googleDocsDuplicatesRemoved = deduped.duplicatesRemoved;
+    diagnostics.googleDocsPartial = units.some((unit) => unit.meta && unit.meta.googleDocsPartial) || !units.length;
+    diagnostics.googleDocsSourceMix = uniqueStrings(units.map((unit) => unit.meta && unit.meta.googleDocsSource || "")).join(",");
+    diagnostics.googleDocsRenderingCapability = renderingCapability;
+    diagnostics.googleDocsGenuineDocumentWords = units.reduce((sum, unit) => sum + helpers.countWords(unit.text || ""), 0);
+    diagnostics.googleDocsRejectedShellWords = Math.max(0, shellWords - diagnostics.googleDocsGenuineDocumentWords);
+    diagnostics.googleDocsExtractionFailureReason = units.length
+      ? ""
+      : renderingCapability === "canvas-only"
+        ? "canvas-rendering-requires-screen-reader-support"
+        : "no-readable-google-docs-document-content";
+
+    return {
+      units,
+      mode,
+      activeTab,
+      partial: diagnostics.googleDocsPartial,
+      failureReason: diagnostics.googleDocsExtractionFailureReason,
+      renderingCapability,
+      diagnostics
+    };
+  }
+
+  function collectGoogleDocsUnits(root, context, helpers) {
+    return getGoogleDocsExtraction(root, context, helpers).units;
+  }
+
+  function collectGoogleDocsRenderedLineUnits(root, context, helpers, mode, activeTab) {
+    const roots = getGoogleDocsSourceRoots(root, context, helpers, "rendered-line")
+      .filter((node) => isGoogleDocsActiveTabNode(node, activeTab));
+    if (!roots.length) return [];
+    const lines = collectGoogleDocsRenderedLines(roots, helpers, activeTab);
+    if (!lines.length) return [];
+    return googleDocsBlocksToUnits(lines, context, helpers, {
+      mode,
+      activeTab,
+      source: "rendered-line"
+    });
+  }
+
+  function collectGoogleDocsOutlineUnits(root, context, helpers, mode, activeTab) {
+    const doc = context && context.document;
+    if (!doc) return [];
+    const selectors = [
+      "#docs-outline-pane [role='link']",
+      "#docs-outline-pane [role='treeitem']",
+      ".docs-outline-items .docs-outline-item",
+      "[aria-label*='Document outline' i] [role='link']",
+      "[aria-label*='Document outline' i] [role='treeitem']",
+      "[guidedhelpid*='outline' i]",
+      "[data-tooltip*='Outline' i] [role='treeitem']"
+    ];
+    return uniqueElements(selectors.flatMap((selector) => helpers.querySelectorAllDeep(doc, selector)))
+      .filter((node) => node && helpers.isVisible(node))
+      .filter((node) => !isGoogleDocsChromeNode(node))
+      .filter((node) => isGoogleDocsActiveTabNode(node, activeTab))
+      .map((node) => ({
+        title: googleDocsTitle(context, helpers.cleanText(node.innerText || node.textContent || helpers.getReadableText(node))),
+        anchor: node,
+        blocks: [node],
+        text: helpers.cleanText(node.innerText || node.textContent || helpers.getReadableText(node)),
+        level: inferGoogleDocsHeadingLevel(node, 2),
+        source: "outline",
+        mode,
+        activeTab,
+        navigationReference: getGoogleDocsNavigationReference(node),
+        navigationExact: true,
+        navigationConfidence: "exact",
+        order: getGoogleDocsNodeOrder(node)
+      }))
+      .filter((unit) => helpers.countWords(unit.text) >= 2)
+      .slice(0, 80);
+  }
+
+  function collectGoogleDocsTextUnits(root, context, helpers, mode, activeTab, source) {
+    const roots = getGoogleDocsSourceRoots(root, context, helpers, source)
+      .filter((node) => isGoogleDocsActiveTabNode(node, activeTab));
+    if (!roots.length) return [];
+    const domBlocks = collectGoogleDocsBlocks(roots, helpers, source);
+    const fallbackBlocks = collectGoogleDocsFallbackTextBlocks(roots, helpers, source);
+    const blocks = chooseGoogleDocsBlocks(domBlocks, fallbackBlocks, helpers);
+    return googleDocsBlocksToUnits(blocks, context, helpers, {
+      mode,
+      activeTab,
+      source
+    });
+  }
+
+  function getGoogleDocsSourceRoots(root, context, helpers, source) {
+    const doc = context && context.document;
+    const editorSelectors = [
+      ".docs-editor-container [contenteditable='true']",
+      "[role='textbox'][contenteditable='true']",
+      "[aria-label*='Document content' i][contenteditable='true']"
+    ];
+    const viewerSelectors = [
+      "[role='document']",
+      "[aria-label*='Document content' i]",
+      ".docs-viewer",
+      ".kix-document-viewer",
+      ".kix-appview-editor[aria-readonly='true']"
+    ];
+    const visibleSelectors = [
+      ".kix-page-content",
+      ".kix-page-content-wrapper",
+      ".kix-page",
+      ".kix-appview-editor",
+      ".kix-lineview",
+      ".docs-page",
+      ".docs-pageless-content"
+    ];
+    const renderedLineSelectors = [
+      ".kix-page-content",
+      ".kix-page-content-wrapper",
+      ".docs-pageless-content",
+      ".kix-appview-editor",
+      ".kix-document-viewer",
+      "[aria-label*='Document content' i]",
+      "[role='document']"
+    ];
+    const selectors = source === "editor"
+      ? editorSelectors
+      : source === "rendered-line"
+        ? renderedLineSelectors
+      : source === "viewer"
+        ? viewerSelectors
+        : visibleSelectors;
+    const entries = getGoogleDocsDocumentEntries(context, helpers).entries;
+    const candidates = uniqueElements(entries.flatMap((entry) => (
+      selectors.flatMap((selector) => queryGoogleDocsDeep(entry.document, selector, helpers))
+    )))
+      .filter((node) => node && helpers.isVisible(node))
+      .filter((node) => !isGoogleDocsChromeNode(node));
+    if (source === "visible-block" && root && doc && root !== doc.body && isGoogleDocsGenuineContentRoot(root) && !isGoogleDocsChromeNode(root)) {
+      candidates.push(root);
+    }
+    return uniqueElements(candidates);
+  }
+
+  function collectGoogleDocsRenderedLines(roots, helpers, activeTab) {
+    const lineSelectors = [
+      "h1", "h2", "h3", "h4", "p", "li", "blockquote",
+      "[role='heading']", "[role='paragraph']", "[role='listitem']",
+      ".kix-lineview", ".kix-paragraphrenderer", ".kix-lineview-content",
+      ".kix-wordhtmlgenerator-word-node"
+    ].join(",");
+    const lineCandidates = uniqueElements(roots.flatMap((contentRoot) => helpers.querySelectorAllDeep(contentRoot, lineSelectors)))
+      .filter((node) => node && helpers.isVisible(node))
+      .filter((node) => !isGoogleDocsChromeNode(node))
+      .filter((node) => isGoogleDocsActiveTabNode(node, activeTab))
+      .map((node, index) => createGoogleDocsRenderedLine(node, helpers, index))
+      .filter(Boolean);
+    const grouped = groupGoogleDocsWordNodesIntoLines(lineCandidates, helpers);
+    return grouped
+      .sort((a, b) => a.order - b.order)
+      .filter((line, index, list) => !list.slice(0, index).some((previous) => previous.node && line.node && previous.node.contains && previous.node.contains(line.node) && normalizeGoogleDocsDedupeText(previous.text).includes(normalizeGoogleDocsDedupeText(line.text))))
+      .slice(0, 360);
+  }
+
+  function createGoogleDocsRenderedLine(node, helpers, index) {
+    const text = getGoogleDocsRenderedNodeText(node, helpers);
+    if (helpers.countWords(text) < 2) return null;
+    const navigationReference = getGoogleDocsNavigationReference(node) || `rendered-line-${index + 1}`;
+    const top = getGoogleDocsNodeOrder(node);
+    return {
+      node,
+      text,
+      level: inferGoogleDocsHeadingLevel(node, inferGoogleDocsTextSegmentLevel(text, helpers.countWords(text))),
+      source: "rendered-line",
+      order: top + index * 0.001,
+      syntheticTop: top,
+      syntheticNavigationReference: navigationReference,
+      googleDocsLineId: navigationReference,
+      lineIndex: index
+    };
+  }
+
+  function getGoogleDocsRenderedNodeText(node, helpers) {
+    if (!node) return "";
+    const directValues = [
+      node.innerText,
+      node.textContent,
+      helpers.getReadableText(node),
+      node.getAttribute && node.getAttribute("aria-label"),
+      node.getAttribute && node.getAttribute("data-text"),
+      node.getAttribute && node.getAttribute("data-content"),
+      node.getAttribute && node.getAttribute("data-value"),
+      node.getAttribute && node.getAttribute("title")
+    ];
+    const descendantValues = helpers.querySelectorAllDeep(node, "[aria-label], [data-text], [data-content], [data-value], [title]")
+      .filter((child) => child && !isGoogleDocsChromeNode(child))
+      .flatMap((child) => [
+        child.getAttribute && child.getAttribute("aria-label"),
+        child.getAttribute && child.getAttribute("data-text"),
+        child.getAttribute && child.getAttribute("data-content"),
+        child.getAttribute && child.getAttribute("data-value"),
+        child.getAttribute && child.getAttribute("title"),
+        child.innerText,
+        child.textContent
+      ]);
+    const candidates = directValues.concat(descendantValues)
+      .map((value) => helpers.cleanText(value || ""))
+      .filter(Boolean)
+      .filter((value) => !looksLikeGoogleDocsChromeText(value));
+    if (!candidates.length) return "";
+    return candidates
+      .sort((a, b) => helpers.countWords(b) - helpers.countWords(a) || b.length - a.length)[0]
+      .replace(/\s+([,.;:!?])/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function looksLikeGoogleDocsChromeText(text) {
+    const value = String(text || "").trim();
+    if (!value) return true;
+    if (/^(file|edit|view|insert|format|tools|extensions|help|share|comments?|suggesting|editing|viewing|menu|toolbar)$/i.test(value)) return true;
+    return /\b(?:share|comments?|toolbar|menu|last edit|document status|saving|saved to drive)\b/i.test(value) && value.split(/\s+/).length < 18;
+  }
+
+  function groupGoogleDocsWordNodesIntoLines(lines, helpers) {
+    const wordNodes = lines.filter((line) => line.node && line.node.matches && line.node.matches(".kix-wordhtmlgenerator-word-node"));
+    if (!wordNodes.length) return lines;
+    const nonWords = lines.filter((line) => !(line.node && line.node.matches && line.node.matches(".kix-wordhtmlgenerator-word-node")));
+    const groups = new Map();
+    wordNodes.forEach((line) => {
+      const parent = line.node.closest && line.node.closest(".kix-lineview, .kix-paragraphrenderer, .kix-lineview-content") || line.node.parentElement;
+      const key = parent ? `node:${getGoogleDocsNavigationReference(parent) || getGoogleDocsNodeOrder(parent)}` : `top:${Math.round(line.order / 8)}`;
+      if (!groups.has(key)) groups.set(key, { node: parent || line.node, parts: [], order: parent ? getGoogleDocsNodeOrder(parent) : line.order, lineIds: [] });
+      const group = groups.get(key);
+      group.parts.push(line.text);
+      group.lineIds.push(line.googleDocsLineId);
+    });
+    const groupedLines = Array.from(groups.values()).map((group, index) => ({
+      node: group.node,
+      text: helpers.cleanText(group.parts.join(" ")),
+      level: inferGoogleDocsTextSegmentLevel(group.parts.join(" "), helpers.countWords(group.parts.join(" "))),
+      source: "rendered-line",
+      order: group.order + index * 0.001,
+      syntheticTop: group.order,
+      syntheticNavigationReference: getGoogleDocsNavigationReference(group.node) || `rendered-line-group-${index + 1}`,
+      googleDocsLineId: getGoogleDocsNavigationReference(group.node) || `rendered-line-group-${index + 1}`,
+      sourceLineIds: group.lineIds,
+      lineIndex: index
+    })).filter((line) => helpers.countWords(line.text) >= 2);
+    return nonWords.concat(groupedLines);
+  }
+
+  function collectGoogleDocsBlocks(roots, helpers, source) {
+    const selector = [
+      "h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote", "table",
+      "[role='heading']", "[role='paragraph']", "[role='listitem']",
+      ".kix-lineview", ".kix-paragraphrenderer", ".kix-wordhtmlgenerator-word-node"
+    ].join(",");
+    const rawBlocks = uniqueElements(roots.flatMap((contentRoot) => {
+      const candidates = helpers.querySelectorAllDeep(contentRoot, selector);
+      return candidates.length ? candidates : [contentRoot];
+    }));
+    return rawBlocks
+      .filter((node) => node && helpers.isVisible(node))
+      .filter((node) => !isGoogleDocsChromeNode(node))
+      .filter((node) => !helpers.isLowValueElement(node))
+      .filter((node, index, list) => !list.slice(0, index).some((previous) => previous.contains && previous.contains(node)))
+      .map((node) => ({
+        node,
+        text: helpers.cleanText(node.innerText || node.textContent || helpers.getReadableText(node)),
+        level: inferGoogleDocsHeadingLevel(node, 2),
+        source,
+        order: getGoogleDocsNodeOrder(node)
+      }))
+      .filter((item) => helpers.countWords(item.text) >= (item.level <= 3 ? 2 : 6))
+      .slice(0, 220);
+  }
+
+  function chooseGoogleDocsBlocks(domBlocks, fallbackBlocks, helpers) {
+    const domWords = sumGoogleDocsBlockWords(domBlocks, helpers);
+    const fallbackWords = sumGoogleDocsBlockWords(fallbackBlocks, helpers);
+    if (
+      fallbackBlocks.length > 1
+      && fallbackWords >= 80
+      && (
+        !domBlocks.length
+        || domBlocks.length <= 1
+        || domWords < fallbackWords * 0.65
+        || fallbackWords >= domWords * 1.35
+      )
+    ) {
+      return fallbackBlocks;
+    }
+    return domBlocks;
+  }
+
+  function sumGoogleDocsBlockWords(blocks, helpers) {
+    return (blocks || []).reduce((sum, block) => sum + helpers.countWords(block && block.text || ""), 0);
+  }
+
+  function collectGoogleDocsFallbackTextBlocks(roots, helpers, source) {
+    const blocks = [];
+    (roots || []).forEach((root, rootIndex) => {
+      const rawText = getGoogleDocsRawNodeText(root);
+      if (helpers.countWords(rawText) < 80) return;
+      if (source === "visible-block" && !isLikelyGoogleDocsDocumentText(rawText, helpers)) return;
+      const baseOrder = getGoogleDocsNodeOrder(root) + rootIndex * 1000;
+      splitGoogleDocsTextSegments(rawText, helpers).forEach((segment, segmentIndex) => {
+        blocks.push({
+          node: root,
+          text: segment.text,
+          level: segment.level,
+          source,
+          standalone: true,
+          order: baseOrder + segmentIndex * 0.01,
+          syntheticTop: getGoogleDocsSyntheticTop(root, segmentIndex),
+          syntheticNavigationReference: `${getGoogleDocsNavigationReference(root) || "visible"}:segment-${segmentIndex + 1}`
+        });
+      });
+    });
+    return blocks.slice(0, 220);
+  }
+
+  function getGoogleDocsRawNodeText(node) {
+    const value = String(node && (node.innerText || node.textContent) || "");
+    return value
+      .replace(/\r/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{4,}/g, "\n\n\n")
+      .trim();
+  }
+
+  function splitGoogleDocsTextSegments(rawText, helpers) {
+    const normalized = String(rawText || "").replace(/\r/g, "\n").trim();
+    if (!normalized) return [];
+    const blocks = normalized
+      .split(/\n{2,}/)
+      .map((part) => part.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const sourceBlocks = blocks.length > 1
+      ? blocks
+      : normalized.split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+    const segments = [];
+    sourceBlocks.forEach((block) => {
+      splitGoogleDocsLongTextBlock(block, helpers).forEach((segment) => segments.push(segment));
+    });
+    if (segments.length <= 1 && helpers.countWords(normalized) >= 120) {
+      return splitGoogleDocsLongTextBlock(normalized.replace(/\s+/g, " "), helpers);
+    }
+    return segments;
+  }
+
+  function splitGoogleDocsLongTextBlock(text, helpers) {
+    const clean = String(text || "").replace(/\s+/g, " ").trim();
+    const words = helpers.countWords(clean);
+    if (!clean || words < 6) return [];
+    if (words <= 150) {
+      return [{ text: clean, level: inferGoogleDocsTextSegmentLevel(clean, words) }];
+    }
+
+    const sentences = clean.match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g) || [clean];
+    const segments = [];
+    let bucket = "";
+    let bucketWords = 0;
+    sentences.forEach((sentence) => {
+      const value = sentence.replace(/\s+/g, " ").trim();
+      const sentenceWords = helpers.countWords(value);
+      if (!value) return;
+      if (bucket && bucketWords + sentenceWords > 120) {
+        segments.push({ text: bucket.trim(), level: 3 });
+        bucket = "";
+        bucketWords = 0;
+      }
+      bucket = `${bucket} ${value}`.trim();
+      bucketWords += sentenceWords;
+    });
+    if (bucket) segments.push({ text: bucket.trim(), level: 3 });
+    return segments.length ? segments : [{ text: clean, level: 3 }];
+  }
+
+  function inferGoogleDocsTextSegmentLevel(text, words) {
+    const value = String(text || "").trim();
+    if (words <= 14 && !/[.!?]\s*$/.test(value) && /\b(introduction|summary|abstract|results?|findings?|steps?|plan|evidence|conclusion|references|appendix|notes?)\b/i.test(value)) {
+      return 2;
+    }
+    return 3;
+  }
+
+  function getGoogleDocsSyntheticTop(node, index) {
+    const rect = node && node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+    const top = rect && Number.isFinite(rect.top) ? rect.top : 0;
+    return top + index * 72;
+  }
+
+  function googleDocsBlocksToUnits(blocks, context, helpers, details) {
+    const units = [];
+    let bucket = [];
+    let bucketWords = 0;
+    let headingStack = [];
+    const bucketLimit = 105;
+    blocks
+      .sort((a, b) => a.order - b.order)
+      .forEach((item) => {
+        const isHeading = isGoogleDocsHeadingItem(item);
+        const words = helpers.countWords(item.text);
+        const standaloneBlock = Boolean(item.standalone) || item.node.matches && item.node.matches("pre, table, blockquote");
+        if (isHeading) {
+          while (headingStack.length && headingStack[headingStack.length - 1].level >= item.level) {
+            headingStack.pop();
+          }
+          headingStack.push({
+            title: item.text,
+            level: item.level,
+            navigationReference: item.syntheticNavigationReference || getGoogleDocsNavigationReference(item.node)
+          });
+        }
+        const itemWithHierarchy = {
+          ...item,
+          headingPath: headingStack.slice()
+        };
+        if ((isHeading || standaloneBlock) && bucket.length) {
+          units.push(createGoogleDocsBucketUnit(bucket, units.length, context, helpers, details));
+          bucket = [];
+          bucketWords = 0;
+        }
+        bucket.push(itemWithHierarchy);
+        bucketWords += words;
+        if (standaloneBlock || (!isHeading && bucketWords >= bucketLimit)) {
+          units.push(createGoogleDocsBucketUnit(bucket, units.length, context, helpers, details));
+          bucket = [];
+          bucketWords = 0;
+        }
+      });
+    if (bucket.length) units.push(createGoogleDocsBucketUnit(bucket, units.length, context, helpers, details));
+    return units.filter(Boolean);
+  }
+
+  function createGoogleDocsBucketUnit(bucket, index, context, helpers, details) {
+    const first = bucket[0];
+    const headingItems = bucket.filter((item) => isGoogleDocsHeadingItem(item));
+    const titleItem = headingItems[0] || first;
+    const headingPath = first && Array.isArray(first.headingPath) ? first.headingPath : [];
+    const text = helpers.cleanText(bucket.map((item) => item.text).join(" "));
+    const sourceLineIds = uniqueStrings(bucket.flatMap((item) => item.sourceLineIds || item.googleDocsLineId || []).filter(Boolean));
+    const lineIndexes = bucket.map((item) => Number(item.lineIndex)).filter(Number.isFinite);
+    const navigationReference = titleItem && (titleItem.syntheticNavigationReference || getGoogleDocsNavigationReference(titleItem.node))
+      || first && (first.syntheticNavigationReference || getGoogleDocsNavigationReference(first.node))
+      || "";
+    return {
+      title: googleDocsTitle(context, titleItem && titleItem.text || first && first.text || `Section ${index + 1}`),
+      anchor: first && first.node,
+      blocks: bucket.map((item) => item.node),
+      text,
+      level: titleItem && titleItem.level || first && first.level || 2,
+      source: details.source,
+      mode: details.mode,
+      activeTab: details.activeTab,
+      navigationReference,
+      navigationExact: details.source !== "visible-block" && Boolean(navigationReference),
+      navigationConfidence: details.source === "visible-block" ? "approximate" : navigationReference ? "exact" : "approximate",
+      order: first && first.order || index,
+      syntheticTop: first && Number.isFinite(Number(first.syntheticTop)) ? Number(first.syntheticTop) : null,
+      headingPath,
+      parentHeadingTitle: headingPath.length > 1 ? headingPath[headingPath.length - 2].title : "",
+      parentHeadingId: headingPath.length > 1 ? headingPath[headingPath.length - 2].navigationReference : "",
+      documentOrder: first && Number.isFinite(Number(first.order)) ? Number(first.order) : index,
+      sourceLineIds,
+      lineStart: lineIndexes.length ? Math.min(...lineIndexes) : null,
+      lineEnd: lineIndexes.length ? Math.max(...lineIndexes) : null
+    };
+  }
+
+  function isGoogleDocsHeadingItem(item) {
+    if (!item) return false;
+    if (Number(item.level) <= 2) return true;
+    const text = String(item.text || "").trim();
+    const words = text.split(/\s+/).filter(Boolean).length;
+    return words <= 14
+      && !/[.!?]\s*$/.test(text)
+      && /\b(introduction|summary|abstract|results?|findings?|steps?|plan|evidence|conclusion|references|appendix|notes?)\b/i.test(text);
+  }
+
+  function normalizeGoogleDocsUnit(details, index, contextDetails) {
+    if (!details || !details.anchor || !details.text) return null;
+    const context = contextDetails.context;
+    const helpers = contextDetails.helpers;
+    const text = helpers.cleanText(details.text);
+    if (helpers.countWords(text) < 6 && details.source !== "outline") return null;
+    const source = details.source || "visible-block";
+    const navigationReference = details.navigationReference || getGoogleDocsNavigationReference(details.anchor);
+    const navigationExact = Boolean(details.navigationExact && navigationReference);
+    const navigationConfidence = navigationExact ? "exact" : details.navigationConfidence || "approximate";
+    const unitId = googleDocsUnitId({
+      documentId: getGoogleDocsDocumentId(context),
+      activeTab: contextDetails.activeTab,
+      source,
+      index,
+      navigationReference,
+      text,
+      helpers
+    });
+    return {
+      title: googleDocsTitle(context, details.title || text),
+      anchor: details.anchor,
+      blocks: details.blocks || [details.anchor],
+      level: Number.isFinite(details.level) ? details.level : 2,
+      source: "google-docs",
+      text,
+      navigationTarget: navigationReference || "",
+      meta: {
+        kind: "google-docs",
+        source: "google-docs",
+        googleDocsDocumentId: getGoogleDocsDocumentId(context),
+        googleDocsTabId: contextDetails.activeTab,
+        googleDocsMode: contextDetails.mode,
+        googleDocsPartial: Boolean(contextDetails.partial),
+        googleDocsSource: source,
+        googleDocsActiveTab: contextDetails.activeTab,
+        googleDocsRenderingCapability: contextDetails.renderingCapability || "",
+        navigationExact,
+        navigationConfidence,
+        googleDocsUnitId: unitId,
+        googleDocsNavigationRef: navigationReference || "",
+        googleDocsParentHeadingId: details.parentHeadingId || "",
+        googleDocsParentHeadingTitle: details.parentHeadingTitle || "",
+        googleDocsHeadingPath: Array.isArray(details.headingPath) ? details.headingPath : [],
+        googleDocsDocumentOrder: Number.isFinite(Number(details.documentOrder)) ? Number(details.documentOrder) : index,
+        googleDocsSourceLineIds: Array.isArray(details.sourceLineIds) ? details.sourceLineIds : [],
+        googleDocsLineStart: Number.isFinite(Number(details.lineStart)) ? Number(details.lineStart) : null,
+        googleDocsLineEnd: Number.isFinite(Number(details.lineEnd)) ? Number(details.lineEnd) : null,
+        syntheticTop: Number.isFinite(Number(details.syntheticTop)) ? Number(details.syntheticTop) : undefined,
+        headingLevel: Number.isFinite(details.level) ? details.level : 2,
+        diagnosticReason: source === "outline"
+          ? "Google Docs outline entry"
+          : source === "rendered-line"
+            ? "Rendered Google Docs document lines"
+          : navigationExact
+            ? "Readable Google Docs document text with exact navigation"
+            : "Readable Google Docs document text with approximate navigation"
+      }
+    };
+  }
+
+  function dedupeGoogleDocsUnits(units) {
+    const priority = { outline: 0, "rendered-line": 1, editor: 2, viewer: 3, "visible-block": 4 };
+    const seen = new Map();
+    let duplicatesRemoved = 0;
+    (units || []).filter(Boolean).forEach((unit) => {
+      const textKey = normalizeGoogleDocsDedupeText(unit.text || unit.title || "");
+      const navKey = unit.navigationReference ? `nav:${unit.navigationReference}` : "";
+      const key = navKey || `text:${textKey.slice(0, 180)}`;
+      if (!textKey && !navKey) return;
+      const existing = seen.get(key);
+      if (!existing) {
+        seen.set(key, unit);
+        return;
+      }
+      duplicatesRemoved += 1;
+      const existingPriority = priority[existing.source] ?? 9;
+      const unitPriority = priority[unit.source] ?? 9;
+      const existingLength = String(existing.text || "").length;
+      const unitLength = String(unit.text || "").length;
+      const contentBeatsShortOutline = existing.source === "outline"
+        && unit.source !== "outline"
+        && unitLength >= Math.max(120, existingLength * 1.8);
+      if (contentBeatsShortOutline || unitPriority < existingPriority || (unitPriority === existingPriority && unitLength > existingLength)) {
+        seen.set(key, unit);
+      }
+    });
+    return {
+      units: Array.from(seen.values()).sort((a, b) => (a.order || 0) - (b.order || 0)),
+      duplicatesRemoved
+    };
+  }
+
+  function normalizeGoogleDocsDedupeText(text) {
+    return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function isGoogleDocsPartialMap(details) {
+    const outlineCount = details.outlineUnits.length;
+    const renderedLineCount = details.renderedLineUnits ? details.renderedLineUnits.length : 0;
+    const editorCount = details.editorUnits.length;
+    const viewerCount = details.viewerUnits.length;
+    const visibleCount = details.visibleUnits.length;
+    if (!details.allUnits.length) return true;
+    if (visibleCount > 0 && outlineCount === 0 && renderedLineCount === 0 && editorCount === 0 && viewerCount === 0) return true;
+    if (outlineCount === 0 && renderedLineCount === 0 && editorCount === 0) return true;
+    return outlineCount === 0 && editorCount + viewerCount < 2;
+  }
+
+  function detectGoogleDocsMode(context, helpers) {
+    const location = context && context.location || {};
+    const path = `${location.pathname || ""}${location.search || ""}${location.hash || ""}`.toLowerCase();
+    const doc = context && context.document;
+    if (/\/(?:preview|pub|pubhtml)(?:[/?#]|$)|[?&]rm=(?:minimal|demo|embedded|preview)/i.test(path)) return "published/preview";
+    if (/\/view(?:[/?#]|$)/i.test(path)) return "viewing";
+    if (doc && doc.querySelectorAll) {
+      const suggestingControl = Array.from(doc.querySelectorAll("[aria-pressed], [aria-checked], button, [role='button'], [role='menuitemradio']"))
+        .find((node) => {
+          const state = String(node.getAttribute && (node.getAttribute("aria-pressed") || node.getAttribute("aria-checked")) || "");
+          const label = String(node.getAttribute && (node.getAttribute("aria-label") || node.getAttribute("data-tooltip") || node.getAttribute("title")) || node.textContent || "");
+          return /^(true|mixed)$/i.test(state) && /\bsuggest(?:ing| edits?)\b/i.test(label);
+        });
+      if (suggestingControl) return "suggesting";
+    }
+    if (doc && doc.querySelectorAll) {
+      const editable = Array.from(doc.querySelectorAll("[contenteditable='true'], [role='textbox'][contenteditable='true']"))
+        .find((node) => String(node.getAttribute && node.getAttribute("aria-readonly") || "").toLowerCase() !== "true");
+      if (editable) return "editing";
+    }
+    if (doc && doc.querySelector && doc.querySelector("[aria-readonly='true'], .kix-appview-editor[aria-readonly='true'], .kix-document-viewer, .docs-viewer")) return "read-only";
+    if (doc && doc.querySelector && doc.querySelector("[role='document'], .kix-appview-editor, .kix-page-content, .docs-pageless-content")) return /\/view/i.test(path) ? "viewing" : "read-only";
+    return "unknown";
+  }
+
+  function inferGoogleDocsHeadingLevel(node, fallback) {
+    if (!node || !node.getAttribute) return fallback || 2;
+    const ariaLevel = Number(node.getAttribute("aria-level"));
+    if (Number.isFinite(ariaLevel) && ariaLevel > 0) return Math.min(6, Math.max(1, ariaLevel));
+    const tag = String(node.tagName || "").toLowerCase();
+    const tagMatch = tag.match(/^h([1-6])$/);
+    if (tagMatch) return Number(tagMatch[1]);
+    const classText = String(node.className || "");
+    const classMatch = classText.match(/\b(?:heading|outline|level)[-_ ]?([1-6])\b/i);
+    if (classMatch) return Number(classMatch[1]);
+    return fallback || 2;
+  }
+
+  function getGoogleDocsNavigationReference(node) {
+    if (!node || !node.getAttribute) return "";
+    const href = node.getAttribute("href") || "";
+    if (href && href.includes("#")) return href.slice(href.indexOf("#"));
+    return node.getAttribute("data-target-id")
+      || node.getAttribute("data-heading-id")
+      || node.getAttribute("data-id")
+      || node.getAttribute("id")
+      || "";
+  }
+
+  function getGoogleDocsNodeOrder(node) {
+    if (!node || !node.getAttribute) return 0;
+    const attrs = ["data-index", "data-order", "aria-posinset"];
+    for (const attr of attrs) {
+      const value = Number(node.getAttribute(attr));
+      if (Number.isFinite(value)) return value;
+    }
+    const top = node.getBoundingClientRect && node.getBoundingClientRect().top;
+    return Number.isFinite(top) ? top : 0;
+  }
+
+  function googleDocsUnitId(details) {
+    const hashSource = `${details.documentId}:${details.activeTab}:${details.source}:${details.navigationReference || ""}:${String(details.text || "").slice(0, 220)}`;
+    const hash = details.helpers && details.helpers.hashText
+      ? details.helpers.hashText(hashSource)
+      : simpleGoogleDocsHash(hashSource);
+    return `gdoc-${sanitizeGoogleDocsRoutePart(details.activeTab || "default")}-${details.source}-${details.index}-${hash}`;
+  }
+
+  function simpleGoogleDocsHash(text) {
+    let hash = 0;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index += 1) {
+      hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+    }
+    return hash.toString(36);
+  }
+
+  function googleDocsTitle(context, fallback) {
+    const docTitle = String(context && context.document && context.document.title || "").replace(/\s*-\s*Google Docs\s*$/i, "").trim();
+    const text = String(fallback || "").replace(/\s+/g, " ").trim();
+    return (text && text.length <= 96 ? text : text.slice(0, 93).trim()) || docTitle || "Google Docs document";
+  }
+
+  function isGoogleDocsChromeNode(node) {
+    if (!node || !node.closest) return false;
+    return Boolean(node.closest([
+      "#docs-toolbar-wrapper",
+      "#docs-toolbar",
+      "#docs-menubar",
+      "#docs-titlebar",
+      ".docs-titlebar",
+      ".docs-menubar",
+      ".docs-toolbar",
+      ".docs-comments",
+      ".docs-sidebar",
+      ".docs-chat",
+      ".docs-explore-widget",
+      ".docs-title-input",
+      ".docs-title-input-label",
+      ".docs-titlebar-buttons",
+      ".goog-toolbar",
+      ".goog-menu",
+      ".goog-menuitem",
+      ".docs-ruler",
+      ".kix-ruler",
+      ".docos",
+      "[role='dialog']",
+      "[aria-label*='status' i]",
+      "[aria-label*='explore' i]",
+      "[role='toolbar']",
+      "[role='menubar']",
+      "[aria-label*='toolbar' i]",
+      "[aria-label*='menu' i]",
+      "[aria-label*='share' i]",
+      "[aria-label*='comment' i]"
+    ].join(",")));
+  }
+
+  function isGoogleDocsGenuineContentRoot(node) {
+    if (!node || !node.getAttribute || isGoogleDocsChromeNode(node)) return false;
+    const tag = String(node.tagName || "").toLowerCase();
+    if (tag === "body" || tag === "html" || tag === "iframe") return false;
+    const selector = [
+      ".kix-appview-editor",
+      ".docs-editor-container",
+      ".docs-pageless-content",
+      ".kix-document-viewer",
+      ".docs-viewer",
+      ".kix-page",
+      ".kix-page-content",
+      ".kix-page-content-wrapper",
+      "[aria-label='Document content']",
+      "[aria-label*='Document content' i]",
+      "[role='document']",
+      "[role='textbox'][contenteditable='true']",
+      "[contenteditable='true']"
+    ].join(",");
+    try {
+      return Boolean(node.matches && node.matches(selector) || node.closest && node.closest(selector));
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isLikelyGoogleDocsDocumentText(rawText, helpers) {
+    const text = String(rawText || "").replace(/\s+/g, " ").trim();
+    const words = helpers.countWords(text);
+    if (words < 80) return false;
+    const lower = text.toLowerCase();
+    if (/^file\s+edit\s+view\s+insert\s+format\s+tools\s+extensions\s+help\b/i.test(text)) return false;
+    const chromeHits = countPatternHits(lower, /\b(file|edit|view|insert|format|tools|extensions|help|share|comments?|toolbar|menu|suggesting|editing|viewing|saved to drive|last edit|zoom|font|bold|italic|underline)\b/g);
+    const documentSignals = countPatternHits(lower, /\b(introduction|summary|abstract|conclusion|results?|findings?|evidence|argument|claim|because|therefore|however|student|paragraph|draft|plan|steps?|recommendation|references?)\b/g)
+      + countPatternHits(text, /[.!?]\s+[A-Z0-9]/g);
+    if (chromeHits >= 8 && chromeHits > Math.max(3, documentSignals * 2)) return false;
+    return true;
+  }
+
+  function isGoogleDocsActiveTabNode(node, activeTab) {
+    if (!activeTab || activeTab === "default" || !node) return true;
+    const nodeTab = getGoogleDocsNodeTabId(node);
+    return !nodeTab || nodeTab === activeTab;
+  }
+
+  function getGoogleDocsNodeTabId(node) {
+    if (!node || !node.getAttribute) return "";
+    const direct = node.getAttribute("data-tab-id")
+      || node.getAttribute("data-docs-tab-id")
+      || node.getAttribute("data-document-tab-id");
+    if (direct) return sanitizeGoogleDocsRoutePart(direct);
+    const owner = node.closest && node.closest("[data-tab-id], [data-docs-tab-id], [data-document-tab-id]");
+    if (!owner || !owner.getAttribute) return "";
+    return sanitizeGoogleDocsRoutePart(owner.getAttribute("data-tab-id") || owner.getAttribute("data-docs-tab-id") || owner.getAttribute("data-document-tab-id") || "");
   }
 
   function collectPdfUnits(root, context, helpers) {

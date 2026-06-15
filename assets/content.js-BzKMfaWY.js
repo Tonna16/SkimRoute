@@ -67,6 +67,49 @@
   const PDF_ACTION_RENDER_TIMEOUT_MS = 5000;
   const PDF_ACTION_VERIFY_TIMEOUT_MS = 1500;
   const PDF_ACTION_DEBOUNCE_MS = 350;
+  const GOOGLE_DOCS_ACTION_TIMEOUT_MS = 4500;
+  const GOOGLE_DOCS_ACTION_OUTLINE_WAIT_MS = 2200;
+  const GOOGLE_DOCS_ACTION_DEBOUNCE_MS = 350;
+  const GOOGLE_DOCS_LIVE_FAST_DELAY_MS = 180;
+  const GOOGLE_DOCS_LIVE_READY_DELAY_MS = 900;
+  const GOOGLE_DOCS_LIVE_MIN_INTERVAL_MS = 650;
+  const GOOGLE_DOCS_LIVE_READY_MIN_INTERVAL_MS = 1600;
+  const GOOGLE_DOCS_APPROXIMATE_MESSAGE = "Google Docs location is approximate because the exact editor block is not mounted.";
+  const GOOGLE_DOCS_CONTENT_SELECTOR = [
+    ".kix-appview-editor",
+    ".docs-editor-container",
+    ".docs-pageless-content",
+    ".kix-page-content",
+    ".kix-page",
+    "[aria-label*='Document content' i]",
+    "[role='document']"
+  ].join(",");
+  const GOOGLE_DOCS_OUTLINE_SELECTOR = [
+    "#docs-outline-pane [role='link']",
+    "#docs-outline-pane [role='treeitem']",
+    ".docs-outline-items .docs-outline-item",
+    "[aria-label*='Document outline' i] [role='link']",
+    "[aria-label*='Document outline' i] [role='treeitem']",
+    "[guidedhelpid*='outline' i]"
+  ].join(",");
+  const GOOGLE_DOCS_CHROME_SELECTOR = [
+    `#${ROOT_ID}`,
+    "[role='toolbar']",
+    "[role='menubar']",
+    ".docs-toolbar",
+    ".docs-titlebar",
+    ".docs-title-input",
+    ".docs-menubar",
+    ".docs-comments",
+    ".docs-comment",
+    ".docs-sidebar",
+    ".docs-sidebars",
+    ".docs-share-button",
+    ".docs-material-menu",
+    ".kix-commentoverlayrenderer",
+    ".pagepilot-google-docs-highlight",
+    ".pagepilot-google-docs-notice"
+  ].join(",");
 
   if (window.top !== window.self) {
     return;
@@ -175,6 +218,35 @@
       cancelled: false,
       completed: false
     },
+    googleDocsAction: {
+      actionId: "",
+      activeActionId: "",
+      type: "",
+      targetSectionId: "",
+      targetKey: "",
+      startedAt: 0,
+      updatedAt: 0,
+      completedAt: 0,
+      timeoutTimer: null,
+      cancelled: false,
+      completed: false
+    },
+    googleDocsHighlightOverlay: null,
+    googleDocsHighlightTimer: null,
+    googleDocsNotice: null,
+    googleDocsNoticeTimer: null,
+    googleDocsLive: {
+      routeKey: "",
+      activeTab: "",
+      lastSignature: "",
+      lastUsableModel: null,
+      lastUsableSignature: "",
+      lastScanAt: 0,
+      pendingTimer: null,
+      scheduledCount: 0,
+      skippedCount: 0,
+      appliedCount: 0
+    },
     debugStatsSuppressed: 0,
     pdfControlledViewer: {
       root: null,
@@ -282,7 +354,9 @@
         ".pagepilot-pdf-mode-consent",
         ".pagepilot-pdf-mode-notice",
         ".pagepilot-pdf-focus-overlay",
-        ".pagepilot-pdf-jump-marker"
+        ".pagepilot-pdf-jump-marker",
+        ".pagepilot-google-docs-highlight",
+        ".pagepilot-google-docs-notice"
       ];
       selectors.forEach((selector) => {
         document.querySelectorAll(selector).forEach((node) => {
@@ -351,7 +425,24 @@
       scoreRecoveredPdfChunk,
       compareRecoveredPdfSections,
       isPdfOcrExactGeometryUsable,
-      getVerifiedPdfOcrHighlightGeometry
+      getVerifiedPdfOcrHighlightGeometry,
+      isGoogleDocsSection,
+      isGoogleDocsActionContext,
+      getGoogleDocsSectionNavigationRef,
+      buildGoogleDocsActionTargetKey,
+      shouldIgnoreDuplicateGoogleDocsAction,
+      resolveGoogleDocsExactTarget,
+      resolveGoogleDocsOutlineEntry,
+      resolveGoogleDocsApproximateTarget,
+      isGoogleDocsChromeElement,
+      isGoogleDocsDocumentContentElement,
+      isGoogleDocsCandidateExact,
+      isGoogleDocsLikePage,
+      getGoogleDocsLiveSignature,
+      isGoogleDocsLiveMutation,
+      shouldScheduleGoogleDocsLiveScan,
+      isUsableGoogleDocsModel,
+      shouldPreserveGoogleDocsLiveModel
     };
   }
 
@@ -639,7 +730,7 @@
           }
           adoptAuthoritativePdfModel("sidebar-section");
           const section = runtime.model && runtime.model.sections.find((item) => item.id === id) || null;
-          const ok = scrollToSection(id, options);
+          const ok = scrollToSection(id, { ...(options || {}), actionType: "section", source: "sidebar-section" });
           setActionResult("section", ok, { section });
           return ok;
         },
@@ -729,6 +820,8 @@
       });
     }
 
+    runtime.model = reconcileGoogleDocsLiveModel(runtime.model, reason);
+
     if (shouldHoldLoadingState(reason, runtime.model)) {
       runtime.loadingAttempts = (runtime.loadingAttempts || 0) + 1;
       const maxLoadingAttempts = runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.type === "pdf"
@@ -794,6 +887,7 @@
       reason,
       changed: !(previousSignature && previousSignature === runtime.model.structureSignature && previousQuiet === runtime.model.pageProfile.quietMode)
     });
+    emitGoogleDocsExtractionDiagnostics(reason, runtime.model);
 
     if (
       previousSignature
@@ -805,6 +899,116 @@
     }
 
     render();
+  }
+
+  function reconcileGoogleDocsLiveModel(model, reason = "scan") {
+    if (!isGoogleDocsModel(model) && !isGoogleDocsLikePage()) return model;
+    const signature = getGoogleDocsLiveSignature(document);
+    const routeKey = getRouteCacheKey();
+    const live = runtime.googleDocsLive;
+    live.routeKey = routeKey;
+    live.activeTab = getGoogleDocsActiveTabFromUrl();
+    if (signature.value) {
+      live.lastSignature = signature.value;
+    }
+    if (isUsableGoogleDocsModel(model)) {
+      live.lastUsableModel = model;
+      live.lastUsableSignature = signature.value || model.structureSignature || "";
+      live.lastScanAt = Date.now();
+      live.appliedCount += 1;
+      emitDebug("google-docs:live-update:applied", {
+        reason,
+        routeKey,
+        sections: model.sections ? model.sections.length : 0,
+        words: model.totalReadableWords || 0,
+        signature: signature.value || "",
+        exactIssue: "A usable Google Docs model was saved as the stable live map for this route."
+      });
+      return model;
+    }
+    if (shouldPreserveGoogleDocsLiveModel(model, live.lastUsableModel, routeKey)) {
+      emitDebug("google-docs:live-update:skipped", {
+        reason,
+        routeKey,
+        sections: model && model.sections ? model.sections.length : 0,
+        words: model && model.totalReadableWords || 0,
+        preservedSections: live.lastUsableModel && live.lastUsableModel.sections ? live.lastUsableModel.sections.length : 0,
+        preservedWords: live.lastUsableModel && live.lastUsableModel.totalReadableWords || 0,
+        signature: signature.value || "",
+        exactIssue: "Google Docs temporarily exposed too little mounted text, so SkimRoute preserved the last usable map instead of falling back to quiet."
+      });
+      return live.lastUsableModel;
+    }
+    return model;
+  }
+
+  function emitGoogleDocsExtractionDiagnostics(reason, model) {
+    if (!isGoogleDocsModel(model) && !isGoogleDocsLikePage()) return;
+    const diagnostics = model && model.diagnostics || {};
+    const signature = getGoogleDocsLiveSignature(document);
+    emitDebug("google-docs:extraction:roots", {
+      reason,
+      routeKey: getRouteCacheKey(),
+      roots: signature.rootCount,
+      outlineCount: signature.outlineCount,
+      activeTab: getGoogleDocsActiveTabFromUrl(),
+      mode: diagnostics.googleDocsMode || model && model.pageProfile && model.pageProfile.googleDocsMode || "",
+      exactIssue: "Google Docs extraction inspected mounted document/editor roots only."
+    });
+    emitDebug("google-docs:extraction:lines", {
+      reason,
+      routeKey: getRouteCacheKey(),
+      lineCount: signature.lineCount,
+      textSampleWords: signature.sampleWords,
+      renderedLineUnits: diagnostics.googleDocsRenderedLineUnits || 0,
+      renderedLineCount: diagnostics.googleDocsRenderedLineCount || 0,
+      visibleBlockUnits: diagnostics.googleDocsVisibleBlockUnits || 0,
+      sourceMix: diagnostics.googleDocsSourceMix || "",
+      exactIssue: "Google Docs extraction counted mounted document lines and readable text samples."
+    });
+    emitDebug("google-docs:extraction:usable-map", {
+      reason,
+      routeKey: getRouteCacheKey(),
+      usable: isUsableGoogleDocsModel(model),
+      sections: model && model.sections ? model.sections.length : 0,
+      important: model && model.importantSections ? model.importantSections.length : 0,
+      words: model && model.totalReadableWords || 0,
+      quietMode: model && model.pageProfile ? model.pageProfile.quietMode : null,
+      failureReason: diagnostics.googleDocsExtractionFailureReason || "",
+      exactIssue: isUsableGoogleDocsModel(model)
+        ? "Google Docs has a usable mapped model."
+        : "Google Docs matched, but mounted readable document text was still insufficient for a useful map."
+    });
+  }
+
+  function isGoogleDocsModel(model) {
+    const profile = model && model.pageProfile || {};
+    const diagnostics = model && model.diagnostics || {};
+    return Boolean(
+      profile.adapterName === "google-docs"
+      || diagnostics.adapterName === "google-docs"
+      || diagnostics.pageProfileBefore && diagnostics.pageProfileBefore.adapterName === "google-docs"
+      || diagnostics.pageProfileAfter && diagnostics.pageProfileAfter.adapterName === "google-docs"
+    );
+  }
+
+  function isUsableGoogleDocsModel(model) {
+    if (!isGoogleDocsModel(model) || !Array.isArray(model.sections)) return false;
+    const sections = model.sections.filter((section) => section && isGoogleDocsSection(section));
+    const words = sections.reduce((sum, section) => sum + (Number(section.wordCount) || 0), 0);
+    const important = Array.isArray(model.importantSections) ? model.importantSections.length : 0;
+    return Boolean(sections.length >= 1 && words >= 40 && (!model.pageProfile || model.pageProfile.quietMode === false || important >= 1));
+  }
+
+  function shouldPreserveGoogleDocsLiveModel(nextModel, lastUsableModel, routeKey = getRouteCacheKey()) {
+    if (!lastUsableModel || !isUsableGoogleDocsModel(lastUsableModel)) return false;
+    if (!isGoogleDocsModel(nextModel) && !isGoogleDocsLikePage()) return false;
+    const liveRoute = runtime.googleDocsLive && runtime.googleDocsLive.routeKey || routeKey;
+    if (liveRoute && routeKey && liveRoute !== routeKey) return false;
+    if (isUsableGoogleDocsModel(nextModel)) return false;
+    const nextWords = Number(nextModel && nextModel.totalReadableWords || 0);
+    const nextSections = nextModel && Array.isArray(nextModel.sections) ? nextModel.sections.length : 0;
+    return nextSections === 0 || nextWords < Math.max(60, Number(lastUsableModel.totalReadableWords || 0) * 0.45);
   }
 
   function shouldSuppressPdfScan(reason) {
@@ -12699,6 +12903,10 @@
 
   function watchPageChanges() {
     runtime.mutationObserver = new MutationObserver((mutations) => {
+      if (isGoogleDocsLikePage() && mutations.some(isGoogleDocsLiveMutation)) {
+        scheduleGoogleDocsLiveScan("mutation");
+        return;
+      }
       if (mutations.some(mutationLooksMeaningful)) {
         scheduleScan("mutation");
       }
@@ -12779,6 +12987,7 @@
     runtime.pdfOcr.cacheUpdatedAt = 0;
     runtime.stableChatModel = null;
     runtime.stableChatRouteKey = "";
+    resetGoogleDocsLiveState();
     stopPdfAnalysisWatchdog();
     runtime.pdfJumpMode = "";
     runtime.pendingPdfControlledJump = null;
@@ -12835,7 +13044,7 @@
     if (
       mutation.target
       && mutation.target.closest
-      && mutation.target.closest("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker")
+      && mutation.target.closest("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker, .pagepilot-google-docs-highlight, .pagepilot-google-docs-notice")
     ) {
       return false;
     }
@@ -12864,8 +13073,8 @@
       if (node.nodeType !== Node.ELEMENT_NODE) return false;
       const element = node;
       if (root && (element === root || root.contains(element) || element.contains(root))) return false;
-      if (element.matches && element.matches("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker")) return false;
-      if (element.closest && element.closest("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker")) return false;
+      if (element.matches && element.matches("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker, .pagepilot-google-docs-highlight, .pagepilot-google-docs-notice")) return false;
+      if (element.closest && element.closest("#pagepilot-pdf-controlled-viewer, .pagepilot-pdf-mode-consent, .pagepilot-pdf-mode-notice, .pagepilot-pdf-page-section-highlight, .pagepilot-pdf-owned-focus, .pagepilot-pdf-focus-overlay, .pagepilot-pdf-jump-marker, .pagepilot-google-docs-highlight, .pagepilot-google-docs-notice")) return false;
       if (runtime.engine.helpers.isLowValueElement(element)) return false;
       const text = runtime.engine.helpers.cleanText(element.innerText || element.textContent || "");
       const words = runtime.engine.helpers.countWords(text);
@@ -12875,9 +13084,210 @@
       if ((isPdfLikePage() || elementLooksPdfLike(element)) && words >= 4) {
         return true;
       }
+      if (isGoogleDocsLikePage() && isGoogleDocsDocumentContentElement(element) && words >= 2) {
+        return true;
+      }
       if (words < 32) return false;
       return !/\b(cookie|subscribe|newsletter|advertisement|sponsored|sign up)\b/i.test(text.slice(0, 1200));
     });
+  }
+
+  function isGoogleDocsLikePage() {
+    try {
+      const url = new URL(window.location.href);
+      return url.hostname === "docs.google.com" && /^\/document\/d\/[^/?#]+/i.test(url.pathname);
+    } catch (error) {
+      return /:\/\/docs\.google\.com\/document\/d\//i.test(String(window.location && window.location.href || ""));
+    }
+  }
+
+  function getGoogleDocsActiveTabFromUrl() {
+    try {
+      const url = new URL(window.location.href);
+      return (url.searchParams.get("tab") || "default").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 160) || "default";
+    } catch (error) {
+      return "default";
+    }
+  }
+
+  function isGoogleDocsLiveMutation(mutation) {
+    if (!mutation || !isGoogleDocsLikePage()) return false;
+    const target = mutation.target && mutation.target.nodeType === Node.TEXT_NODE
+      ? mutation.target.parentElement
+      : mutation.target;
+    if (target && isGoogleDocsChromeElement(target)) return false;
+    if (target && isGoogleDocsDocumentContentElement(target)) {
+      if (mutation.type === "characterData") {
+        const text = runtime.engine && runtime.engine.helpers ? runtime.engine.helpers.cleanText(target.textContent || "") : String(target.textContent || "").trim();
+        return countGoogleDocsWords(text) >= 1;
+      }
+      if (mutation.type === "attributes") {
+        return /^(class|aria-label|role|data-text|data-content|data-value)$/i.test(String(mutation.attributeName || ""));
+      }
+    }
+    return Array.from(mutation.addedNodes || []).some((node) => {
+      if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+      const element = node;
+      if (isGoogleDocsChromeElement(element)) return false;
+      if (isGoogleDocsDocumentContentElement(element)) return true;
+      if (element.querySelector && element.querySelector(".kix-lineview, .kix-paragraphrenderer, .kix-wordhtmlgenerator-word-node, .kix-page-content, .docs-pageless-content, [aria-label*='Document content' i]")) {
+        return true;
+      }
+      return false;
+    });
+  }
+
+  function scheduleGoogleDocsLiveScan(reason = "google-docs-live") {
+    if (!isGoogleDocsLikePage()) return false;
+    const signature = getGoogleDocsLiveSignature(document);
+    const live = runtime.googleDocsLive;
+    const ready = isUsableGoogleDocsModel(runtime.model) || isUsableGoogleDocsModel(live.lastUsableModel);
+    const decision = shouldScheduleGoogleDocsLiveScan({
+      previousSignature: live.lastSignature,
+      nextSignature: signature.value,
+      now: Date.now(),
+      lastScanAt: Number(live.lastScanAt || runtime.lastScanAt || 0),
+      ready
+    });
+    if (!decision.schedule) {
+      live.skippedCount += 1;
+      emitDebug("google-docs:live-update:skipped", {
+        reason,
+        routeKey: getRouteCacheKey(),
+        skippedReason: decision.reason,
+        signature: signature.value || "",
+        lineCount: signature.lineCount,
+        exactIssue: "Google Docs live update skipped because mounted document content did not materially change or the throttle is active."
+      });
+      return false;
+    }
+    live.lastSignature = signature.value;
+    live.routeKey = getRouteCacheKey();
+    live.activeTab = getGoogleDocsActiveTabFromUrl();
+    live.scheduledCount += 1;
+    window.clearTimeout(live.pendingTimer);
+    const delay = ready ? GOOGLE_DOCS_LIVE_READY_DELAY_MS : GOOGLE_DOCS_LIVE_FAST_DELAY_MS;
+    live.pendingTimer = window.setTimeout(() => {
+      live.pendingTimer = null;
+      const run = () => {
+        live.lastScanAt = Date.now();
+        scanPage("google-docs-live");
+      };
+      if ("requestIdleCallback" in window) {
+        window.requestIdleCallback(run, { timeout: ready ? 1500 : 700 });
+      } else {
+        run();
+      }
+    }, Math.max(delay, decision.waitMs || 0));
+    emitDebug("google-docs:live-update:scheduled", {
+      reason,
+      routeKey: live.routeKey,
+      activeTab: live.activeTab,
+      delayMs: Math.max(delay, decision.waitMs || 0),
+      ready,
+      signature: signature.value || "",
+      lineCount: signature.lineCount,
+      rootCount: signature.rootCount,
+      exactIssue: "A Google Docs document/content mutation scheduled a bounded local rescan."
+    });
+    return true;
+  }
+
+  function shouldScheduleGoogleDocsLiveScan(details = {}) {
+    const previousSignature = String(details.previousSignature || "");
+    const nextSignature = String(details.nextSignature || "");
+    if (!nextSignature) return { schedule: false, reason: "empty-signature", waitMs: 0 };
+    if (previousSignature && previousSignature === nextSignature) return { schedule: false, reason: "unchanged-signature", waitMs: 0 };
+    const now = Number(details.now || Date.now());
+    const lastScanAt = Number(details.lastScanAt || 0);
+    const minInterval = details.ready ? GOOGLE_DOCS_LIVE_READY_MIN_INTERVAL_MS : GOOGLE_DOCS_LIVE_MIN_INTERVAL_MS;
+    const elapsed = lastScanAt ? now - lastScanAt : minInterval;
+    return {
+      schedule: true,
+      reason: elapsed >= minInterval ? "changed" : "throttled-change",
+      waitMs: Math.max(0, minInterval - elapsed)
+    };
+  }
+
+  function getGoogleDocsLiveSignature(doc = document) {
+    const roots = getGoogleDocsLiveContentRoots(doc);
+    const lineNodes = uniqueElements(roots.flatMap((root) => {
+      if (!root || !root.querySelectorAll) return [];
+      return Array.from(root.querySelectorAll(".kix-lineview, .kix-paragraphrenderer, .kix-wordhtmlgenerator-word-node, h1, h2, h3, p, li, [role='heading'], [role='paragraph'], [aria-label], [data-text], [data-content], [data-value]"));
+    }))
+      .filter((node) => node && !isGoogleDocsChromeElement(node));
+    const textParts = lineNodes
+      .slice(0, 80)
+      .map((node) => getGoogleDocsLiveNodeText(node))
+      .filter(Boolean)
+      .slice(0, 40);
+    const outlineCount = doc && doc.querySelectorAll ? doc.querySelectorAll(GOOGLE_DOCS_OUTLINE_SELECTOR).length : 0;
+    const sample = textParts.join(" ").replace(/\s+/g, " ").trim().slice(0, 1400);
+    const sampleWords = countGoogleDocsWords(sample);
+    const value = [
+      getRouteCacheKey(),
+      getGoogleDocsActiveTabFromUrl(),
+      roots.length,
+      lineNodes.length,
+      outlineCount,
+      hashString(sample)
+    ].join("|");
+    return {
+      value,
+      rootCount: roots.length,
+      lineCount: lineNodes.length,
+      outlineCount,
+      sampleWords,
+      sample
+    };
+  }
+
+  function getGoogleDocsLiveContentRoots(doc = document) {
+    if (!doc || !doc.querySelectorAll) return [];
+    return uniqueElements(Array.from(doc.querySelectorAll(GOOGLE_DOCS_CONTENT_SELECTOR)))
+      .filter((node) => node && !isGoogleDocsChromeElement(node));
+  }
+
+  function getGoogleDocsLiveNodeText(node) {
+    if (!node) return "";
+    const values = [
+      node.innerText,
+      node.textContent,
+      node.getAttribute && node.getAttribute("aria-label"),
+      node.getAttribute && node.getAttribute("data-text"),
+      node.getAttribute && node.getAttribute("data-content"),
+      node.getAttribute && node.getAttribute("data-value"),
+      node.getAttribute && node.getAttribute("title")
+    ];
+    return values.map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .find((value) => value && !/\b(file|edit|view|insert|format|tools|extensions|help|share|toolbar|menu)\b/i.test(value.slice(0, 140))) || "";
+  }
+
+  function hashString(text) {
+    let hash = 0;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index += 1) {
+      hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+    }
+    return hash.toString(36);
+  }
+
+  function resetGoogleDocsLiveState() {
+    if (runtime.googleDocsLive && runtime.googleDocsLive.pendingTimer) {
+      window.clearTimeout(runtime.googleDocsLive.pendingTimer);
+    }
+    runtime.googleDocsLive = {
+      routeKey: "",
+      activeTab: "",
+      lastSignature: "",
+      lastUsableModel: null,
+      lastUsableSignature: "",
+      lastScanAt: 0,
+      pendingTimer: null,
+      scheduledCount: 0,
+      skippedCount: 0,
+      appliedCount: 0
+    };
   }
 
   function scheduleScan(reason) {
@@ -12885,6 +13295,7 @@
     const elapsed = Date.now() - runtime.lastScanAt;
     const fastScan = isChatLikePage()
       || isPdfLikePage()
+      || isGoogleDocsLikePage()
       || /\b(chat|conversation|stream|pdf|warmup)\b/i.test(String(reason || ""));
     const delay = Math.max(
       fastScan ? FAST_MUTATION_SCAN_DELAY_MS : MUTATION_SCAN_DELAY_MS,
@@ -12906,6 +13317,8 @@
     if (!shouldWarmupScan()) return;
     const delays = isChatLikePage()
       ? CHAT_WARMUP_SCAN_DELAYS_MS
+      : isGoogleDocsLikePage()
+        ? [220, 700, 1600, 3200, 6500, 12000]
       : isPdfLikePage()
         ? [180, 500, 1100, 2200]
         : WARMUP_SCAN_DELAYS_MS;
@@ -12925,6 +13338,7 @@
     }
     return isKnownAiHost()
       || isPdfLikePage()
+      || isGoogleDocsLikePage()
       || (runtime.model && ["chat", "pdf"].includes(runtime.model.pageProfile.type))
       || Boolean(document.querySelector(".textLayer, [data-page-number], pdf-viewer, embed[type='application/pdf'], iframe[src*='.pdf']"));
   }
@@ -13118,11 +13532,14 @@
 
   function jumpToUsefulPart() {
     if (!runtime.model || !runtime.model.hasStrongTarget) {
+      if (isGoogleDocsActionContext(runtime.model)) {
+        return blockGoogleDocsActionWithoutTarget("jump", "no-google-docs-target");
+      }
       return false;
     }
 
     const targetId = runtime.model.bestSectionId || runtime.model.skipTargetId || runtime.model.nextImportantId;
-    return scrollToSection(targetId, { highlight: true });
+    return scrollToSection(targetId, { highlight: true, actionType: "jump" });
   }
 
   function getSectionForAction(type) {
@@ -14079,15 +14496,840 @@
       return scrollToSection(pdfTarget && pdfTarget.id, { highlight: true });
     }
     refreshActiveSection();
-    if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
+    if (!runtime.model || runtime.model.pageProfile.quietMode) {
+      if (isGoogleDocsActionContext(runtime.model)) {
+        return blockGoogleDocsActionWithoutTarget("next", "no-google-docs-target");
+      }
+      return false;
+    }
     const targetId = runtime.model.nextImportantId
       || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id;
-    return scrollToSection(targetId, { highlight: true });
+    return scrollToSection(targetId, { highlight: true, actionType: "next" });
+  }
+
+  function isGoogleDocsSection(section) {
+    const meta = section && section.unitMeta || {};
+    return Boolean(
+      section
+      && (
+        meta.kind === "google-docs"
+        || meta.source === "google-docs"
+        || meta.googleDocsUnitId
+        || meta.googleDocsNavigationRef
+        || section.source === "google-docs"
+      )
+    );
+  }
+
+  function isGoogleDocsActionContext(model = runtime.model, section = null) {
+    const profile = model && model.pageProfile || {};
+    const diagnostics = model && model.diagnostics || {};
+    return Boolean(
+      isGoogleDocsSection(section)
+      || profile.adapterName === "google-docs"
+      || diagnostics.adapterName === "google-docs"
+      || diagnostics.pageProfileBefore && diagnostics.pageProfileBefore.adapterName === "google-docs"
+      || diagnostics.pageProfileAfter && diagnostics.pageProfileAfter.adapterName === "google-docs"
+    );
+  }
+
+  function getGoogleDocsSectionNavigationRef(section) {
+    const meta = section && section.unitMeta || {};
+    return String(
+      meta.googleDocsNavigationRef
+      || meta.navigationTarget
+      || section && section.navigationTarget
+      || ""
+    ).trim();
+  }
+
+  function buildGoogleDocsActionTargetKey(type, section, options = {}) {
+    return [
+      getRouteCacheKey(),
+      type || "section",
+      section && section.id || options.sectionId || "",
+      getGoogleDocsSectionNavigationRef(section),
+      section && section.unitMeta && section.unitMeta.googleDocsDocumentOrder || section && section.index || 0
+    ].join("|");
+  }
+
+  function shouldIgnoreDuplicateGoogleDocsAction(current, targetKey, now = Date.now(), debounceMs = GOOGLE_DOCS_ACTION_DEBOUNCE_MS) {
+    return Boolean(
+      current
+      && current.activeActionId
+      && !current.completed
+      && !current.cancelled
+      && current.targetKey === targetKey
+      && now - (Number(current.startedAt) || 0) < debounceMs
+    );
+  }
+
+  function makeGoogleDocsActionId(type) {
+    return `google-docs-action-${String(type || "section").replace(/[^a-z0-9_-]+/gi, "-")}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function getGoogleDocsActionElapsed(action = runtime.googleDocsAction) {
+    const startedAt = Number(action && action.startedAt) || 0;
+    return startedAt ? Math.max(0, Date.now() - startedAt) : 0;
+  }
+
+  function isGoogleDocsActionActive(actionId) {
+    const action = runtime.googleDocsAction || {};
+    const id = String(actionId || action.activeActionId || action.actionId || "");
+    return Boolean(id && action.activeActionId === id && !action.cancelled && !action.completed);
+  }
+
+  function emitGoogleDocsActionLog(event, actionId, details = {}) {
+    const action = runtime.googleDocsAction || {};
+    emitDebug(event, {
+      actionId: actionId || action.actionId || action.activeActionId || "",
+      type: details.type || action.type || "",
+      sectionId: details.sectionId || action.targetSectionId || "",
+      targetSectionId: details.sectionId || action.targetSectionId || "",
+      source: details.source || "",
+      navigationRef: details.navigationRef || "",
+      elapsedMs: Number(details.elapsedMs) || getGoogleDocsActionElapsed(action),
+      blockedReason: details.blockedReason || "",
+      exact: Boolean(details.exact),
+      approximate: Boolean(details.approximate),
+      targetKind: details.targetKind || "",
+      exactIssue: details.exactIssue || ""
+    });
+  }
+
+  function finishGoogleDocsAction(actionId, status, details = {}) {
+    const action = runtime.googleDocsAction || {};
+    const id = String(actionId || action.actionId || action.activeActionId || "");
+    if (!id || action.actionId !== id && action.activeActionId !== id) return false;
+    if (action.timeoutTimer) window.clearTimeout(action.timeoutTimer);
+    runtime.googleDocsAction = {
+      ...action,
+      activeActionId: "",
+      completed: true,
+      cancelled: status === "cancelled" || Boolean(action.cancelled),
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
+      timeoutTimer: null
+    };
+    if (status === "blocked") {
+      emitGoogleDocsActionLog("google-docs:action:blocked", id, details);
+    }
+    return true;
+  }
+
+  function cancelActiveGoogleDocsAction(reason = "superseded", details = {}) {
+    const action = runtime.googleDocsAction || {};
+    const actionId = action.activeActionId || action.actionId || "";
+    if (!actionId || action.completed || action.cancelled) return false;
+    if (action.timeoutTimer) window.clearTimeout(action.timeoutTimer);
+    runtime.googleDocsAction = {
+      ...action,
+      activeActionId: "",
+      cancelled: true,
+      completed: true,
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
+      timeoutTimer: null
+    };
+    emitGoogleDocsActionLog("google-docs:action:blocked", actionId, {
+      ...details,
+      blockedReason: reason,
+      exactIssue: "A newer Google Docs action replaced this pending target."
+    });
+    return true;
+  }
+
+  function beginGoogleDocsAction(type, section, options = {}) {
+    const now = Date.now();
+    const targetKey = buildGoogleDocsActionTargetKey(type, section, options);
+    const current = runtime.googleDocsAction || {};
+    if (shouldIgnoreDuplicateGoogleDocsAction(current, targetKey, now)) {
+      emitGoogleDocsActionLog("google-docs:action:blocked", current.activeActionId, {
+        type,
+        sectionId: section && section.id || options.sectionId || "",
+        navigationRef: getGoogleDocsSectionNavigationRef(section),
+        blockedReason: "duplicate-action",
+        exactIssue: "A duplicate Google Docs action for the same target arrived inside the debounce window."
+      });
+      return { duplicate: true, actionId: current.activeActionId };
+    }
+    cancelActiveGoogleDocsAction("superseded", {
+      type,
+      sectionId: section && section.id || "",
+      navigationRef: getGoogleDocsSectionNavigationRef(section)
+    });
+    const actionId = makeGoogleDocsActionId(type);
+    const timeoutTimer = window.setTimeout(() => {
+      if (!isGoogleDocsActionActive(actionId)) return;
+      finishGoogleDocsAction(actionId, "blocked", {
+        type,
+        sectionId: section && section.id || "",
+        navigationRef: getGoogleDocsSectionNavigationRef(section),
+        blockedReason: "google-docs-action-timeout",
+        exactIssue: "Google Docs navigation exceeded its bounded action timeout."
+      });
+      setActionResult(type, false, {
+        section,
+        phase: "blocked",
+        blockedReason: "google-docs-action-timeout",
+        message: "Google Docs did not expose that section quickly enough to jump there."
+      });
+    }, GOOGLE_DOCS_ACTION_TIMEOUT_MS);
+    runtime.googleDocsAction = {
+      actionId,
+      activeActionId: actionId,
+      type,
+      targetSectionId: section && section.id || options.sectionId || "",
+      targetKey,
+      startedAt: now,
+      updatedAt: now,
+      completedAt: 0,
+      timeoutTimer,
+      cancelled: false,
+      completed: false
+    };
+    emitGoogleDocsActionLog("google-docs:action:received", actionId, {
+      type,
+      sectionId: section && section.id || "",
+      source: options.source || "",
+      navigationRef: getGoogleDocsSectionNavigationRef(section),
+      exactIssue: "Google Docs navigation is handled by a bounded SkimRoute-owned action branch."
+    });
+    return { duplicate: false, actionId };
+  }
+
+  function blockGoogleDocsActionWithoutTarget(type, blockedReason = "no-google-docs-target") {
+    cancelActiveGoogleDocsAction("superseded", { type, blockedReason });
+    const actionId = makeGoogleDocsActionId(type);
+    runtime.googleDocsAction = {
+      actionId,
+      activeActionId: "",
+      type,
+      targetSectionId: "",
+      targetKey: `${getRouteCacheKey()}|${type}|no-target`,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: Date.now(),
+      timeoutTimer: null,
+      cancelled: false,
+      completed: true
+    };
+    emitGoogleDocsActionLog("google-docs:action:received", actionId, {
+      type,
+      blockedReason,
+      exactIssue: "Google Docs action was requested, but no current mapped section target exists."
+    });
+    emitGoogleDocsActionLog("google-docs:action:blocked", actionId, {
+      type,
+      blockedReason,
+      exactIssue: "SkimRoute will not invent a Google Docs navigation target when the document text is not mapped strongly enough."
+    });
+    setActionResult(type, false, {
+      phase: "blocked",
+      blockedReason,
+      message: "Google Docs has no mapped target to jump to yet."
+    });
+    return false;
+  }
+
+  function performGoogleDocsSectionNavigation(section, options = {}) {
+    const type = options.actionType || options.source || "section";
+    if (!section || !isGoogleDocsActionContext(runtime.model, section)) return false;
+    const begin = beginGoogleDocsAction(type, section, options);
+    if (begin.duplicate) return true;
+    const actionId = begin.actionId;
+    window.setTimeout(() => {
+      runGoogleDocsNavigationStep(actionId, section, { ...options, actionType: type })
+        .catch((error) => {
+          if (!isGoogleDocsActionActive(actionId)) return;
+          finishGoogleDocsAction(actionId, "blocked", {
+            type,
+            sectionId: section.id,
+            navigationRef: getGoogleDocsSectionNavigationRef(section),
+            blockedReason: "google-docs-action-error",
+            exactIssue: String(error && error.message ? error.message : error)
+          });
+        });
+    }, 0);
+    return true;
+  }
+
+  async function runGoogleDocsNavigationStep(actionId, section, options = {}) {
+    const type = options.actionType || "section";
+    if (!isGoogleDocsActionActive(actionId)) return false;
+    const navigationRef = getGoogleDocsSectionNavigationRef(section);
+    emitGoogleDocsActionLog("google-docs:action:section-resolved", actionId, {
+      type,
+      sectionId: section.id,
+      source: section.unitMeta && section.unitMeta.googleDocsSource || section.source || "",
+      navigationRef,
+      exactIssue: "The selected Google Docs section came from the current in-memory SkimRoute model."
+    });
+
+    let target = resolveGoogleDocsExactTarget(section);
+    if (target && isGoogleDocsCandidateExact(section, target.element, target)) {
+      emitGoogleDocsActionLog("google-docs:action:target-exact", actionId, {
+        type,
+        sectionId: section.id,
+        source: target.source,
+        navigationRef,
+        exact: true,
+        targetKind: target.kind || "editor"
+      });
+      return completeGoogleDocsNavigation(actionId, section, target, { ...options, approximate: false });
+    }
+
+    const outline = resolveGoogleDocsOutlineEntry(section);
+    if (outline && outline.element) {
+      emitGoogleDocsActionLog("google-docs:action:outline-fallback-used", actionId, {
+        type,
+        sectionId: section.id,
+        source: outline.source || "outline",
+        navigationRef,
+        targetKind: "outline",
+        exactIssue: "The exact Google Docs editor block was not mounted, so SkimRoute activated the matching document outline entry."
+      });
+      activateGoogleDocsOutlineEntry(outline.element);
+      target = await waitForGoogleDocsExactTarget(section, actionId);
+      if (target && isGoogleDocsCandidateExact(section, target.element, target)) {
+        emitGoogleDocsActionLog("google-docs:action:target-exact", actionId, {
+          type,
+          sectionId: section.id,
+          source: target.source,
+          navigationRef,
+          exact: true,
+          targetKind: target.kind || "editor"
+        });
+        return completeGoogleDocsNavigation(actionId, section, target, { ...options, approximate: false });
+      }
+      const approximateOutlineTarget = resolveGoogleDocsApproximateTarget(section, { preferredElement: outline.element, reason: "outline-target-not-mounted" });
+      if (approximateOutlineTarget) {
+        emitGoogleDocsActionLog("google-docs:action:target-approximate", actionId, {
+          type,
+          sectionId: section.id,
+          source: approximateOutlineTarget.source,
+          navigationRef,
+          approximate: true,
+          targetKind: approximateOutlineTarget.kind || "outline",
+          exactIssue: "Google Docs did not mount the exact editor block after outline activation, so SkimRoute will show an approximate location."
+        });
+        return completeGoogleDocsNavigation(actionId, section, approximateOutlineTarget, { ...options, approximate: true });
+      }
+    }
+
+    const approximateTarget = resolveGoogleDocsApproximateTarget(section);
+    if (approximateTarget) {
+      emitGoogleDocsActionLog("google-docs:action:target-approximate", actionId, {
+        type,
+        sectionId: section.id,
+        source: approximateTarget.source,
+        navigationRef,
+        approximate: true,
+        targetKind: approximateTarget.kind || "approximate",
+        exactIssue: "The exact Google Docs block is virtualized or approximate, so SkimRoute will use the nearest safe document area."
+      });
+      return completeGoogleDocsNavigation(actionId, section, approximateTarget, { ...options, approximate: true });
+    }
+
+    finishGoogleDocsAction(actionId, "blocked", {
+      type,
+      sectionId: section.id,
+      navigationRef,
+      blockedReason: target ? "chrome-candidate-rejected" : "no-google-docs-target",
+      exactIssue: "No mounted Google Docs document block or safe outline fallback could be verified for this section."
+    });
+    setActionResult(type, false, {
+      section,
+      phase: "blocked",
+      blockedReason: "no-google-docs-target",
+      message: "Google Docs did not expose that section for navigation yet."
+    });
+    return false;
+  }
+
+  async function completeGoogleDocsNavigation(actionId, section, target, options = {}) {
+    if (!isGoogleDocsActionActive(actionId)) return false;
+    const type = options.actionType || runtime.googleDocsAction && runtime.googleDocsAction.type || "section";
+    const scrolled = await scrollGoogleDocsTargetIntoView(target, section, Boolean(options.approximate));
+    if (!isGoogleDocsActionActive(actionId)) return false;
+    if (!scrolled) {
+      finishGoogleDocsAction(actionId, "blocked", {
+        type,
+        sectionId: section && section.id || "",
+        navigationRef: getGoogleDocsSectionNavigationRef(section),
+        blockedReason: "target-not-mounted",
+        exactIssue: "A Google Docs target was selected but could not be scrolled into view."
+      });
+      return false;
+    }
+    runtime.view.activeId = section.id;
+    if (expandAncestors(section.id)) {
+      render();
+    } else if (runtime.ui) {
+      runtime.ui.updateActiveClasses(runtime.view.activeId);
+    }
+    const highlighted = showGoogleDocsHighlight(target, section, { approximate: Boolean(options.approximate) });
+    if (options.approximate) {
+      showGoogleDocsActionNotice(GOOGLE_DOCS_APPROXIMATE_MESSAGE);
+    }
+    if (highlighted) {
+      emitGoogleDocsActionLog("google-docs:action:highlight-applied", actionId, {
+        type,
+        sectionId: section.id,
+        source: target.source,
+        navigationRef: getGoogleDocsSectionNavigationRef(section),
+        exact: !options.approximate,
+        approximate: Boolean(options.approximate),
+        targetKind: target.kind || ""
+      });
+    }
+    finishGoogleDocsAction(actionId, "completed", {
+      type,
+      sectionId: section.id,
+      navigationRef: getGoogleDocsSectionNavigationRef(section)
+    });
+    setActionResult(type, true, {
+      section,
+      phase: "completed",
+      message: options.approximate ? GOOGLE_DOCS_APPROXIMATE_MESSAGE : "Google Docs section highlighted."
+    });
+    return true;
+  }
+
+  function resolveGoogleDocsExactTarget(section, details = {}) {
+    const doc = details.document || document;
+    const candidates = [];
+    const addCandidate = (element, source, kind) => {
+      if (!element || !isElementNode(element)) return;
+      candidates.push({ element, source, kind });
+    };
+    addCandidate(section && section.anchor, "section-anchor", "editor");
+    (section && section.blocks || []).forEach((block) => addCandidate(block, "section-block", "editor"));
+    queryGoogleDocsElementsByNavigationRef(section, doc).forEach((element) => addCandidate(element, "navigation-ref", "editor"));
+    return candidates.find((candidate) => {
+      if (!isGoogleDocsDocumentContentElement(candidate.element)) return false;
+      if (!isVisibleGoogleDocsElement(candidate.element)) return false;
+      return isGoogleDocsCandidateExact(section, candidate.element, candidate);
+    }) || null;
+  }
+
+  function resolveGoogleDocsOutlineEntry(section, details = {}) {
+    const doc = details.document || document;
+    if (!doc || typeof doc.querySelectorAll !== "function") return null;
+    const navigationRef = getGoogleDocsSectionNavigationRef(section);
+    const headingTitles = getGoogleDocsSectionHeadingTitles(section);
+    const entries = Array.from(doc.querySelectorAll(GOOGLE_DOCS_OUTLINE_SELECTOR))
+      .filter((entry) => isElementNode(entry) && isVisibleGoogleDocsElement(entry));
+    const byRef = entries.find((entry) => googleDocsElementMatchesNavigationRef(entry, navigationRef));
+    if (byRef) return { element: byRef, source: "outline-ref", kind: "outline" };
+    const byTitle = entries.find((entry) => {
+      const text = normalizeGoogleDocsText(entry.innerText || entry.textContent || "");
+      return headingTitles.some((title) => title && normalizeGoogleDocsText(title) === text);
+    });
+    if (byTitle) return { element: byTitle, source: "outline-title", kind: "outline" };
+    return null;
+  }
+
+  function resolveGoogleDocsApproximateTarget(section, details = {}) {
+    const preferred = details.preferredElement;
+    if (preferred && isGoogleDocsDocumentContentElement(preferred) && isVisibleGoogleDocsElement(preferred)) {
+      return {
+        element: preferred,
+        source: details.reason || "outline",
+        kind: "approximate-outline",
+        approximate: true,
+        approximateOffset: 0
+      };
+    }
+    const exactCandidate = [section && section.anchor].concat(section && section.blocks || [])
+      .find((element) => isElementNode(element) && isGoogleDocsDocumentContentElement(element) && isVisibleGoogleDocsElement(element));
+    if (exactCandidate) {
+      return {
+        element: exactCandidate,
+        source: section && section.unitMeta && section.unitMeta.googleDocsSource || "section",
+        kind: "approximate-section",
+        approximate: true,
+        approximateOffset: getGoogleDocsApproximateOffset(section, exactCandidate)
+      };
+    }
+    const doc = details.document || document;
+    const root = findGoogleDocsContentRoot(doc);
+    if (root) {
+      return {
+        element: root,
+        source: "content-root",
+        kind: "approximate-root",
+        approximate: true,
+        approximateOffset: getGoogleDocsApproximateOffset(section, root)
+      };
+    }
+    return null;
+  }
+
+  function queryGoogleDocsElementsByNavigationRef(section, doc = document) {
+    const navigationRef = getGoogleDocsSectionNavigationRef(section);
+    if (!navigationRef || !doc || typeof doc.querySelectorAll !== "function") return [];
+    const escaped = cssEscape(navigationRef.replace(/^#/, ""));
+    const selectors = [
+      `#${escaped}`,
+      `[data-target-id="${cssEscape(navigationRef)}"]`,
+      `[data-id="${cssEscape(navigationRef)}"]`,
+      `[data-pagepilot-section="${cssEscape(section && section.id || "")}"]`,
+      `[href="#${escaped}"]`
+    ].filter((selector) => !/""/.test(selector));
+    const found = [];
+    selectors.forEach((selector) => {
+      try {
+        found.push(...Array.from(doc.querySelectorAll(selector)));
+      } catch (error) {
+        // Ignore selector support gaps on Google Docs internals.
+      }
+    });
+    return uniqueElements(found);
+  }
+
+  function getGoogleDocsSectionHeadingTitles(section) {
+    const meta = section && section.unitMeta || {};
+    const titles = [section && section.title, meta.googleDocsParentHeadingTitle];
+    if (Array.isArray(meta.googleDocsHeadingPath)) {
+      meta.googleDocsHeadingPath.forEach((entry) => titles.push(entry && entry.title || ""));
+    }
+    return titles.map((title) => String(title || "").trim()).filter(Boolean);
+  }
+
+  function isGoogleDocsCandidateExact(section, element, details = {}) {
+    if (!isElementNode(element) || !section || !isVisibleGoogleDocsElement(element)) return false;
+    if (isGoogleDocsChromeElement(element) || !isGoogleDocsDocumentContentElement(element)) return false;
+    const meta = section.unitMeta || {};
+    const source = String(details.source || meta.googleDocsSource || "");
+    const elementText = getElementTextSample(element, 1800);
+    const elementWords = countGoogleDocsWords(elementText);
+    const sectionWords = Math.max(1, countGoogleDocsWords(section.text || section.title || ""));
+    const oversizedVisibleRoot = source !== "navigation-ref"
+      && meta.navigationExact !== true
+      && meta.googleDocsSource === "visible-block"
+      && elementWords > Math.max(90, sectionWords * 3);
+    if (oversizedVisibleRoot) return false;
+    if (googleDocsElementMatchesNavigationRef(element, getGoogleDocsSectionNavigationRef(section)) && meta.navigationExact) return true;
+    if (section.blocks && section.blocks.includes && section.blocks.includes(element) && !oversizedVisibleRoot) {
+      return hasGoogleDocsTextOverlap(section, elementText);
+    }
+    if (section.anchor === element && !oversizedVisibleRoot) {
+      return hasGoogleDocsTextOverlap(section, elementText);
+    }
+    return hasGoogleDocsTextOverlap(section, elementText);
+  }
+
+  function isGoogleDocsChromeElement(element) {
+    if (!isElementNode(element)) return false;
+    try {
+      return Boolean(element.closest && element.closest(GOOGLE_DOCS_CHROME_SELECTOR));
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isGoogleDocsDocumentContentElement(element) {
+    if (!isElementNode(element)) return false;
+    if (isGoogleDocsChromeElement(element)) return false;
+    try {
+      return Boolean(
+        element.closest && element.closest(GOOGLE_DOCS_CONTENT_SELECTOR)
+        || element.matches && element.matches(GOOGLE_DOCS_CONTENT_SELECTOR)
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isVisibleGoogleDocsElement(element) {
+    if (!isElementNode(element)) return false;
+    try {
+      const rect = element.getBoundingClientRect ? element.getBoundingClientRect() : null;
+      if (rect && rect.width <= 0 && rect.height <= 0) return false;
+      const style = window.getComputedStyle ? window.getComputedStyle(element) : null;
+      if (style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0)) return false;
+      return true;
+    } catch (error) {
+      return true;
+    }
+  }
+
+  function findGoogleDocsContentRoot(doc = document) {
+    if (!doc || typeof doc.querySelector !== "function") return null;
+    try {
+      return doc.querySelector(GOOGLE_DOCS_CONTENT_SELECTOR);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function findGoogleDocsScrollContainer(element) {
+    const contentRoot = element && element.closest && element.closest(".kix-appview-editor, .docs-editor-container, .docs-pageless-content, [aria-label*='Document content' i]") || null;
+    let current = contentRoot || element && element.parentElement || null;
+    while (current && current !== document.body && current !== document.documentElement) {
+      try {
+        const style = window.getComputedStyle(current);
+        const overflowY = style.overflowY || style.overflow;
+        if (/(auto|scroll|overlay)/i.test(overflowY) && current.scrollHeight > current.clientHeight + 24) {
+          return current;
+        }
+      } catch (error) {
+        // Ignore traversal issues.
+      }
+      current = current.parentElement;
+    }
+    return document.scrollingElement || document.documentElement || document.body;
+  }
+
+  async function scrollGoogleDocsTargetIntoView(target, section, approximate) {
+    const element = target && target.element;
+    if (!isElementNode(element)) return false;
+    const container = findGoogleDocsScrollContainer(element);
+    const prefersReducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const behavior = prefersReducedMotion ? "auto" : "smooth";
+    try {
+      const offset = Number(target.approximateOffset || 0);
+      if (container && container !== document.body && container !== document.documentElement) {
+        const containerRect = container.getBoundingClientRect();
+        const targetRect = element.getBoundingClientRect();
+        const top = Math.max(0, Number(container.scrollTop || 0) + (targetRect.top - containerRect.top) + offset - Math.max(80, Number(container.clientHeight || 0) * 0.32));
+        if (typeof container.scrollTo === "function") {
+          container.scrollTo({ top, behavior });
+        } else {
+          container.scrollTop = top;
+        }
+      } else if (typeof element.scrollIntoView === "function" && !approximate) {
+        element.scrollIntoView({ behavior, block: "center", inline: "nearest" });
+      } else {
+        const rect = element.getBoundingClientRect();
+        const top = Math.max(0, Number(window.scrollY || 0) + rect.top + offset - Math.max(80, Number(window.innerHeight || 0) * 0.32));
+        window.scrollTo({ top, behavior });
+      }
+      await delayGoogleDocsAction(prefersReducedMotion ? 30 : 160);
+      emitGoogleDocsActionLog("google-docs:action:editor-scroll-completed", runtime.googleDocsAction && runtime.googleDocsAction.activeActionId, {
+        sectionId: section && section.id || "",
+        source: target.source || "",
+        navigationRef: getGoogleDocsSectionNavigationRef(section),
+        approximate: Boolean(approximate),
+        targetKind: target.kind || ""
+      });
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function showGoogleDocsHighlight(target, section, options = {}) {
+    const rect = getGoogleDocsHighlightRect(target, section, options);
+    if (!rect || rect.width < 8 || rect.height < 8) return false;
+    clearGoogleDocsHighlight();
+    const overlay = document.createElement("div");
+    overlay.className = "pagepilot-google-docs-highlight";
+    overlay.setAttribute("aria-hidden", "true");
+    overlay.style.position = "fixed";
+    overlay.style.pointerEvents = "none";
+    overlay.style.zIndex = "2147483646";
+    overlay.style.left = `${Math.round(rect.left)}px`;
+    overlay.style.top = `${Math.round(rect.top)}px`;
+    overlay.style.width = `${Math.round(rect.width)}px`;
+    overlay.style.height = `${Math.round(rect.height)}px`;
+    overlay.style.border = "3px solid #2563eb";
+    overlay.style.borderRadius = "10px";
+    overlay.style.background = "rgba(37, 99, 235, 0.14)";
+    overlay.style.boxShadow = "0 0 0 9999px rgba(15, 23, 42, 0.04), 0 14px 38px rgba(37, 99, 235, 0.22)";
+    overlay.style.transition = "opacity 180ms ease";
+    const label = document.createElement("div");
+    label.textContent = `${options.approximate ? "Approximate Google Docs location" : "Google Docs highlight"} - ${section && section.title || "section"}`;
+    label.style.position = "absolute";
+    label.style.left = "12px";
+    label.style.top = "-34px";
+    label.style.maxWidth = "min(640px, 80vw)";
+    label.style.overflow = "hidden";
+    label.style.textOverflow = "ellipsis";
+    label.style.whiteSpace = "nowrap";
+    label.style.padding = "6px 12px";
+    label.style.borderRadius = "999px";
+    label.style.background = "#2563eb";
+    label.style.color = "#ffffff";
+    label.style.font = "700 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    label.style.boxShadow = "0 10px 24px rgba(37, 99, 235, 0.24)";
+    overlay.appendChild(label);
+    document.documentElement.appendChild(overlay);
+    runtime.googleDocsHighlightOverlay = overlay;
+    runtime.googleDocsHighlightTimer = window.setTimeout(clearGoogleDocsHighlight, JUMP_EFFECT_DURATION_MS);
+    runtime.jumpEffectActive = true;
+    runtime.jumpEffectLockedUntil = Date.now() + JUMP_EFFECT_SCROLL_LOCK_MS;
+    return true;
+  }
+
+  function getGoogleDocsHighlightRect(target, section, options = {}) {
+    const element = target && target.element;
+    if (!isElementNode(element) || !element.getBoundingClientRect) return null;
+    const base = element.getBoundingClientRect();
+    const approximate = Boolean(options.approximate || target.approximate);
+    const offset = Number(target.approximateOffset || 0);
+    if (approximate) {
+      const width = Math.max(180, Math.min(Number(base.width || window.innerWidth || 0) - 32, Number(base.width || window.innerWidth || 0) * 0.92));
+      const left = Math.max(12, Number(base.left || 0) + Math.min(24, Math.max(0, Number(base.width || 0) * 0.04)));
+      const top = Math.max(72, Math.min((Number(window.innerHeight || 900) - 120), Number(base.top || 0) + offset));
+      return {
+        left,
+        top,
+        width,
+        height: Math.max(72, Math.min(150, Number(base.height || 96)))
+      };
+    }
+    const top = Math.max(48, Number(base.top || 0) - 8);
+    const left = Math.max(8, Number(base.left || 0) - 10);
+    const width = Math.max(80, Math.min(Number(window.innerWidth || 1600) - left - 8, Number(base.width || 0) + 20));
+    const height = Math.max(38, Math.min(Number(window.innerHeight || 900) - top - 8, Number(base.height || 0) + 16));
+    return { left, top, width, height };
+  }
+
+  function showGoogleDocsActionNotice(message) {
+    clearGoogleDocsActionNotice();
+    const notice = document.createElement("div");
+    notice.className = "pagepilot-google-docs-notice";
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
+    notice.textContent = String(message || "");
+    notice.style.position = "fixed";
+    notice.style.left = "50%";
+    notice.style.bottom = "32px";
+    notice.style.transform = "translateX(-50%)";
+    notice.style.zIndex = "2147483647";
+    notice.style.maxWidth = "min(720px, calc(100vw - 32px))";
+    notice.style.padding = "12px 18px";
+    notice.style.borderRadius = "10px";
+    notice.style.background = "#0f172a";
+    notice.style.color = "#ffffff";
+    notice.style.font = "500 14px/1.35 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    notice.style.boxShadow = "0 18px 50px rgba(15, 23, 42, 0.28)";
+    document.documentElement.appendChild(notice);
+    runtime.googleDocsNotice = notice;
+    runtime.googleDocsNoticeTimer = window.setTimeout(clearGoogleDocsActionNotice, 4200);
+  }
+
+  function clearGoogleDocsHighlight() {
+    window.clearTimeout(runtime.googleDocsHighlightTimer);
+    runtime.googleDocsHighlightTimer = null;
+    if (runtime.googleDocsHighlightOverlay && runtime.googleDocsHighlightOverlay.parentNode) {
+      runtime.googleDocsHighlightOverlay.parentNode.removeChild(runtime.googleDocsHighlightOverlay);
+    }
+    runtime.googleDocsHighlightOverlay = null;
+  }
+
+  function clearGoogleDocsActionNotice() {
+    window.clearTimeout(runtime.googleDocsNoticeTimer);
+    runtime.googleDocsNoticeTimer = null;
+    if (runtime.googleDocsNotice && runtime.googleDocsNotice.parentNode) {
+      runtime.googleDocsNotice.parentNode.removeChild(runtime.googleDocsNotice);
+    }
+    runtime.googleDocsNotice = null;
+  }
+
+  function activateGoogleDocsOutlineEntry(element) {
+    if (!isElementNode(element)) return false;
+    try {
+      if (typeof element.click === "function") {
+        element.click();
+        return true;
+      }
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true, view: window });
+      element.dispatchEvent(event);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async function waitForGoogleDocsExactTarget(section, actionId) {
+    const deadline = Date.now() + GOOGLE_DOCS_ACTION_OUTLINE_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (!isGoogleDocsActionActive(actionId)) return null;
+      const target = resolveGoogleDocsExactTarget(section);
+      if (target && isGoogleDocsCandidateExact(section, target.element, target)) return target;
+      await delayGoogleDocsAction(140);
+    }
+    return null;
+  }
+
+  function getGoogleDocsApproximateOffset(section, element) {
+    const ref = getGoogleDocsSectionNavigationRef(section);
+    const segmentMatch = ref.match(/segment-(\d+)/i);
+    if (segmentMatch) return Math.max(0, (Number(segmentMatch[1]) - 1) * 96);
+    const order = Number(section && section.unitMeta && section.unitMeta.googleDocsDocumentOrder);
+    if (Number.isFinite(order) && order > 0 && order < 1000) return Math.min(520, order * 64);
+    const top = Number(section && section.unitMeta && section.unitMeta.syntheticTop);
+    if (Number.isFinite(top) && element && element.getBoundingClientRect) {
+      const rect = element.getBoundingClientRect();
+      return Math.max(0, Math.min(520, top - Number(rect.top || 0)));
+    }
+    return 0;
+  }
+
+  function hasGoogleDocsTextOverlap(section, elementText) {
+    const sectionTokens = getGoogleDocsMeaningfulTokens(`${section && section.title || ""} ${section && section.text || ""}`);
+    const elementTokens = new Set(getGoogleDocsMeaningfulTokens(elementText));
+    if (!sectionTokens.length || !elementTokens.size) return false;
+    const matches = sectionTokens.filter((token) => elementTokens.has(token));
+    return matches.length >= Math.min(4, Math.max(2, Math.ceil(sectionTokens.length * 0.18)));
+  }
+
+  function getGoogleDocsMeaningfulTokens(text) {
+    const stop = new Set(["the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "was", "were", "not", "but", "have", "has", "had", "will", "can", "section", "google", "docs"]);
+    return Array.from(new Set(String(text || "").toLowerCase().match(/\b[a-z][a-z0-9'-]{2,}\b/g) || []))
+      .filter((token) => !stop.has(token))
+      .slice(0, 60);
+  }
+
+  function googleDocsElementMatchesNavigationRef(element, navigationRef) {
+    if (!isElementNode(element) || !navigationRef) return false;
+    const ref = String(navigationRef || "").replace(/^#/, "");
+    const candidates = [
+      element.id,
+      element.getAttribute && element.getAttribute("data-target-id"),
+      element.getAttribute && element.getAttribute("data-id"),
+      element.getAttribute && element.getAttribute("href"),
+      element.getAttribute && element.getAttribute("data-pagepilot-section")
+    ].filter(Boolean).map((value) => String(value || "").replace(/^#/, ""));
+    return candidates.some((value) => value === ref || value.endsWith(`#${ref}`));
+  }
+
+  function getElementTextSample(element, maxLength = 1200) {
+    const text = normalizeGoogleDocsText(element && (element.innerText || element.textContent) || "");
+    return text.length > maxLength ? text.slice(0, maxLength) : text;
+  }
+
+  function normalizeGoogleDocsText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function countGoogleDocsWords(text) {
+    const matches = String(text || "").match(/\b[\w'-]+\b/g);
+    return matches ? matches.length : 0;
+  }
+
+  function isElementNode(node) {
+    return Boolean(node && node.nodeType === 1);
+  }
+
+  function delayGoogleDocsAction(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  }
+
+  function cssEscape(value) {
+    if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(String(value || ""));
+    return String(value || "").replace(/["\\]/g, "\\$&").replace(/[^\w-]/g, "\\$&");
   }
 
   function scrollToSection(id, options) {
     const section = runtime.model && runtime.model.sections.find((item) => item.id === id);
     if (!section) {
+      if (isGoogleDocsActionContext(runtime.model)) {
+        return blockGoogleDocsActionWithoutTarget(options && options.actionType || "section", "no-google-docs-target");
+      }
       return false;
     }
 
@@ -14095,6 +15337,9 @@
     const isPdf = Boolean(runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.type === "pdf");
     if (isPdf && isOcrPdfSection(section) && getPdfSectionPageNumber(section)) {
       return performPdfSyntheticJump(section, options);
+    }
+    if (!isPdf && isGoogleDocsActionContext(runtime.model, section)) {
+      return performGoogleDocsSectionNavigation(section, options || {});
     }
     if (!section.anchor) {
       return false;
@@ -15290,6 +16535,8 @@
     runtime.jumpEffectActive = false;
     runtime.jumpEffectLockedUntil = 0;
     clearPdfJumpMarker();
+    clearGoogleDocsHighlight();
+    clearGoogleDocsActionNotice();
     runtime.highlightedElements.forEach((element) => element.classList.remove("pagepilot-answer-target"));
     runtime.dimmedElements.forEach((element) => element.classList.remove("pagepilot-fluff-dim"));
     runtime.highlightedElements = [];
@@ -17792,6 +19039,7 @@
     clearChatReadinessPolling();
     window.clearInterval(runtime.urlWatchTimer);
     clearJumpEffect();
+    cancelActiveGoogleDocsAction("destroy", { exactIssue: "The content script was destroyed while a Google Docs action was pending." });
     runtime.pendingPdfControlledJump = null;
     closePagePilotPdfModeConsentDialog(false);
     clearPagePilotPdfModeNotice();

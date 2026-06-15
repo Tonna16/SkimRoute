@@ -16,6 +16,7 @@
   const LOW_CONFIDENCE_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
   const QUIET_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
   const AMBIGUOUS_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
+  const GOOGLE_DOCS_CANVAS_RENDERING_REASON = "Google Docs is using canvas rendering. Turn on screen-reader support in Google Docs, then select Rescan. Windows: Ctrl+Alt+Z. Mac: Command+Option+Z. Or use Tools → Accessibility settings.";
 
   const LOW_VALUE_SELECTOR = [
     "nav",
@@ -119,6 +120,8 @@
     final_recommendation: "Final recommendation",
     step_by_step: "Step-by-step answer",
     key_explanation: "Key explanation",
+    document_title: "Document title",
+    heading: "Heading",
     main_argument: "Main argument",
     key_evidence: "Key evidence",
     abstract: "Abstract",
@@ -157,6 +160,7 @@
     search_shopping: "Shopping",
     search_maps: "Maps",
     search_related_searches: "Related searches",
+    unknown: "Unknown",
     useful_section: "Useful section"
   };
 
@@ -171,6 +175,47 @@
     if (normalized === "date_reference") return "ocr_date_reference";
     if (normalized === "signature") return "ocr_signature";
     return normalized ? `ocr_${normalized}` : "";
+  }
+
+  const GOOGLE_DOCS_ROLE_LABELS = {
+    document_title: "Document title",
+    introduction: "Introduction",
+    summary: "Summary",
+    main_claim: "Main argument",
+    heading: "Heading",
+    steps: "Steps",
+    evidence: "Key evidence",
+    results: "Results",
+    conclusion: "Conclusion",
+    references: "References",
+    appendix: "Appendix",
+    unknown: "Useful section"
+  };
+
+  function isGoogleDocsSection(unitMeta, profile) {
+    return Boolean(unitMeta && (
+      unitMeta.kind === "google-docs"
+      || unitMeta.source === "google-docs"
+      || unitMeta.googleDocsUnitId
+    )) || Boolean(profile && profile.adapterName === "google-docs");
+  }
+
+  function googleDocsRoleToSectionKind(role) {
+    const map = {
+      document_title: "document_title",
+      introduction: "introduction",
+      summary: "summary",
+      main_claim: "main_argument",
+      heading: "heading",
+      steps: "steps",
+      evidence: "key_evidence",
+      results: "results",
+      conclusion: "conclusion",
+      references: "works_cited",
+      appendix: "appendix",
+      unknown: "useful_section"
+    };
+    return map[role] || "";
   }
 
   const INTELLIGENCE_POSITIVE_SIGNALS = [
@@ -318,7 +363,8 @@
       });
       let pageProfile = normalizeProfile(rawProfile, adapter);
       const adapterUnits = safeCall(() => adapter.collectUnits(root, context, helpers), null);
-      const useAdapterUnits = adapterUnits && (adapterUnits.length >= 2 || ((pageProfile.type === "chat" || pageProfile.type === "pdf") && adapterUnits.length >= 1));
+      const adapterDiagnostics = safeCall(() => adapter.diagnostics ? adapter.diagnostics(context, helpers, root) : null, null);
+      const useAdapterUnits = adapterUnits && (adapter.authoritativeUnits || adapterUnits.length >= 2 || ((pageProfile.type === "chat" || pageProfile.type === "pdf") && adapterUnits.length >= 1));
       const headingSections = useAdapterUnits
         ? []
         : collectHeadingSections(root, adapter, pageProfile).slice(0, MAX_SECTIONS);
@@ -353,8 +399,9 @@
       const recommendation = buildRecommendation(sections, importantSections, pageProfile);
       attachSectionIntelligence(sections, pageProfile, recommendation);
       const targets = pickNavigationTargets(sections, importantSections, recommendation.bestSectionId, pageProfile);
-      const totalWords = helpers.countWords(rootText);
-      const totalReadableWords = Math.max(totalWords, sections.reduce((sum, section) => sum + section.wordCount, 0));
+      const sectionWordTotal = sections.reduce((sum, section) => sum + section.wordCount, 0);
+      const totalWords = adapter.name === "google-docs" ? sectionWordTotal : helpers.countWords(rootText);
+      const totalReadableWords = adapter.name === "google-docs" ? sectionWordTotal : Math.max(totalWords, sectionWordTotal);
       const routeKey = safeCall(() => adapter.routeKey(context), `${context.location.origin}${context.location.pathname}${context.location.search}`);
 
       return {
@@ -393,7 +440,8 @@
           unitSectionsCount: unitSections.length,
           rawSectionCount: rawSections.length,
           pageProfileBefore: rawProfile,
-          pageProfileAfter: pageProfile
+          pageProfileAfter: pageProfile,
+          ...(adapterDiagnostics || {})
         },
         structureSignature: getStructureSignature(pageProfile, sections)
       };
@@ -401,6 +449,9 @@
 
     function pickRoot(adapter) {
       const root = safeCall(() => adapter.getRoot(context, helpers), null);
+      if (adapter && adapter.name === "google-docs") {
+        return root || context.document.documentElement || context.document.body;
+      }
       const fallback = pickArticleRoot(context, helpers);
 
       if (root && root !== context.document.documentElement && helpers.isVisible(root)) {
@@ -714,7 +765,7 @@
   }
 
   function normalizeProfile(profile, adapter) {
-    return {
+    const normalized = {
       type: profile.type || "low_structure",
       label: profile.label || "Page",
       readingConfidence: Number.isFinite(profile.readingConfidence) ? profile.readingConfidence : 34,
@@ -726,6 +777,14 @@
       qualityMessage: profile.qualityMessage || "",
       adapterName: profile.adapterName || adapter.name
     };
+    if ((profile.adapterName || adapter.name) === "google-docs") {
+      normalized.googleDocsPartial = Boolean(profile.googleDocsPartial);
+      normalized.googleDocsMode = profile.googleDocsMode || "";
+      normalized.googleDocsActiveTab = profile.googleDocsActiveTab || "";
+      normalized.googleDocsFailureReason = profile.googleDocsFailureReason || "";
+      normalized.googleDocsRenderingCapability = profile.googleDocsRenderingCapability || "";
+    }
+    return normalized;
   }
 
   function collectHeadingSections(root, adapter, profile) {
@@ -1167,6 +1226,34 @@
       repeatedNoise: hasRepeatedNoise
     };
 
+    const googleDocsRole = isGoogleDocsSection(unitMeta, profile)
+      ? classifyGoogleDocsRole({
+        title,
+        headingText,
+        lower,
+        headingAndText,
+        wordCount,
+        index: input.index,
+        profile,
+        stats,
+        unitMeta,
+        matched,
+        level: unitMeta.headingLevel
+      })
+      : null;
+    if (googleDocsRole) {
+      matched.googleDocsMainClaim = googleDocsRole.role === "main_claim";
+      matched.googleDocsSummary = googleDocsRole.role === "summary";
+      matched.googleDocsSteps = googleDocsRole.role === "steps";
+      matched.googleDocsEvidence = googleDocsRole.role === "evidence";
+      matched.googleDocsResults = googleDocsRole.role === "results";
+      matched.googleDocsConclusion = googleDocsRole.role === "conclusion";
+      matched.googleDocsReferences = googleDocsRole.role === "references";
+      matched.googleDocsAppendix = googleDocsRole.role === "appendix";
+      matched.googleDocsDocumentTitle = googleDocsRole.role === "document_title";
+      matched.googleDocsEditorInstruction = Boolean(googleDocsRole.chromeOrInstruction);
+    }
+
     const pdfOcrRole = profile.type === "pdf"
       ? normalizePdfOcrRole(unitMeta.ocrRole || input.ocrRole || input.metrics && input.metrics.ocrRole)
       : "";
@@ -1189,7 +1276,8 @@
         ocrSignature: pdfOcrRole === "signature"
       } : matched,
       isHeaderOnly,
-      repeatedTextScore
+      repeatedTextScore,
+      googleDocsRole
     });
 
     let usefulScore = 0;
@@ -1248,6 +1336,21 @@
       if (matched.results) usefulScore += 54;
       if (matched.discussion) usefulScore += 36;
       if (matched.conclusion) usefulScore += 50;
+    }
+    if (googleDocsRole) {
+      if (googleDocsRole.role === "summary") usefulScore += 58;
+      if (googleDocsRole.role === "main_claim") usefulScore += 62;
+      if (googleDocsRole.role === "steps") usefulScore += 86;
+      if (googleDocsRole.role === "evidence") usefulScore += 44;
+      if (googleDocsRole.role === "results") usefulScore += 96;
+      if (googleDocsRole.role === "conclusion") usefulScore += 62;
+      if (googleDocsRole.role === "introduction") usefulScore += 16;
+      if (googleDocsRole.role === "heading") usefulScore -= 28;
+      if (googleDocsRole.role === "document_title") usefulScore -= 34;
+      if (googleDocsRole.role === "references") usefulScore -= 72;
+      if (googleDocsRole.role === "appendix") usefulScore -= 46;
+      if (googleDocsRole.shortFragment) usefulScore -= 26;
+      if (googleDocsRole.chromeOrInstruction) usefulScore -= 82;
     }
     if (matched.revision) usefulScore += 28;
     if (matched.finalAnswer) usefulScore += 58;
@@ -1341,6 +1444,21 @@
       if (matched.discussion) importanceScore += 26;
       if (matched.conclusion) importanceScore += 38;
     }
+    if (googleDocsRole) {
+      if (googleDocsRole.role === "summary") importanceScore += 38;
+      if (googleDocsRole.role === "main_claim") importanceScore += 42;
+      if (googleDocsRole.role === "steps") importanceScore += 48;
+      if (googleDocsRole.role === "evidence") importanceScore += 34;
+      if (googleDocsRole.role === "results") importanceScore += 58;
+      if (googleDocsRole.role === "conclusion") importanceScore += 44;
+      if (googleDocsRole.role === "introduction") importanceScore += 12;
+      if (googleDocsRole.role === "heading") importanceScore -= 18;
+      if (googleDocsRole.role === "document_title") importanceScore -= 22;
+      if (googleDocsRole.role === "references") importanceScore -= 58;
+      if (googleDocsRole.role === "appendix") importanceScore -= 34;
+      if (googleDocsRole.shortFragment) importanceScore -= 18;
+      if (googleDocsRole.chromeOrInstruction) importanceScore -= 58;
+    }
     if (matched.directAction) importanceScore += 18;
     if (matched.completeCode) importanceScore += 22;
     if (matched.troubleshooting && (matched.answer || matched.action || matched.procedure)) importanceScore += 18;
@@ -1432,10 +1550,13 @@
       isDenseLinks,
       sectionKind: sectionKind.kind,
       sectionKindLabel: sectionKind.label,
-      selectionReason: getSelectionReason(matched, unitMeta, profile, contentRankType),
+      selectionReason: getSelectionReason(matched, unitMeta, profile, contentRankType, googleDocsRole),
       pdfSectionType: sectionKind.pdfSectionType,
       ocrRole: pdfOcrRole,
       ocrRoleLabel: pdfOcrRole ? SECTION_KIND_LABELS[pdfOcrRoleKind(pdfOcrRole)] || "" : "",
+      googleDocsRole: googleDocsRole && googleDocsRole.role || "",
+      googleDocsRoleLabel: googleDocsRole && googleDocsRole.label || "",
+      googleDocsRoleConfidence: googleDocsRole && googleDocsRole.confidence || 0,
       isHeaderOnly,
       repeatedTextScore,
       chatRole: unitMeta.role || ""
@@ -1455,9 +1576,10 @@
     return "";
   }
 
-  function getSelectionReason(matched, unitMeta, profile, contentRankType) {
+  function getSelectionReason(matched, unitMeta, profile, contentRankType, googleDocsRole) {
     if (!matched) return "";
     if (profile && profile.type === "chat") return getChatSelectionReason(matched, unitMeta, profile);
+    if (googleDocsRole && isGoogleDocsSection(unitMeta, profile)) return getGoogleDocsSelectionReason(googleDocsRole);
     return getContentSelectionReason(matched, contentRankType);
   }
 
@@ -1480,6 +1602,96 @@
     if (matched.answersLatestUser) return "Answers the latest user request";
     if (matched.completeAssistantAnswer) return "Complete assistant response with enough substance";
     return "";
+  }
+
+  function getGoogleDocsSelectionReason(roleInfo) {
+    if (!roleInfo) return "";
+    return roleInfo.reason || "";
+  }
+
+  function classifyGoogleDocsRole(details) {
+    const unitMeta = details.unitMeta || {};
+    const headingText = String(details.headingText || "").toLowerCase();
+    const lower = String(details.lower || "").toLowerCase();
+    const text = String(details.headingAndText || `${headingText} ${lower}`).toLowerCase();
+    const wordCount = Number(details.wordCount) || 0;
+    const headingLevel = Number(unitMeta.headingLevel || details.level || 0);
+    const index = Number(details.index) || 0;
+    const matched = details.matched || {};
+    const shortFragment = wordCount < 28;
+    const chromeOrInstruction = /\b(type\s+@|press\s+enter|editing mode|suggesting mode|accept suggestion|reject suggestion|resolve comment|add comment|toolbar|share|request edit access|last edit was|saving\.?|saved to drive)\b/i.test(text);
+    let role = "unknown";
+    let confidence = 42;
+    let reason = "Readable Google Docs document section.";
+
+    if (matched.tableOfContents || /\b(table of contents|contents)\b/i.test(headingText)) {
+      role = "heading";
+      confidence = 42;
+      reason = "Table of contents is document navigation, not the main content.";
+    } else if (matched.references || /\b(references|bibliography|works cited|citations)\b/i.test(headingText)) {
+      role = "references";
+      confidence = 86;
+      reason = "References are supporting material and are down-ranked.";
+    } else if (matched.appendix || /\b(appendix|appendices|supplemental|supplementary)\b/i.test(headingText)) {
+      role = "appendix";
+      confidence = 82;
+      reason = "Appendix material is secondary to the main document body.";
+    } else if (matched.summary || /\b(summary|executive summary|abstract|overview|recap|tl;dr|tldr)\b/i.test(headingText)) {
+      role = "summary";
+      confidence = 88;
+      reason = "Summary section captures the document's key points.";
+    } else if (/\b(results?|findings?|outcomes?|what we found)\b/i.test(headingText) && !/\b(expected result|final result|what you should see|result should)\b/i.test(headingText)) {
+      role = "results";
+      confidence = 90;
+      reason = "Results or findings are high-value Google Docs content.";
+    } else if (matched.conclusion || /\b(conclusion|final thoughts?|closing|takeaway|so what|what this means)\b/i.test(headingText)) {
+      role = "conclusion";
+      confidence = 90;
+      reason = "Conclusion states the document takeaway.";
+    } else if (matched.procedure || matched.directAction || matched.action || /\b(steps?|plan|action items?|next actions?|to do|todo|checklist)\b/i.test(headingText)) {
+      role = "steps";
+      confidence = 86;
+      reason = "Actionable steps are useful Google Docs guidance.";
+    } else if ((matched.keyEvidence || /\b(evidence|supporting details?|examples?|proof|data|quote|source analysis|because|shows?|demonstrates?)\b/i.test(text)) && !/\b(introduction|intro|background|context|opening)\b/i.test(headingText)) {
+      role = "evidence";
+      confidence = 82;
+      reason = "Evidence section supports the document's main point.";
+    } else if ((matched.mainArgument || /\b(thesis|main claim|central claim|main argument|argument|i argue|we argue|this essay argues|the point is|claim)\b/i.test(text)) && !/\b(introduction|intro|background|context|opening)\b/i.test(headingText)) {
+      role = "main_claim";
+      confidence = 88;
+      reason = "Main argument in the Google Docs document.";
+    } else if (/\b(introduction|intro|background|context|opening)\b/i.test(headingText) || (index <= 1 && wordCount >= 45 && !matched.pageTypeClutter)) {
+      role = "introduction";
+      confidence = 70;
+      reason = "Introduction provides opening context for the document.";
+    } else if ((headingLevel <= 1 || index === 0) && wordCount < 90 && !/[.!?]\s+\w/.test(lower)) {
+      role = "document_title";
+      confidence = 64;
+      reason = "Document title or title-like heading.";
+    } else if (headingLevel <= 2 && shortFragment) {
+      role = "heading";
+      confidence = 50;
+      reason = "Short heading without enough body text.";
+    } else if (wordCount >= 55) {
+      role = "main_claim";
+      confidence = 68;
+      reason = "Substantial Google Docs section with enough body text.";
+    }
+
+    if (chromeOrInstruction) {
+      role = "unknown";
+      confidence = Math.min(confidence, 28);
+      reason = "Editor instruction or suggestion UI is down-ranked.";
+    }
+
+    return {
+      role,
+      label: GOOGLE_DOCS_ROLE_LABELS[role] || GOOGLE_DOCS_ROLE_LABELS.unknown,
+      confidence,
+      reason,
+      shortFragment,
+      chromeOrInstruction
+    };
   }
 
   function getContentSelectionReason(matched, contentRankType) {
@@ -1535,9 +1747,12 @@
       ? pdfOcrRoleKind(pdfOcrRole)
       : "";
     const searchKind = searchSectionKind(unitMeta.searchBlockType || "");
+    const googleDocsRole = details.googleDocsRole && details.googleDocsRole.role || "";
+    const googleDocsKind = googleDocsRoleToSectionKind(googleDocsRole);
     let kind = "";
 
     if (searchKind) kind = searchKind;
+    else if (googleDocsKind && !["unknown", "useful_section"].includes(googleDocsKind)) kind = googleDocsKind;
     else if (matched.boilerplate) kind = "boilerplate";
     else if (matched.promptEcho) kind = "prompt_echo";
     else if (matched.citationOnly) kind = "works_cited";
@@ -2124,6 +2339,9 @@
 
   function labelForSectionBySignals(section) {
     if (!section || !section.metrics) return "";
+    if (section.metrics.googleDocsRoleLabel && section.metrics.googleDocsRoleLabel !== "Useful section") {
+      return section.metrics.googleDocsRoleLabel;
+    }
     if (section.unitMeta && section.unitMeta.searchBlockType) {
       return SECTION_KIND_LABELS[searchSectionKind(section.unitMeta.searchBlockType)] || "";
     }
@@ -2198,6 +2416,7 @@
     const unitMeta = section && section.unitMeta || {};
     const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
     if (ocrRole) return pdfOcrRoleKind(ocrRole);
+    if (metrics.googleDocsRole) return String(metrics.googleDocsRole);
     if (unitMeta.searchBlockType) return searchSectionKind(unitMeta.searchBlockType) || "search_result";
     if (metrics.pdfSectionType || unitMeta.pdfSectionType) return String(metrics.pdfSectionType || unitMeta.pdfSectionType);
     if (metrics.sectionKind) return String(metrics.sectionKind);
@@ -2211,6 +2430,7 @@
     const unitMeta = section && section.unitMeta || {};
     const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
     if (ocrRole) return metrics.ocrRoleLabel || unitMeta.ocrRoleLabel || SECTION_KIND_LABELS[pdfOcrRoleKind(ocrRole)] || SECTION_KIND_LABELS.useful_section;
+    if (metrics.googleDocsRoleLabel) return metrics.googleDocsRoleLabel;
     if (metrics.sectionKindLabel && metrics.sectionKindLabel !== "Useful section") return metrics.sectionKindLabel;
     const signalLabel = labelForSectionBySignals(section);
     if (signalLabel) return signalLabel;
@@ -2235,8 +2455,13 @@
     if (recommendation && recommendation.bestSectionId === section.id && recommendation.targetConfidenceReason) {
       reasons.push(recommendation.targetConfidenceReason);
     }
+    if (isGoogleDocsSection(unitMeta, { adapterName: unitMeta.kind === "google-docs" ? "google-docs" : "" }) && metrics.selectionReason) {
+      reasons.push(metrics.selectionReason);
+    }
     if (unitMeta.diagnosticReason) reasons.push(unitMeta.diagnosticReason);
-    if (metrics.selectionReason) reasons.push(metrics.selectionReason);
+    if (!isGoogleDocsSection(unitMeta, { adapterName: unitMeta.kind === "google-docs" ? "google-docs" : "" }) && metrics.selectionReason) {
+      reasons.push(metrics.selectionReason);
+    }
     if (metrics.themeIntent && Array.isArray(metrics.themeIntent.reasons)) {
       metrics.themeIntent.reasons.slice(0, 2).forEach((reason) => reasons.push(reason));
     }
@@ -2293,6 +2518,17 @@
     if (pdfSectionType === "form") addPositive("pdfSectionType.form", 70, "Form or notice with structured identifiers.");
     if (pdfSectionType === "table") addPositive("pdfSectionType.table", 50, "Table-like PDF section.");
     if (pdfSectionType === "signature") addPositive("pdfSectionType.signature", 24, "Signature area was identified.");
+
+    if (metrics.googleDocsRole) {
+      const label = metrics.googleDocsRoleLabel || GOOGLE_DOCS_ROLE_LABELS[metrics.googleDocsRole] || "Google Docs section";
+      const confidence = Number(metrics.googleDocsRoleConfidence) || 0;
+      if (["summary", "main_claim", "steps", "evidence", "results", "conclusion"].includes(metrics.googleDocsRole)) {
+        addPositive(`googleDocsRole.${metrics.googleDocsRole}`, confidence || 70, `${label} role from Google Docs document structure.`);
+      }
+      if (["document_title", "heading", "references", "appendix", "unknown"].includes(metrics.googleDocsRole)) {
+        addNegative(`googleDocsRole.${metrics.googleDocsRole}`, -Math.max(20, confidence || 30), `${label} is secondary to substantive document content.`);
+      }
+    }
 
     const searchBlockType = unitMeta.searchBlockType || "";
     if (searchBlockType === "ai_overview") addPositive("searchBlock.ai_overview", 92, "AI Overview is the highest-value search block.");
@@ -2378,6 +2614,38 @@
     const text = helpers.getReadableText(root);
     const rootWords = helpers.countWords(text);
     const sectionWords = sections.reduce((sum, section) => sum + (Number(section.wordCount) || 0), 0);
+    if (profile.adapterName === "google-docs") {
+      const strongSignals = sections.filter((section) => section.score >= 58 && section.metrics.fluffScore < 58 && section.usefulScore >= 24).length;
+      return resolvePageProfile(profile, sections, {
+        words: sectionWords,
+        sectionCount: sections.length,
+        strongSignals,
+        linkDensity: 0,
+        formControls: 0,
+        headings: headingSections.length,
+        fallbackOnly: false,
+        readableBlocks: sections.length,
+        cardLikeCount: 0,
+        pageEvidence: {
+          articleEvidence: 0,
+          conversationEvidence: 0,
+          conversationNodes: 0,
+          assistantHits: 0,
+          userHits: 0,
+          codeBlocks: 0,
+          quietEvidence: sectionWords >= 40 ? 0 : 1,
+          paragraphs: sections.length,
+          controls: 0,
+          links: 0,
+          resultItems: 0,
+          commerceNodes: 0,
+          appShellNodes: 0,
+          searchNodes: 0,
+          prefixCount: 0,
+          reason: profile.reason || "Google Docs adapter controls document readability"
+        }
+      });
+    }
     const hasRecoveredPdfSections = profile.type === "pdf" && sections.some((section) => {
       const meta = section.unitMeta || {};
       return section.source === "pdf"
@@ -2448,6 +2716,40 @@ function resolvePageProfile(profile, sections, details) {
 
   const initialIsChat = profile.type === "chat";
   const initialIsPdf = profile.type === "pdf";
+  const initialIsGoogleDocs = profile.adapterName === "google-docs";
+  if (initialIsGoogleDocs) {
+    const sectionWords = sections.reduce((sum, section) => sum + (Number(section.wordCount) || 0), 0);
+    const readable = sectionCount >= 1 && sectionWords >= 40;
+    const partial = Boolean(profile.googleDocsPartial);
+    const canvasOnly = profile.googleDocsRenderingCapability === "canvas-only" || profile.googleDocsFailureReason === "canvas-rendering-requires-screen-reader-support";
+    const reason = readable
+      ? partial
+        ? "SkimRoute mapped the Google Docs content currently available in the editor."
+        : "Google Docs document text found"
+      : canvasOnly
+        ? GOOGLE_DOCS_CANVAS_RENDERING_REASON
+        : profile.quietReason || profile.reason || "Google Docs is open, but SkimRoute cannot read enough document text yet.";
+    return {
+      type: "docs",
+      label: "Google Docs",
+      readingConfidence: Math.max(readable ? 68 : 38, Math.min(90, Number(profile.readingConfidence) || 38)),
+      quietMode: !readable,
+      reason,
+      quietReason: readable ? "" : reason,
+      diagnosticHint: readable ? "" : canvasOnly ? "Google Docs appears to be rendering document text to canvas instead of exposing local text nodes." : "Google Docs matched, but readable document text was not exposed clearly enough to build sections.",
+      pageEvidence,
+      searchSubtype: profile.searchSubtype || "",
+      ocrQuality: profile.ocrQuality || "",
+      qualityMessage: profile.qualityMessage || "",
+      isAmbiguous: !readable,
+      adapterName: "google-docs",
+      googleDocsPartial: partial,
+      googleDocsMode: profile.googleDocsMode || "",
+      googleDocsActiveTab: profile.googleDocsActiveTab || "",
+      googleDocsFailureReason: profile.googleDocsFailureReason || "",
+      googleDocsRenderingCapability: profile.googleDocsRenderingCapability || ""
+    };
+  }
   const conversationLikeEvidence = (pageEvidence.conversationEvidence || 0) >= 4
     || ((pageEvidence.conversationNodes || 0) >= 4 && (pageEvidence.assistantHits || 0) >= 1 && (pageEvidence.userHits || 0) >= 1)
     || ((pageEvidence.conversationEvidence || 0) >= 3 && (pageEvidence.codeBlocks || 0) > 0)
@@ -3007,6 +3309,7 @@ function getPageEvidence(details) {
       return SECTION_KIND_LABELS[searchSectionKind(blockType)] || "Search result";
     }
     if (section.metrics.matched.finalCode) return "Jump to the final code";
+    if (isGoogleDocsSection(section.unitMeta, pageProfile) && section.metrics.googleDocsRoleLabel && section.metrics.googleDocsRoleLabel !== "Useful section") return section.metrics.googleDocsRoleLabel;
     if (pageProfile.type === "chat" && (section.metrics.matched.correctedAnswer || section.metrics.matched.replacesFailedAttempt)) return "Jump to the corrected answer";
     if (section.metrics.matched.finalRecommendation) return "Final recommendation";
     if (pageProfile.type === "chat" && section.metrics.matched.completeCode) return "Complete code";
@@ -3058,6 +3361,7 @@ function getPageEvidence(details) {
     }
     if (details.bestSection.unitMeta && details.bestSection.unitMeta.searchBlockType) return details.bestSection.unitMeta.diagnosticReason || "Search result block has the strongest signal";
     if (details.bestSection.metrics.ocrRole === "body") return "This paragraph is the main body of the scanned letter, not the letterhead or signature";
+    if (isGoogleDocsSection(details.bestSection.unitMeta, { adapterName: "google-docs" }) && details.bestSection.metrics.selectionReason) return details.bestSection.metrics.selectionReason;
     if (details.bestSection.unitMeta && details.bestSection.unitMeta.diagnosticReason) return details.bestSection.unitMeta.diagnosticReason;
     if (details.bestSection.metrics.selectionReason) return details.bestSection.metrics.selectionReason;
     if (details.bestSection.metrics.matched.finalCode) return "Final code signal with enough confidence";
@@ -3088,7 +3392,8 @@ function getPageEvidence(details) {
       "mainArgument", "keyEvidence", "quickStart", "installation", "usage", "parameters",
       "troubleshooting", "prerequisites", "setup", "finalResult", "ingredients",
       "instructions", "timing", "tips", "abstract", "methods", "results",
-      "discussion", "conclusion"
+      "discussion", "conclusion", "googleDocsMainClaim", "googleDocsSummary",
+      "googleDocsSteps", "googleDocsEvidence", "googleDocsResults", "googleDocsConclusion"
     ];
     return positiveSignals.reduce((sum, key) => sum + (metrics.matched[key] ? 1 : 0), 0)
       + (metrics.listItems >= 3 ? 1 : 0)
@@ -3280,7 +3585,10 @@ function getPageEvidence(details) {
       reason: fixture.reason || "",
       quietReason: fixture.quietReason || "",
       isAmbiguous: Boolean(fixture.isAmbiguous || LOW_CONFIDENCE_PAGE_TYPES.has(fixture.type)),
-      adapterName: "fixture"
+      adapterName: fixture.adapterName || "fixture",
+      googleDocsPartial: Boolean(fixture.googleDocsPartial),
+      googleDocsMode: fixture.googleDocsMode || "",
+      googleDocsActiveTab: fixture.googleDocsActiveTab || ""
     };
     const sections = (fixture.sections || []).map((section, index) => {
       const text = cleanText(`${section.title || ""} ${section.text || ""}`);
