@@ -366,6 +366,8 @@
     return {
       routeKey,
       lastSelectedSectionId: "",
+      lastSelectedPassageId: "",
+      lastSelectedPageNumber: 0,
       lastSelectedRole: "",
       recentSectionIds: [],
       lastActionSource: "",
@@ -391,6 +393,16 @@
       canNavigate: false,
       weakRequiresConfirm: false,
       canRunBetterOcr: false,
+      hasNavigated: false,
+      isCurrentTarget: false,
+      canReturnToMatch: false,
+      targetSectionId: "",
+      targetPassageId: "",
+      targetSurface: "",
+      targetPageNumber: 0,
+      targetNavigation: createEmptyQueryNavigationResult(),
+      targetFingerprint: "",
+      targetRouteKey: "",
       navigation: createEmptyQueryNavigationResult(),
       alternatives: [],
       requestId: 0,
@@ -825,7 +837,7 @@
           prepareBetterOcrRetryForCurrentQuery("sidebar-query");
           return runManualPdfOcr("better");
         },
-        onNavigateQueryResult: (target) => navigateCurrentQueryResult("sidebar-weak-confirm", target || {}).catch((error) => {
+        onNavigateQueryResult: (target) => navigateCurrentQueryResult(target && target.returnToMatch ? "sidebar-return" : "sidebar-weak-confirm", target || {}).catch((error) => {
           emitDebug("section-query:sidebar-navigate-error", {
             error: String(error && error.message ? error.message : error),
             exactIssue: "Sidebar PDF query result navigation failed before public state could be updated."
@@ -13356,9 +13368,10 @@
       return getPublicStats();
     }
     if (type === "PAGEPILOT_NAVIGATE_QUERY_RESULT") {
-      await navigateCurrentQueryResult(options.source || "popup-weak-confirm", {
+      await navigateCurrentQueryResult(message.returnToMatch ? `${options.source || "popup"}-return` : options.source || "popup-weak-confirm", {
         sectionId: message.sectionId || "",
-        passageId: message.passageId || ""
+        passageId: message.passageId || "",
+        returnToMatch: Boolean(message.returnToMatch)
       });
       return getPublicStats();
     }
@@ -14115,7 +14128,7 @@
     }
   }
 
-  function recordNavigationSelection(section, source) {
+  function recordNavigationSelection(section, source, target = {}) {
     if (!section || !runtime.model) return;
     const routeKey = getRouteCacheKey();
     if (runtime.navigationHistory.routeKey && runtime.navigationHistory.routeKey !== routeKey) {
@@ -14125,8 +14138,15 @@
       || section.metrics && section.metrics.sectionKind
       || section.label
       || "";
+    const previousActive = {
+      sectionId: runtime.navigationHistory.lastSelectedSectionId || "",
+      passageId: runtime.navigationHistory.lastSelectedPassageId || "",
+      pageNumber: runtime.navigationHistory.lastSelectedPageNumber || 0
+    };
     runtime.navigationHistory.routeKey = routeKey;
     runtime.navigationHistory.lastSelectedSectionId = section.id;
+    runtime.navigationHistory.lastSelectedPassageId = String(target.passageId || "");
+    runtime.navigationHistory.lastSelectedPageNumber = Number(target.pageNumber) || getPdfSectionPageNumber(section);
     runtime.navigationHistory.lastSelectedRole = role;
     runtime.navigationHistory.lastActionSource = source || "";
     runtime.navigationHistory.lastSelectedAt = Date.now();
@@ -14134,6 +14154,168 @@
       .filter((id) => id && id !== section.id)
       .concat(section.id)
       .slice(-6);
+    updateSectionQueryReturnState("navigation", { previousActive, source: source || "" });
+  }
+
+  function buildSectionQueryTargetFingerprint(query, section) {
+    return hashPdfOcrTextForId([
+      query && (query.passageId || query.sectionId || ""),
+      query && (query.pageNumber || ""),
+      query && (query.title || ""),
+      query && (query.snippet || ""),
+      section && (section.title || ""),
+      section && String(section.text || "").slice(0, 220)
+    ].join("|")).slice(0, 14);
+  }
+
+  function applySavedSectionQueryTarget(query, selected, navigation, section, source = "query") {
+    if (!query || !selected || !navigation) return query;
+    const navigated = Boolean(navigation.navigated && navigation.verified);
+    const targetSectionId = String(navigation.sectionId || selected.sectionId || section && section.id || "");
+    const targetPassageId = String(navigation.passageId || selected.passageId || "");
+    const targetSurface = String(navigation.surface || selected.surface || "pdf");
+    const targetPageNumber = Number(navigation.pageNumber || selected.pageNumber || getPdfSectionPageNumber(section)) || 0;
+    const next = {
+      ...query,
+      ...selected,
+      navigation,
+      weakRequiresConfirm: false,
+      hasNavigated: navigated,
+      targetSectionId,
+      targetPassageId,
+      targetSurface,
+      targetPageNumber,
+      targetNavigation: navigation,
+      targetFingerprint: buildSectionQueryTargetFingerprint(selected, section),
+      targetRouteKey: getPdfDocumentRouteKey(),
+      updatedAt: Date.now()
+    };
+    runtime.view.sectionQuery = next;
+    if (navigated && section) {
+      runtime.view.activeId = section.id;
+      recordNavigationSelection(section, source || "query", {
+        passageId: targetPassageId,
+        pageNumber: targetPageNumber
+      });
+    } else {
+      updateSectionQueryReturnState("query-navigation-failed", { source: source || "" });
+    }
+    return runtime.view.sectionQuery;
+  }
+
+  function carrySavedSectionQueryTarget(previous, next, reason = "rescan") {
+    if (!previous || !previous.hasNavigated) return next;
+    const targetSectionId = String(previous.targetSectionId || previous.sectionId || "");
+    const targetPassageId = String(previous.targetPassageId || previous.passageId || "");
+    const ids = new Set(runtime.model && Array.isArray(runtime.model.sections) ? runtime.model.sections.map((section) => section.id) : []);
+    let strategy = "";
+    if (targetPassageId && targetPassageId === String(next.passageId || "")) {
+      strategy = "passage-id";
+    } else if (targetSectionId && ids.has(targetSectionId)) {
+      strategy = "section-id";
+    } else if (
+      Number(previous.targetPageNumber || 0)
+      && Number(previous.targetPageNumber || 0) === Number(next.pageNumber || 0)
+      && previous.targetFingerprint
+      && previous.targetFingerprint === buildSectionQueryTargetFingerprint(next, runtime.model && runtime.model.sections.find((section) => section.id === next.sectionId))
+    ) {
+      strategy = "page-fingerprint";
+    }
+    if (!strategy) {
+      emitDebug("section-query:saved-target-invalidated", {
+        reason,
+        sectionId: targetSectionId,
+        passageId: targetPassageId,
+        surface: previous.targetSurface || previous.surface || "pdf",
+        pageNumber: Number(previous.targetPageNumber || previous.pageNumber) || 0,
+        exactIssue: "The saved PDF FPA target could not be reconciled after the PDF map changed."
+      });
+      return next;
+    }
+    const carried = {
+      ...next,
+      hasNavigated: true,
+      targetSectionId,
+      targetPassageId,
+      targetSurface: previous.targetSurface || previous.surface || next.surface || "pdf",
+      targetPageNumber: Number(previous.targetPageNumber || previous.pageNumber) || Number(next.pageNumber) || 0,
+      targetNavigation: previous.targetNavigation || previous.navigation || createEmptyQueryNavigationResult(),
+      targetFingerprint: previous.targetFingerprint || buildSectionQueryTargetFingerprint(next, runtime.model && runtime.model.sections.find((section) => section.id === next.sectionId)),
+      targetRouteKey: previous.targetRouteKey || getPdfDocumentRouteKey()
+    };
+    emitDebug("section-query:saved-target-reconciled", {
+      reason,
+      strategy,
+      sectionId: carried.targetSectionId,
+      passageId: carried.targetPassageId,
+      surface: carried.targetSurface,
+      pageNumber: carried.targetPageNumber,
+      exactIssue: "A saved PDF FPA target survived a same-document map remap."
+    });
+    runtime.view.sectionQuery = carried;
+    updateSectionQueryReturnState("reconciled", { strategy });
+    return runtime.view.sectionQuery;
+  }
+
+  function queryTargetMatchesCurrent(query) {
+    if (!query || !query.hasNavigated) return false;
+    const sectionId = String(query.targetSectionId || query.sectionId || "");
+    const passageId = String(query.targetPassageId || query.passageId || "");
+    const pageNumber = Number(query.targetPageNumber || query.pageNumber) || 0;
+    const history = runtime.navigationHistory || createEmptyNavigationHistory();
+    if (!sectionId || String(history.lastSelectedSectionId || "") !== sectionId) return false;
+    if (passageId && String(history.lastSelectedPassageId || "") !== passageId) return false;
+    if (pageNumber && Number(history.lastSelectedPageNumber || 0) && Number(history.lastSelectedPageNumber || 0) !== pageNumber) return false;
+    return true;
+  }
+
+  function updateSectionQueryReturnState(reason = "state", details = {}) {
+    const query = runtime.view.sectionQuery;
+    if (!query || !query.text || !query.hasNavigated) return false;
+    const sectionId = String(query.targetSectionId || query.sectionId || "");
+    const ids = new Set(runtime.model && Array.isArray(runtime.model.sections) ? runtime.model.sections.map((section) => section.id) : []);
+    if (!sectionId || !ids.has(sectionId)) {
+      runtime.view.sectionQuery = {
+        ...query,
+        hasNavigated: false,
+        isCurrentTarget: false,
+        canReturnToMatch: false
+      };
+      emitDebug("section-query:saved-target-invalidated", {
+        reason,
+        sectionId,
+        passageId: query.targetPassageId || query.passageId || "",
+        surface: query.targetSurface || query.surface || "pdf",
+        pageNumber: Number(query.targetPageNumber || query.pageNumber) || 0,
+        exactIssue: "The saved PDF FPA target section is no longer present."
+      });
+      return false;
+    }
+    const current = queryTargetMatchesCurrent(query);
+    const navigation = query.targetNavigation || query.navigation || {};
+    const canReturn = Boolean(!current && query.canNavigate && navigation.navigated);
+    runtime.view.sectionQuery = {
+      ...query,
+      isCurrentTarget: current,
+      canReturnToMatch: canReturn
+    };
+    if (canReturn) {
+      emitDebug("section-query:return-available", {
+        reason,
+        sectionId,
+        passageId: query.targetPassageId || query.passageId || "",
+        surface: query.targetSurface || query.surface || "pdf",
+        pageNumber: Number(query.targetPageNumber || query.pageNumber) || 0,
+        previousActive: details.previousActive || null,
+        currentActive: {
+          sectionId: runtime.navigationHistory.lastSelectedSectionId || "",
+          passageId: runtime.navigationHistory.lastSelectedPassageId || "",
+          pageNumber: runtime.navigationHistory.lastSelectedPageNumber || 0
+        },
+        exactIssue: "The saved PDF FPA match is navigable and the active target is elsewhere."
+      });
+    }
+    return canReturn;
   }
 
   function ensurePdfQueryModel(reason = "section-query") {
@@ -14261,6 +14443,7 @@
   async function runSectionQuery(query, options = {}) {
     const text = String(query || "").slice(0, 120).trim();
     const requestId = Number(options.requestId) || nextSectionQueryRequestId();
+    const previousQuery = runtime.view.sectionQuery || createEmptySectionQuery();
     if (!text) {
       clearSectionQuery(options.source || "empty-query");
       return runtime.view.sectionQuery;
@@ -14358,6 +14541,9 @@
       navigation: createEmptyQueryNavigationResult(),
       updatedAt: Date.now()
     };
+    if (options.preserveOnly) {
+      carrySavedSectionQueryTarget(previousQuery, runtime.view.sectionQuery, options.source || "preserve");
+    }
     const shouldNavigate = !options.preserveOnly
       && runtime.view.sectionQuery.canNavigate
       && runtime.view.sectionQuery.status !== "weak";
@@ -14374,6 +14560,7 @@
         return runtime.view.sectionQuery;
       }
       runtime.view.sectionQuery.navigation = navigation;
+      applySavedSectionQueryTarget(runtime.view.sectionQuery, runtime.view.sectionQuery, navigation, section, options.source || "query");
       const ok = Boolean(navigation.navigated);
       setActionResult("query", ok, {
         section,
@@ -14435,12 +14622,32 @@
 
   async function navigateCurrentQueryResult(source, target = {}) {
     const query = runtime.view.sectionQuery || createEmptySectionQuery();
-    const selected = target && (target.sectionId || target.passageId)
+    const returnToMatch = Boolean(target && target.returnToMatch);
+    const selected = returnToMatch
+      ? {
+        ...query,
+        sectionId: query.targetSectionId || query.sectionId || "",
+        passageId: query.targetPassageId || query.passageId || "",
+        surface: query.targetSurface || query.surface || "pdf",
+        pageNumber: Number(query.targetPageNumber || query.pageNumber) || 0
+      }
+      : target && (target.sectionId || target.passageId)
       ? resolveQueryAlternative(query, target) || query
       : query;
     if (!selected.sectionId || !runtime.model) return false;
     const section = runtime.model.sections.find((item) => item.id === selected.sectionId) || null;
     const requestId = Number(query.requestId || 0);
+    if (returnToMatch) {
+      emitDebug("section-query:return-requested", {
+        sectionId: selected.sectionId || "",
+        passageId: selected.passageId || "",
+        surface: selected.surface || "pdf",
+        pageNumber: Number(selected.pageNumber) || 0,
+        previousActiveSection: runtime.navigationHistory.lastSelectedSectionId || "",
+        currentActiveSection: runtime.view.activeId || "",
+        exactIssue: "Return to match uses the existing PDF FPA navigation route."
+      });
+    }
     const navigation = await navigatePdfQueryResult(selected, source || "query-confirm");
     if (requestId && runtime.view.sectionQuery && Number(runtime.view.sectionQuery.requestId || 0) !== requestId) {
       emitDebug("section-query:stale-navigation-discarded", {
@@ -14452,12 +14659,18 @@
       return false;
     }
     runtime.view.sectionQuery = {
-      ...runtime.view.sectionQuery,
-      ...selected,
-      navigation,
-      weakRequiresConfirm: false,
-      updatedAt: Date.now()
+      ...applySavedSectionQueryTarget(runtime.view.sectionQuery, selected, navigation, section, source || (returnToMatch ? "query-return" : "query-confirm"))
     };
+    if (returnToMatch) {
+      emitDebug(navigation.navigated ? navigation.exact ? "section-query:return-verified" : "section-query:return-approximate" : "section-query:return-failed", {
+        sectionId: selected.sectionId || "",
+        passageId: selected.passageId || "",
+        surface: selected.surface || "pdf",
+        pageNumber: Number(selected.pageNumber) || 0,
+        navigation,
+        exactIssue: navigation.navigated && navigation.exact ? "none" : navigation.reason || "Return navigation was not exact."
+      });
+    }
     const ok = Boolean(navigation.navigated);
     setActionResult("query", ok, {
       section,
@@ -19274,6 +19487,14 @@
       canNavigate: Boolean(state.canNavigate),
       weakRequiresConfirm: Boolean(state.weakRequiresConfirm),
       canRunBetterOcr: Boolean(state.canRunBetterOcr),
+      hasNavigated: Boolean(state.hasNavigated),
+      isCurrentTarget: Boolean(state.isCurrentTarget),
+      canReturnToMatch: Boolean(state.canReturnToMatch),
+      targetSectionId: String(state.targetSectionId || ""),
+      targetPassageId: String(state.targetPassageId || ""),
+      targetSurface: String(state.targetSurface || ""),
+      targetPageNumber: Number(state.targetPageNumber) || 0,
+      targetNavigation: normalizePublicQueryNavigation(state.targetNavigation),
       navigation: normalizePublicQueryNavigation(state.navigation),
       alternatives: Array.isArray(state.alternatives) ? state.alternatives.slice(0, 2).map(normalizePublicSectionQueryAlternative) : [],
       requestId: Number(state.requestId) || 0,

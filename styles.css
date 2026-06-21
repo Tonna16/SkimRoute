@@ -799,7 +799,9 @@
 
 #pagepilot-root .pp-query-submit,
 #pagepilot-root .pp-query-clear,
-#pagepilot-root .pp-query-go {
+#pagepilot-root .pp-query-go,
+#pagepilot-root .pp-query-return,
+#pagepilot-root .pp-query-better-ocr {
   appearance: none !important;
   align-items: center;
   background: var(--pp-surface) !important;
@@ -821,7 +823,9 @@
 
 #pagepilot-root .pp-query-submit .pp-icon,
 #pagepilot-root .pp-query-clear .pp-icon,
-#pagepilot-root .pp-query-go .pp-icon {
+#pagepilot-root .pp-query-go .pp-icon,
+#pagepilot-root .pp-query-return .pp-icon,
+#pagepilot-root .pp-query-better-ocr .pp-icon {
   color: currentColor !important;
   fill: none !important;
   stroke: currentColor !important;
@@ -830,6 +834,8 @@
 #pagepilot-root .pp-query-submit:hover,
 #pagepilot-root .pp-query-clear:hover,
 #pagepilot-root .pp-query-go:hover,
+#pagepilot-root .pp-query-return:hover,
+#pagepilot-root .pp-query-better-ocr:hover,
 #pagepilot-root .pp-query-alt:hover {
   background: var(--pp-surface-strong);
   border-color: var(--pp-border);
@@ -838,6 +844,8 @@
 #pagepilot-root .pp-query-submit:active,
 #pagepilot-root .pp-query-clear:active,
 #pagepilot-root .pp-query-go:active,
+#pagepilot-root .pp-query-return:active,
+#pagepilot-root .pp-query-better-ocr:active,
 #pagepilot-root .pp-query-alt:active {
   transform: translateY(1px);
 }
@@ -845,6 +853,8 @@
 #pagepilot-root .pp-query-submit:focus-visible,
 #pagepilot-root .pp-query-clear:focus-visible,
 #pagepilot-root .pp-query-go:focus-visible,
+#pagepilot-root .pp-query-return:focus-visible,
+#pagepilot-root .pp-query-better-ocr:focus-visible,
 #pagepilot-root .pp-query-alt:focus-visible {
   border-color: rgba(37, 99, 235, 0.55);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
@@ -853,17 +863,30 @@
 
 #pagepilot-root .pp-query-submit:disabled,
 #pagepilot-root .pp-query-clear:disabled,
-#pagepilot-root .pp-query-go:disabled {
+#pagepilot-root .pp-query-go:disabled,
+#pagepilot-root .pp-query-return:disabled,
+#pagepilot-root .pp-query-better-ocr:disabled {
   color: var(--pp-muted) !important;
   cursor: not-allowed;
   opacity: 0.68 !important;
   -webkit-text-fill-color: var(--pp-muted) !important;
 }
 
-#pagepilot-root .pp-query-go {
+#pagepilot-root .pp-query-go,
+#pagepilot-root .pp-query-return,
+#pagepilot-root .pp-query-better-ocr {
   justify-self: start;
   min-height: 34px;
   padding: 7px 10px;
+}
+
+#pagepilot-root .pp-query-return,
+#pagepilot-root .pp-query-better-ocr {
+  background: var(--pp-surface-strong) !important;
+  border-color: var(--pp-border) !important;
+  color: var(--pp-ink) !important;
+  width: 100%;
+  -webkit-text-fill-color: var(--pp-ink) !important;
 }
 
 #pagepilot-root .pp-query-result {

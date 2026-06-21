@@ -162,9 +162,19 @@
           callbacks.onNavigateQueryResult && callbacks.onNavigateQueryResult();
           return;
         }
+        const queryReturn = event.target.closest(".pp-query-return");
+        if (queryReturn) {
+          event.preventDefault();
+          if (queryReturn.disabled) return;
+          callbacks.onNavigateQueryResult && callbacks.onNavigateQueryResult({ returnToMatch: true });
+          return;
+        }
         const queryBetterOcr = event.target.closest(".pp-query-better-ocr");
         if (queryBetterOcr) {
           event.preventDefault();
+          if (queryBetterOcr.disabled) return;
+          queryBetterOcr.disabled = true;
+          queryBetterOcr.textContent = "Running Better OCR...";
           callbacks.onRunQueryBetterOcr && callbacks.onRunQueryBetterOcr();
           return;
         }
@@ -219,7 +229,7 @@
           return;
         }
 
-        const current = event.target.closest && event.target.closest(".pp-section-item, .pp-collapse-toggle, .pp-start-card, .pp-skip, .pp-next, .pp-pdf-ocr, .pp-pdf-ocr-cancel, .pp-query-input, .pp-query-submit, .pp-query-clear, .pp-query-go, .pp-query-better-ocr, .pp-query-alt");
+        const current = event.target.closest && event.target.closest(".pp-section-item, .pp-collapse-toggle, .pp-start-card, .pp-skip, .pp-next, .pp-pdf-ocr, .pp-pdf-ocr-cancel, .pp-query-input, .pp-query-submit, .pp-query-clear, .pp-query-go, .pp-query-return, .pp-query-better-ocr, .pp-query-alt");
         if (!current) return;
         const focusables = getFocusableItems();
         const index = focusables.indexOf(current);
@@ -285,7 +295,7 @@
     }
 
     function getFocusableItems() {
-      return Array.from(root.querySelectorAll(".pp-start-card:not(:disabled), .pp-skip:not(:disabled), .pp-next:not(:disabled), .pp-pdf-ocr:not(:disabled), .pp-pdf-ocr-cancel:not(:disabled), .pp-query-input, .pp-query-submit:not(:disabled), .pp-query-clear:not(:disabled), .pp-query-go:not(:disabled), .pp-query-better-ocr:not(:disabled), .pp-query-alt:not(:disabled), .pp-collapse-toggle, .pp-section-item"))
+      return Array.from(root.querySelectorAll(".pp-start-card:not(:disabled), .pp-skip:not(:disabled), .pp-next:not(:disabled), .pp-pdf-ocr:not(:disabled), .pp-pdf-ocr-cancel:not(:disabled), .pp-query-input, .pp-query-submit:not(:disabled), .pp-query-clear:not(:disabled), .pp-query-go:not(:disabled), .pp-query-return:not(:disabled), .pp-query-better-ocr:not(:disabled), .pp-query-alt:not(:disabled), .pp-collapse-toggle, .pp-section-item"))
         .filter((element) => !element.closest("[hidden]") && element.offsetParent !== null);
     }
 
@@ -332,6 +342,7 @@
       const clearButton = panel.querySelector(".pp-query-clear");
       const submitButton = panel.querySelector(".pp-query-submit");
       const goButton = panel.querySelector(".pp-query-go");
+      const returnButton = panel.querySelector(".pp-query-return");
       const waiting = query.status === "waiting";
       const disabled = Boolean(!waiting && (state.loading || !state.sectionCount));
       panel.hidden = Boolean(state.quietMode && !query.text);
@@ -343,8 +354,15 @@
       clearButton.disabled = !query.text && !query.status || query.status === "idle";
       const hasResult = Boolean(query && query.status && query.status !== "idle");
       result.hidden = !hasResult;
-      goButton.hidden = !(query.weakRequiresConfirm && query.canNavigate && query.sectionId);
+      const showGo = Boolean(query.weakRequiresConfirm && query.canNavigate && query.sectionId && !query.hasNavigated);
+      goButton.hidden = !showGo;
       goButton.disabled = !query.weakRequiresConfirm || !query.canNavigate;
+      if (returnButton) {
+        const showReturn = Boolean(!query.weakRequiresConfirm && query.hasNavigated && query.canNavigate && (query.canReturnToMatch || query.isCurrentTarget));
+        returnButton.hidden = !showReturn;
+        returnButton.disabled = Boolean(showReturn && query.isCurrentTarget) || !query.canReturnToMatch;
+        returnButton.textContent = query.isCurrentTarget ? "At match" : "Return to match";
+      }
       if (!hasResult) {
         result.innerHTML = "";
         return;
@@ -354,10 +372,14 @@
         return;
       }
       if (query.status === "waiting" || query.status === "error") {
+        const betterOcrRunning = query.status === "waiting" && /Better OCR/i.test(String(query.reason || ""));
+        const betterOcrButton = query.canRunBetterOcr || betterOcrRunning
+          ? `<button class="pp-query-better-ocr" type="button"${betterOcrRunning ? " disabled" : ""}>${betterOcrRunning ? "Running Better OCR..." : "Search again with Better OCR"}</button>`
+          : "";
         result.innerHTML = `
           <strong>${escape(query.status === "waiting" ? "Waiting for OCR" : "Search issue")}</strong>
           <p>${escape(query.reason || (query.status === "waiting" ? "Waiting for OCR to finish..." : "SkimRoute could not search this page."))}</p>
-          ${query.canRunBetterOcr ? `<button class="pp-query-better-ocr" type="button">Search again with Better OCR</button>` : ""}
+          ${betterOcrButton}
         `;
         return;
       }
@@ -538,6 +560,7 @@
               </div>
               <div class="pp-query-result" role="status" aria-live="polite" hidden></div>
               <button class="pp-query-go" type="button" hidden>Go anyway</button>
+              <button class="pp-query-return" type="button" hidden>Return to match</button>
             </div>
           </section>
 

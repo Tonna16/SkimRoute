@@ -254,6 +254,55 @@
         line-height: 1.25;
       }
 
+      .query-better-ocr,
+      .query-return {
+        appearance: none;
+        background: #eef4ff;
+        border: 1px solid rgba(37, 99, 235, 0.26);
+        border-radius: 8px;
+        color: #1e3a8a;
+        cursor: pointer;
+        display: flex;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 760;
+        justify-content: center;
+        line-height: 1.25;
+        min-height: 36px;
+        opacity: 1;
+        padding: 8px 10px;
+        width: 100%;
+        -webkit-text-fill-color: #1e3a8a;
+      }
+
+      .query-better-ocr:hover:not(:disabled),
+      .query-return:hover:not(:disabled) {
+        background: #dbeafe;
+        border-color: rgba(37, 99, 235, 0.42);
+      }
+
+      .query-better-ocr:active:not(:disabled),
+      .query-return:active:not(:disabled) {
+        background: #bfdbfe;
+        transform: translateY(1px);
+      }
+
+      .query-better-ocr:focus-visible,
+      .query-return:focus-visible {
+        outline: 3px solid rgba(37, 99, 235, 0.36);
+        outline-offset: 2px;
+      }
+
+      .query-better-ocr:disabled,
+      .query-return:disabled {
+        background: #f1f5f9;
+        border-color: rgba(15, 23, 42, 0.1);
+        color: #64748b;
+        cursor: not-allowed;
+        opacity: 0.78;
+        -webkit-text-fill-color: #64748b;
+      }
+
       .secondary-actions {
         display: grid;
         gap: 8px;
@@ -479,6 +528,28 @@
           color: #cbd5e1;
         }
 
+        .query-better-ocr,
+        .query-return {
+          background: rgba(96, 165, 250, 0.18);
+          border-color: rgba(147, 197, 253, 0.42);
+          color: #eff6ff;
+          -webkit-text-fill-color: #eff6ff;
+        }
+
+        .query-better-ocr:hover:not(:disabled),
+        .query-return:hover:not(:disabled) {
+          background: rgba(96, 165, 250, 0.28);
+          border-color: rgba(191, 219, 254, 0.52);
+        }
+
+        .query-better-ocr:disabled,
+        .query-return:disabled {
+          background: rgba(148, 163, 184, 0.16);
+          border-color: rgba(203, 213, 225, 0.24);
+          color: #cbd5e1;
+          -webkit-text-fill-color: #cbd5e1;
+        }
+
         button:disabled {
           color: #cbd5e1;
           opacity: 0.72;
@@ -574,6 +645,7 @@
           </div>
           <div class="query-result" id="sectionQueryResult" role="status" aria-live="polite" hidden></div>
           <button class="secondary" id="sectionQueryGo" type="button" hidden>Go anyway</button>
+          <button class="query-return" id="sectionQueryReturn" type="button" hidden>Return to match</button>
         </form>
 
         <div class="actions">

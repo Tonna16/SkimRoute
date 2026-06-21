@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SkimRoute",
   "short_name": "SkimRoute",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Navigate long web pages, AI chats, and PDFs. SkimRoute finds the useful part and stays out of the way.",
   "permissions": [
     "activeTab",

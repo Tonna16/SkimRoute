@@ -86,9 +86,22 @@ test("local section query navigates mapped sections and Next uses progression", 
   });
   expect(["strong", "possible"]).toContain(queryStats.sectionQuery.status);
   expect(queryStats.sectionQuery.title).toMatch(/Main claim/i);
+  expect(queryStats.sectionQuery.hasNavigated).toBeTruthy();
+  expect(queryStats.sectionQuery.isCurrentTarget).toBeTruthy();
   await expect(page.locator(".pagepilot-answer-target")).toHaveCount(1);
   const queryNetwork = requestedUrls.slice(networkBeforeQuery).filter((url) => !url.startsWith("chrome-extension://"));
   expect(queryNetwork).toEqual([]);
+
+  const returnSource = queryStats.sectionQuery;
+  const away = await messageActiveTab({ type: "PAGEPILOT_NEXT_IMPORTANT" });
+  expect(away.lastActionOk).toBeTruthy();
+  expect(away.sectionQuery.canReturnToMatch).toBeTruthy();
+  const returned = await messageActiveTab({ type: "PAGEPILOT_NAVIGATE_QUERY_RESULT", returnToMatch: true });
+  expect(returned.sectionQuery.targetSectionId).toBe(returnSource.sectionId);
+  expect(returned.sectionQuery.isCurrentTarget).toBeTruthy();
+  expect(returned.sectionQuery.canReturnToMatch).toBeFalsy();
+  expect(returned.sectionQuery.navigation.verified).toBeTruthy();
+  await expect(page.locator(".pagepilot-answer-target")).toContainText(/Main claim/i);
 
   const noMatch = await messageActiveTab({
     type: "PAGEPILOT_QUERY_SECTION",
@@ -153,6 +166,15 @@ test("chat query selects and highlights the matched live passage", async () => {
     query: "handleQueryAction function code"
   });
   expect(codeStats.sectionQuery.passageId).toContain(":chat:");
+  await expect(page.locator(".pagepilot-answer-target")).toContainText(/handleQueryAction/i);
+
+  await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+  const away = await messageActiveTab({ type: "PAGEPILOT_STATUS" });
+  expect(away.sectionQuery.canReturnToMatch).toBeTruthy();
+  const returned = await messageActiveTab({ type: "PAGEPILOT_NAVIGATE_QUERY_RESULT", returnToMatch: true });
+  expect(returned.sectionQuery.isCurrentTarget).toBeTruthy();
+  expect(returned.sectionQuery.targetPassageId).toBe(codeStats.sectionQuery.passageId);
+  expect(returned.sectionQuery.navigation.exact).toBeTruthy();
   await expect(page.locator(".pagepilot-answer-target")).toContainText(/handleQueryAction/i);
 });
 
@@ -368,10 +390,30 @@ test("weak Fast OCR no-match offers Better OCR and reruns the preserved query", 
   expect(weakQuery.pdfOcrCanRunBetter).toBeTruthy();
   expect(weakQuery.pdfOcrRecommendedMode).toBe("better");
 
+  const targetTabId = await getTabIdForUrl(page.url());
+  const popup = await context.newPage();
+  await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${targetTabId}`);
+  await expect(popup.locator(".query-better-ocr")).toBeVisible();
+  const popupBetter = await popup.locator(".query-better-ocr").evaluate(readButtonVisual);
+  expect(popupBetter.text).toContain("Search again with Better OCR");
+  expect(popupBetter.color).not.toBe("rgba(0, 0, 0, 0)");
+  expect(popupBetter.fill).not.toBe("rgba(0, 0, 0, 0)");
+  expect(popupBetter.background).not.toBe("rgba(0, 0, 0, 0)");
+  expect(popupBetter.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+  await popup.close();
+
   await messageActiveTab({ type: "PAGEPILOT_TOGGLE", open: true });
   await expect(page.locator("#pagepilot-root .pp-query-better-ocr")).toBeVisible();
+  const sidebarBetter = await page.locator("#pagepilot-root .pp-query-better-ocr").evaluate(readButtonVisual);
+  expect(sidebarBetter.text).toContain("Search again with Better OCR");
+  expect(sidebarBetter.color).not.toBe("rgba(0, 0, 0, 0)");
+  expect(sidebarBetter.fill).not.toBe("rgba(0, 0, 0, 0)");
+  expect(sidebarBetter.background).not.toBe("rgba(0, 0, 0, 0)");
+  expect(sidebarBetter.borderColor).not.toBe("rgba(0, 0, 0, 0)");
   await installOcrTestResultForActiveTab({ entry: makeBetterScholarshipOcrEntry({ delayMs: 500 }), delayMs: 500 });
   await page.locator("#pagepilot-root .pp-query-better-ocr").click();
+  await expect(page.locator("#pagepilot-root .pp-query-better-ocr")).toBeDisabled();
+  await expect(page.locator("#pagepilot-root .pp-query-better-ocr")).toContainText(/Running Better OCR/i);
 
   await expect.poll(async () => {
     const latest = await messageActiveTab({ type: "PAGEPILOT_STATUS" });
@@ -481,11 +523,14 @@ test("sidebar query card remains readable under hostile page CSS", async () => {
   await page.locator("#pagepilot-root .pp-query-input").fill("Main claim");
   await page.keyboard.press("Enter");
   await expect(page.locator("#pagepilot-root .pp-query-result")).toBeVisible();
+  await messageActiveTab({ type: "PAGEPILOT_NEXT_IMPORTANT" });
+  await expect(page.locator("#pagepilot-root .pp-query-return")).toBeVisible();
   const visual = await page.evaluate(() => {
     const root = document.querySelector("#pagepilot-root");
     const query = root && root.querySelector(".pp-query");
     const input = root && root.querySelector(".pp-query-input");
     const button = root && root.querySelector(".pp-query-submit");
+    const returnButton = root && root.querySelector(".pp-query-return");
     const result = root && root.querySelector(".pp-query-result");
     const sidebar = root && root.querySelector(".pp-sidebar");
     const read = (element) => {
@@ -504,15 +549,16 @@ test("sidebar query card remains readable under hostile page CSS", async () => {
       query: read(query),
       input: read(input),
       button: read(button),
+      returnButton: read(returnButton),
       result: read(result),
       sidebar: read(sidebar)
     };
   });
-  for (const key of ["query", "input", "button", "result"]) {
+  for (const key of ["query", "input", "button", "returnButton", "result"]) {
     expect(visual[key].fill).not.toBe("rgba(0, 0, 0, 0)");
     expect(visual[key].color).not.toBe("rgba(0, 0, 0, 0)");
     expect(visual[key].background).not.toBe("rgba(0, 0, 0, 0)");
-    expect(Number(visual[key].opacity)).toBeGreaterThan(0.9);
+    expect(Number(visual[key].opacity)).toBeGreaterThan(key === "returnButton" ? 0.6 : 0.9);
     expect(parseFloat(visual[key].fontSize)).toBeGreaterThanOrEqual(12);
   }
   expect(visual.query.rect.left).toBeGreaterThanOrEqual(visual.sidebar.rect.left - 1);
@@ -638,6 +684,19 @@ async function queryHighlightIntersectsPdfPage(pageNumber) {
       return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
     });
   }, pageNumber);
+}
+
+function readButtonVisual(element) {
+  const style = getComputedStyle(element);
+  return {
+    text: element.textContent || "",
+    color: style.color || "",
+    fill: style.webkitTextFillColor || "",
+    background: style.backgroundColor || "",
+    borderColor: style.borderColor || "",
+    cursor: style.cursor || "",
+    opacity: style.opacity || ""
+  };
 }
 
 async function installOcrTestResultForActiveTab(options = {}) {

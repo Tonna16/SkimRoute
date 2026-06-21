@@ -24,6 +24,7 @@ const buttons = {
   sectionQuerySubmit: document.getElementById("sectionQuerySubmit"),
   sectionQueryClear: document.getElementById("sectionQueryClear"),
   sectionQueryGo: document.getElementById("sectionQueryGo"),
+  sectionQueryReturn: document.getElementById("sectionQueryReturn"),
   openExtensionSettings: document.getElementById("openExtensionSettings"),
   checkFileAccess: document.getElementById("checkFileAccess")
 };
@@ -116,11 +117,23 @@ if (buttons.sectionQueryGo) {
   });
 }
 
+if (buttons.sectionQueryReturn) {
+  buttons.sectionQueryReturn.addEventListener("click", async () => {
+    if (buttons.sectionQueryReturn.disabled) return;
+    const tab = await getActiveTab();
+    if (!tab) return;
+    renderStats(await ensureAndSend(tab.id, { type: "PAGEPILOT_NAVIGATE_QUERY_RESULT", returnToMatch: true }));
+  });
+}
+
 if (els.sectionQueryResult) {
   els.sectionQueryResult.addEventListener("click", async (event) => {
     const betterOcr = event.target.closest && event.target.closest(".query-better-ocr");
     if (betterOcr) {
       event.preventDefault();
+      if (betterOcr.disabled) return;
+      betterOcr.disabled = true;
+      betterOcr.textContent = "Running Better OCR...";
       const tab = await getActiveTab();
       if (!tab) return;
       renderStats(await ensureAndSend(tab.id, { type: "PAGEPILOT_RUN_PDF_OCR", mode: "better" }));
@@ -610,8 +623,15 @@ function renderSectionQuery(sectionQuery, state = {}) {
   if (buttons.sectionQuerySubmit) buttons.sectionQuerySubmit.disabled = disabled;
   if (buttons.sectionQueryClear) buttons.sectionQueryClear.disabled = !query.text && (!query.status || query.status === "idle");
   if (buttons.sectionQueryGo) {
-    buttons.sectionQueryGo.hidden = !(query.weakRequiresConfirm && query.canNavigate && query.sectionId);
+    const showGo = Boolean(query.weakRequiresConfirm && query.canNavigate && query.sectionId && !query.hasNavigated);
+    buttons.sectionQueryGo.hidden = !showGo;
     buttons.sectionQueryGo.disabled = !query.weakRequiresConfirm || !query.canNavigate;
+  }
+  if (buttons.sectionQueryReturn) {
+    const showReturn = Boolean(!query.weakRequiresConfirm && query.hasNavigated && query.canNavigate && (query.canReturnToMatch || query.isCurrentTarget));
+    buttons.sectionQueryReturn.hidden = !showReturn;
+    buttons.sectionQueryReturn.disabled = Boolean(showReturn && query.isCurrentTarget) || !query.canReturnToMatch;
+    buttons.sectionQueryReturn.textContent = query.isCurrentTarget ? "At match" : "Return to match";
   }
   if (!els.sectionQueryResult) return;
   const hasResult = Boolean(query.status && query.status !== "idle");
@@ -625,10 +645,14 @@ function renderSectionQuery(sectionQuery, state = {}) {
     return;
   }
   if (query.status === "waiting" || query.status === "error") {
+    const betterOcrRunning = query.status === "waiting" && /Better OCR/i.test(String(query.reason || ""));
+    const betterOcrButton = query.canRunBetterOcr || betterOcrRunning
+      ? `<button class="query-better-ocr" type="button"${betterOcrRunning ? " disabled" : ""}>${betterOcrRunning ? "Running Better OCR..." : "Search again with Better OCR"}</button>`
+      : "";
     els.sectionQueryResult.innerHTML = `
       <strong>${query.status === "waiting" ? "Waiting for OCR" : "Search issue"}</strong>
       <p>${escapeHtml(query.reason || (query.status === "waiting" ? "Waiting for OCR to finish..." : "SkimRoute could not search this page."))}</p>
-      ${query.canRunBetterOcr ? `<button class="query-better-ocr" type="button">Search again with Better OCR</button>` : ""}
+      ${betterOcrButton}
     `;
     return;
   }
