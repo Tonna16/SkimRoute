@@ -117,11 +117,12 @@
       setText(".pp-pdf-ocr span", pdfOcrButtonLabel(profile, ocrTerminal));
       ocrButton.title = pdfOcrButtonTitle(profile, ocrTerminal);
       setText(".pp-pdf-ocr-cancel span", "Cancel OCR");
-      setText(".pp-next-label", loading ? "Scanning" : canNext ? "Next important" : "No next jump");
+      setText(".pp-next-label", loading ? "Scanning" : canNext ? model.nextReason || "Next important" : "No next jump");
 
       root.querySelector(".pp-overview").classList.toggle("pp-low-signal", loading || quietMode || !model.hasStrongTarget);
       root.querySelector(".pp-important-panel").hidden = loading || quietMode || !importantCount;
       root.querySelector(".pp-jump-panel").hidden = quietMode || (!loading && !sectionCount);
+      renderSectionQuery(viewState.sectionQuery, { loading, quietMode, sectionCount });
       renderImportantList(model);
       renderJumpList(model, viewState);
       updateActiveClasses(viewState.activeId);
@@ -142,6 +143,40 @@
       root.querySelector(".pp-tip-dismiss").addEventListener("click", () => callbacks.onDismissTip && callbacks.onDismissTip());
 
       root.addEventListener("click", (event) => {
+        const queryClear = event.target.closest(".pp-query-clear");
+        if (queryClear) {
+          event.preventDefault();
+          callbacks.onClearQuery && callbacks.onClearQuery();
+          return;
+        }
+        const querySubmit = event.target.closest(".pp-query-submit");
+        if (querySubmit) {
+          event.preventDefault();
+          const input = root.querySelector(".pp-query-input");
+          callbacks.onQuery && callbacks.onQuery(input && input.value || "");
+          return;
+        }
+        const queryGo = event.target.closest(".pp-query-go");
+        if (queryGo) {
+          event.preventDefault();
+          callbacks.onNavigateQueryResult && callbacks.onNavigateQueryResult();
+          return;
+        }
+        const queryBetterOcr = event.target.closest(".pp-query-better-ocr");
+        if (queryBetterOcr) {
+          event.preventDefault();
+          callbacks.onRunQueryBetterOcr && callbacks.onRunQueryBetterOcr();
+          return;
+        }
+        const queryAlt = event.target.closest(".pp-query-alt");
+        if (queryAlt) {
+          event.preventDefault();
+          callbacks.onNavigateQueryResult && callbacks.onNavigateQueryResult({
+            sectionId: queryAlt.dataset.sectionId || "",
+            passageId: queryAlt.dataset.passageId || ""
+          });
+          return;
+        }
         const toggle = event.target.closest("[data-toggle-section]");
         if (toggle) {
           event.preventDefault();
@@ -159,6 +194,21 @@
       });
 
       root.addEventListener("keydown", (event) => {
+        const queryInput = event.target.closest && event.target.closest(".pp-query-input");
+        if (queryInput) {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            callbacks.onQuery && callbacks.onQuery(queryInput.value || "");
+            return;
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            queryInput.value = "";
+            callbacks.onClearQuery && callbacks.onClearQuery();
+            return;
+          }
+          return;
+        }
         if (event.key === "Escape") {
           event.preventDefault();
           callbacks.onMinimize && callbacks.onMinimize();
@@ -169,7 +219,7 @@
           return;
         }
 
-        const current = event.target.closest && event.target.closest(".pp-section-item, .pp-collapse-toggle, .pp-start-card, .pp-skip, .pp-next, .pp-pdf-ocr, .pp-pdf-ocr-cancel");
+        const current = event.target.closest && event.target.closest(".pp-section-item, .pp-collapse-toggle, .pp-start-card, .pp-skip, .pp-next, .pp-pdf-ocr, .pp-pdf-ocr-cancel, .pp-query-input, .pp-query-submit, .pp-query-clear, .pp-query-go, .pp-query-better-ocr, .pp-query-alt");
         if (!current) return;
         const focusables = getFocusableItems();
         const index = focusables.indexOf(current);
@@ -235,7 +285,7 @@
     }
 
     function getFocusableItems() {
-      return Array.from(root.querySelectorAll(".pp-start-card:not(:disabled), .pp-skip:not(:disabled), .pp-next:not(:disabled), .pp-pdf-ocr:not(:disabled), .pp-pdf-ocr-cancel:not(:disabled), .pp-collapse-toggle, .pp-section-item"))
+      return Array.from(root.querySelectorAll(".pp-start-card:not(:disabled), .pp-skip:not(:disabled), .pp-next:not(:disabled), .pp-pdf-ocr:not(:disabled), .pp-pdf-ocr-cancel:not(:disabled), .pp-query-input, .pp-query-submit:not(:disabled), .pp-query-clear:not(:disabled), .pp-query-go:not(:disabled), .pp-query-better-ocr:not(:disabled), .pp-query-alt:not(:disabled), .pp-collapse-toggle, .pp-section-item"))
         .filter((element) => !element.closest("[hidden]") && element.offsetParent !== null);
     }
 
@@ -271,6 +321,64 @@
       list.innerHTML = navSections
         .map((section) => sectionButtonTemplate(section, { showReason: false, showTree: true }))
         .join("");
+    }
+
+    function renderSectionQuery(sectionQuery, state) {
+      const panel = root.querySelector(".pp-query");
+      if (!panel) return;
+      const query = sectionQuery || {};
+      const input = panel.querySelector(".pp-query-input");
+      const result = panel.querySelector(".pp-query-result");
+      const clearButton = panel.querySelector(".pp-query-clear");
+      const submitButton = panel.querySelector(".pp-query-submit");
+      const goButton = panel.querySelector(".pp-query-go");
+      const waiting = query.status === "waiting";
+      const disabled = Boolean(!waiting && (state.loading || !state.sectionCount));
+      panel.hidden = Boolean(state.quietMode && !query.text);
+      input.disabled = disabled;
+      submitButton.disabled = disabled;
+      if (document.activeElement !== input && input.value !== String(query.text || "")) {
+        input.value = String(query.text || "");
+      }
+      clearButton.disabled = !query.text && !query.status || query.status === "idle";
+      const hasResult = Boolean(query && query.status && query.status !== "idle");
+      result.hidden = !hasResult;
+      goButton.hidden = !(query.weakRequiresConfirm && query.canNavigate && query.sectionId);
+      goButton.disabled = !query.weakRequiresConfirm || !query.canNavigate;
+      if (!hasResult) {
+        result.innerHTML = "";
+        return;
+      }
+      if (query.status === "none") {
+        result.innerHTML = `<strong>No strong section match found on this page.</strong>`;
+        return;
+      }
+      if (query.status === "waiting" || query.status === "error") {
+        result.innerHTML = `
+          <strong>${escape(query.status === "waiting" ? "Waiting for OCR" : "Search issue")}</strong>
+          <p>${escape(query.reason || (query.status === "waiting" ? "Waiting for OCR to finish..." : "SkimRoute could not search this page."))}</p>
+          ${query.canRunBetterOcr ? `<button class="pp-query-better-ocr" type="button">Search again with Better OCR</button>` : ""}
+        `;
+        return;
+      }
+      const role = query.roleLabel ? `<span>${escape(query.roleLabel)}</span>` : "";
+      const confidence = query.confidenceLabel ? `<span>${escape(query.confidenceLabel)}</span>` : "";
+      const navigation = query.navigation && query.navigation.reason ? `<em>${escape(query.navigation.reason)}</em>` : `<em>${escape(query.reason || "")}</em>`;
+      const alternatives = Array.isArray(query.alternatives) && query.alternatives.length
+        ? `<div class="pp-query-alternatives">${query.alternatives.map((item) => `
+          <button class="pp-query-alt" type="button" data-section-id="${escape(item.sectionId || "")}" data-passage-id="${escape(item.passageId || "")}">
+            <span>${escape(item.title || "Matched section")}</span>
+            <small>${escape(item.snippet || item.reason || "")}</small>
+          </button>
+        `).join("")}</div>`
+        : "";
+      result.innerHTML = `
+        <strong>${escape(query.title || "Matched section")}</strong>
+        <div class="pp-query-meta">${role}${confidence}</div>
+        <p>${escape(query.snippet || query.reason || "")}</p>
+        ${navigation}
+        ${alternatives}
+      `;
     }
 
     function visibleSections(sections) {
@@ -419,6 +527,17 @@
                 ${icon("x")}
                 <span>Cancel OCR</span>
               </button>
+            </div>
+
+            <div class="pp-query">
+              <label class="pp-query-label" for="pagepilot-section-query">Find on this page</label>
+              <div class="pp-query-row">
+                <input class="pp-query-input" id="pagepilot-section-query" type="search" placeholder="Find the part about..." autocomplete="off" spellcheck="false">
+                <button class="pp-query-submit" type="button" title="Find section" aria-label="Find section">${icon("search")}</button>
+                <button class="pp-query-clear" type="button" title="Clear search" aria-label="Clear search">${icon("x")}</button>
+              </div>
+              <div class="pp-query-result" role="status" aria-live="polite" hidden></div>
+              <button class="pp-query-go" type="button" hidden>Go anyway</button>
             </div>
           </section>
 
@@ -828,6 +947,7 @@
       arrowDown: "<path d='M12 5v14'/><path d='m19 12-7 7-7-7'/>",
       chevronRight: "<path d='m9 18 6-6-6-6'/>",
       chevronDown: "<path d='m6 9 6 6 6-6'/>",
+      search: "<circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/>",
       copy: "<rect x='9' y='9' width='13' height='13' rx='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/>",
       x: "<path d='M18 6 6 18'/><path d='m6 6 12 12'/>"
     };

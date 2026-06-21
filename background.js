@@ -130,8 +130,10 @@ function cachePdfStatus(tabId, routeKey, url, payload, source) {
 
 function getCachedPdfStatus(tabId, routeKey, url) {
   if (!Number.isFinite(Number(tabId))) return null;
+  const requestedUrl = normalizeCacheUrl(url);
+  const requestedRouteKey = String(routeKey || "");
   const keys = [
-    normalizeStatusCacheKey(tabId, routeKey, url),
+    normalizeStatusCacheKey(tabId, requestedRouteKey, url),
     normalizeStatusCacheKey(tabId, "", "")
   ];
   for (const key of keys) {
@@ -141,9 +143,16 @@ function getCachedPdfStatus(tabId, routeKey, url) {
       pdfStatusCache.delete(key);
       continue;
     }
+    const entryUrl = normalizeCacheUrl(entry.url);
+    if (requestedUrl && entryUrl && requestedUrl !== entryUrl) continue;
+    if (requestedRouteKey && entry.routeKey && requestedRouteKey !== String(entry.routeKey)) continue;
     if (isReadyPdfStatus(entry)) return entry;
   }
   return null;
+}
+
+function normalizeCacheUrl(url) {
+  return String(url || "").replace(/#.*$/, "");
 }
 
 log("service worker loaded", { version: getVersion() });
@@ -235,6 +244,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "PAGEPILOT_FILE_ACCESS_STATUS") {
     try {
+      if (globalThis.SKIMROUTE_DEV_MODE === true && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get("pagepilot.test.fileAccessAllowed", (result) => {
+          const override = result && result["pagepilot.test.fileAccessAllowed"];
+          if (typeof override === "boolean") {
+            if (typeof sendResponse === "function") sendResponse({ ok: true, allowed: override, testOverride: true });
+            return;
+          }
+          if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === "function") {
+            chrome.extension.isAllowedFileSchemeAccess((allowed) => {
+              if (typeof sendResponse === "function") sendResponse({ ok: true, allowed: Boolean(allowed) });
+            });
+            return;
+          }
+          if (typeof sendResponse === "function") sendResponse({ ok: true, allowed: null });
+        });
+        return true;
+      }
       if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === "function") {
         chrome.extension.isAllowedFileSchemeAccess((allowed) => {
           if (typeof sendResponse === "function") sendResponse({ ok: true, allowed: Boolean(allowed) });

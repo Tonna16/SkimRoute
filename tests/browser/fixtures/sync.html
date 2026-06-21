@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Popup sidebar sync fixture</title><link rel="stylesheet" href="./fixture.css"></head>
+  <body>
+    <main>
+      <article>
+        <h1>Popup and sidebar synchronization</h1>
+        <h2>Useful synchronization result</h2>
+        <p>The useful synchronization result explains that popup actions, sidebar actions, and status polling should all read the same current model, best section, Next target, and action result. This section contains enough detail to be the best target.</p>
+        <p>The important behavior is that opening the sidebar updates the same state the popup reads, repeated status requests do not rebuild optional runtimes, and the visible title remains stable while the page is already scanned. A regression would show the popup reading an empty model, a stale section title, or a different readiness state from the sidebar.</p>
+        <p>This fixture intentionally repeats the synchronization result with concrete language about popup status, sidebar state, current model identity, best section, action result, and local-only page scanning so the section is long enough to be a confident target.</p>
+        <h2>Secondary detail</h2>
+        <p>Secondary detail confirms that status should stay stable after repeated requests.</p>
+      </article>
+    </main>
+  </body>
+</html>

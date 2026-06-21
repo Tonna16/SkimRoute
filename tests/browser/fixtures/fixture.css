@@ -1,0 +1,65 @@
+html {
+  color: #172033;
+  font-family: Arial, sans-serif;
+  line-height: 1.55;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 820px;
+  padding: 96px 24px 800px;
+}
+
+article,
+.docs {
+  display: grid;
+  gap: 22px;
+}
+
+section,
+[data-testid='conversation-turn'],
+model-response,
+user-query {
+  display: block;
+  margin: 48px 0;
+}
+
+p,
+li {
+  font-size: 18px;
+}
+
+header {
+  background: white;
+  border-bottom: 1px solid #d9e2ef;
+  left: 0;
+  padding: 16px 24px;
+  position: sticky;
+  right: 0;
+  top: 0;
+  z-index: 2;
+}
+
+.author-bio,
+.related,
+.dashboard {
+  background: #f1f5f9;
+  border: 1px solid #d8e1eb;
+  padding: 18px;
+}
+
+.spacer {
+  min-height: 900px;
+}
+
+.page {
+  background: #fff;
+  border: 1px solid #ccd6e0;
+  margin: 32px auto;
+  min-height: 720px;
+  padding: 72px;
+}

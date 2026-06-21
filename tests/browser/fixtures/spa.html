@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>SPA route fixture</title><link rel="stylesheet" href="./fixture.css"></head>
+  <body>
+    <main id="app">
+      <article>
+        <h1>Initial short view</h1>
+        <p>Short dashboard-like view with little to map.</p>
+      </article>
+    </main>
+    <button id="route">Route</button>
+    <script>
+      document.getElementById("route").addEventListener("click", () => {
+        history.pushState({}, "", "/spa/long-article");
+        document.getElementById("app").innerHTML = `
+          <article>
+            <h1>SPA long article</h1>
+            <h2>Summary</h2>
+            <p>The route changed to a long article with a summary, main claim, useful evidence, and conclusion. SkimRoute should rescan after the SPA route change and expose a useful jump target.</p>
+            <h2>Main claim</h2>
+            <p>The main claim says SPA route changes must refresh the model without reloading the page, preserving popup and sidebar synchronization while updating the best section.</p>
+          </article>`;
+      });
+    </script>
+  </body>
+</html>

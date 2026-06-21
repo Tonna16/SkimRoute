@@ -3,7 +3,7 @@ const path = require("path");
 const vm = require("vm");
 
 const root = path.resolve(__dirname, "..");
-const contentCode = fs.readFileSync(path.join(root, "content.js"), "utf8");
+const contentCode = fs.readFileSync(path.join(root, "pdf-runtime.js"), "utf8");
 
 function assert(condition, message) {
   if (!condition) {
@@ -61,7 +61,7 @@ function loadHooks() {
     setTimeout,
     clearTimeout
   };
-  vm.runInNewContext(contentCode, sandbox, { filename: "content.js" });
+vm.runInNewContext(contentCode, sandbox, { filename: "pdf-runtime.js" });
   assert(sandbox.window.__PAGEPILOT_CONTENT_TESTS__, "content test hooks were not installed");
   return sandbox.window.__PAGEPILOT_CONTENT_TESTS__;
 }

@@ -67,6 +67,10 @@
   const PDF_ACTION_RENDER_TIMEOUT_MS = 5000;
   const PDF_ACTION_VERIFY_TIMEOUT_MS = 1500;
   const PDF_ACTION_DEBOUNCE_MS = 350;
+  const PDF_QUERY_NAVIGATION_TIMEOUT_MS = 2500;
+  const PDF_QUERY_SCROLL_SETTLE_TIMEOUT_MS = 900;
+  const PDF_QUERY_POLL_INTERVAL_MS = 75;
+  const PDF_QUERY_RENDER_RETRY_COUNT = 1;
   const GOOGLE_DOCS_ACTION_TIMEOUT_MS = 4500;
   const GOOGLE_DOCS_ACTION_OUTLINE_WAIT_MS = 2200;
   const GOOGLE_DOCS_ACTION_DEBOUNCE_MS = 350;
@@ -140,6 +144,13 @@
   cleanupStaleSkimRouteDom("boot-current-version");
   window.__PAGEPILOT_LOADED__ = true;
   window.__SKIMROUTE_CONTENT_VERSION__ = SKIMROUTE_CONTENT_VERSION;
+  window.PagePilotPdfRuntime = {
+    version: SKIMROUTE_CONTENT_VERSION,
+    initializedAt: Date.now(),
+    source: "legacy-pdf-runtime",
+    handleExternalMessage: (message, options) => handleExternalMessage(message, options),
+    handleQueryAction: (message, options) => handleQueryAction(message, options)
+  };
 
   const runtime = {
     engine: null,
@@ -149,8 +160,10 @@
       mode: "minimized",
       activeId: null,
       showOnboarding: false,
-      collapsedSectionIds: new Set()
+      collapsedSectionIds: new Set(),
+      sectionQuery: createEmptySectionQuery()
     },
+    navigationHistory: createEmptyNavigationHistory(),
     currentUrl: "",
     scanTimer: null,
     warmupTimers: [],
@@ -167,6 +180,11 @@
     jumpEffectActive: false,
     highlightedElements: [],
     dimmedElements: [],
+    pdfQueryPassages: new Map(),
+    pdfQueryPassageSignature: "",
+    queryRequestSeq: 0,
+    pendingSectionQuery: null,
+    sidebarOpenResult: null,
     pdfJumpMarker: null,
     pdfJumpMarkerTimer: null,
     pdfJumpMode: "",
@@ -344,6 +362,62 @@
     listeners: []
   };
 
+  function createEmptyNavigationHistory(routeKey = "") {
+    return {
+      routeKey,
+      lastSelectedSectionId: "",
+      lastSelectedRole: "",
+      recentSectionIds: [],
+      lastActionSource: "",
+      lastSelectedAt: 0
+    };
+  }
+
+  function createEmptySectionQuery(text = "") {
+    return {
+      text: String(text || ""),
+      status: "idle",
+      sectionId: "",
+      passageId: "",
+      surface: "",
+      pageNumber: 0,
+      title: "",
+      label: "",
+      roleLabel: "",
+      snippet: "",
+      confidenceLabel: "",
+      score: 0,
+      reason: "",
+      canNavigate: false,
+      weakRequiresConfirm: false,
+      canRunBetterOcr: false,
+      navigation: createEmptyQueryNavigationResult(),
+      alternatives: [],
+      requestId: 0,
+      updatedAt: 0
+    };
+  }
+
+  function nextSectionQueryRequestId() {
+    runtime.queryRequestSeq = (Number(runtime.queryRequestSeq) || 0) + 1;
+    return runtime.queryRequestSeq;
+  }
+
+  function createEmptyQueryNavigationResult() {
+    return {
+      found: false,
+      navigated: false,
+      verified: false,
+      exact: false,
+      surface: "",
+      sectionId: "",
+      passageId: "",
+      pageNumber: 0,
+      reason: "",
+      strategy: ""
+    };
+  }
+
   const DEBUG_PREFIX = "[SkimRoute]";
   const DEBUG_ENABLED = globalThis.SKIMROUTE_DEV_MODE === true;
 
@@ -405,6 +479,7 @@
       verifyPdfPublicStatusTopLevelFields,
       getPdfOcrPlan,
       shouldRunBetterPdfOcrAfterFast,
+      isWeakSearchableOcrResult,
       normalizePdfOcrLineTextSpacing,
       sortPdfOcrLinesByReadingOrder,
       reconstructPdfOcrTextFromLines,
@@ -714,13 +789,15 @@
             return runPdfAction("next", { focus: true, source: "sidebar" });
           }
           adoptAuthoritativePdfModel("sidebar-next");
-          const section = getSectionForAction("next");
-          const ok = jumpToNextImportant();
+          const selection = selectNextTarget("sidebar-next");
+          const section = selection.section || null;
+          const ok = jumpToNextImportant(selection);
           setActionResult("next", ok, { section });
           return ok;
         },
         onRunPdfOcr: (mode) => {
           emitPdfActionCommandReceived("run-pdf-ocr", { source: "sidebar", mode: getManualPdfOcrMode(mode || "fast") }, { command: "manual-ocr" });
+          if (getManualPdfOcrMode(mode || "fast") === "better") prepareBetterOcrRetryForCurrentQuery("sidebar");
           return runManualPdfOcr(mode);
         },
         onCancelPdfOcr: () => {
@@ -737,6 +814,23 @@
           setActionResult("section", ok, { section });
           return ok;
         },
+        onQuery: (query) => runSectionQuery(query, { source: "sidebar", allowWeakNavigation: false }).catch((error) => {
+          emitDebug("section-query:sidebar-submit-error", {
+            error: String(error && error.message ? error.message : error),
+            exactIssue: "Sidebar PDF query submission failed before public state could be updated."
+          });
+        }),
+        onClearQuery: () => clearSectionQuery("sidebar-clear"),
+        onRunQueryBetterOcr: () => {
+          prepareBetterOcrRetryForCurrentQuery("sidebar-query");
+          return runManualPdfOcr("better");
+        },
+        onNavigateQueryResult: (target) => navigateCurrentQueryResult("sidebar-weak-confirm", target || {}).catch((error) => {
+          emitDebug("section-query:sidebar-navigate-error", {
+            error: String(error && error.message ? error.message : error),
+            exactIssue: "Sidebar PDF query result navigation failed before public state could be updated."
+          });
+        }),
         onToggleCollapse: (id) => toggleSectionCollapse(id),
         onDismissTip: () => dismissOnboarding()
       }
@@ -868,6 +962,7 @@
     }
 
     clearStalePdfErrorIfReady(runtime.model);
+    reconcileNavigationStateAfterScan(reason);
     scheduleChatReadinessPolling(reason, runtime.model);
 
     if (isPdfRouteLocked() && runtime.model && (runtime.model.totalReadableWords || 0) < 80) {
@@ -898,6 +993,7 @@
       && previousQuiet === runtime.model.pageProfile.quietMode
     ) {
       refreshActiveSection();
+      render();
       return;
     }
 
@@ -1079,6 +1175,7 @@
     );
     const entry = normalizePdfCacheEntry(details.entry || details.cacheEntry || runtime.pdfOcr.lastRecoveredEntry || null);
     runtime.model = normalizedModel;
+    invalidatePdfQueryPassages(`ocr-ready:${reason}`);
     runtime.pdfOcr.completedForRoute = routeKey;
     runtime.pdfOcr.pending = false;
     runtime.pdfOcr.retrying = false;
@@ -1164,6 +1261,8 @@
       pdfActiveSectionId: runtime.view.activeId || snapshot.pdfActiveSectionId || "",
       pdfOcrFinalDiagnostic: runtime.pdfOcr.finalDiagnostic || snapshot.pdfOcrFinalDiagnostic || null,
       finalDiagnostic: runtime.pdfOcr.finalDiagnostic || snapshot.finalDiagnostic || null,
+      sectionQuery: normalizePublicSectionQuery(runtime.view.sectionQuery),
+      sidebarOpenResult: normalizePublicSidebarOpenResult(runtime.sidebarOpenResult),
       pdfOcrCanCancel: false,
       pdfPending: false,
       pdfRetrying: false,
@@ -1376,7 +1475,7 @@
     const weakTextCanRunBetter = Boolean(
       runtime.pdfOcr
       && runtime.pdfOcr.betterAvailableForRoute === routeKey
-      && /weak_text/i.test(String(details.finalStatus || diagnostic && diagnostic.finalStatus || ""))
+      && isWeakSearchableOcrResult(diagnostic, model)
     );
     const status = {
       ok: true,
@@ -2071,7 +2170,7 @@
     profile.pdfOcrCanRunBetter = shouldExposePdfOcrBetter(getRouteCacheKey());
     profile.pdfOcrTakingLong = Boolean(pdfOcrActive && (elapsed > 7000 || runtime.pdfOcr && runtime.pdfOcr.slowDevice));
     profile.pdfOcrCancelled = state === "ocr-cancelled";
-    profile.pdfOcrRecommendedMode = runtime.pdfOcr && runtime.pdfOcr.recommendedMode || "fast";
+    profile.pdfOcrRecommendedMode = profile.pdfOcrCanRunBetter ? "better" : runtime.pdfOcr && runtime.pdfOcr.recommendedMode || "fast";
     profile.ocrFinalDiagnostic = runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic || null;
     model.pdfOcrFinalDiagnostic = runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic || null;
     return model;
@@ -6935,6 +7034,17 @@
       confidence: Number(variant && variant.confidence) || 0,
       firstTextSample: String(variant && variant.firstTextSample || "").slice(0, 240)
     };
+    if (variant && variant.ocrTextQuality && typeof variant.ocrTextQuality === "object") {
+      result.ocrTextQuality = {
+        corrupted: Boolean(variant.ocrTextQuality.corrupted),
+        missedRegionLikely: Boolean(variant.ocrTextQuality.missedRegionLikely),
+        complete: Boolean(variant.ocrTextQuality.complete),
+        readableWordRatio: Number(variant.ocrTextQuality.readableWordRatio || 0) || 0,
+        textCompleteness: Number(variant.ocrTextQuality.textCompleteness || 0) || 0,
+        pageCoverage: Number(variant.ocrTextQuality.pageCoverage || 0) || 0,
+        score: Number(variant.ocrTextQuality.score || 0) || 0
+      };
+    }
     if (errorMessage) result.errorMessage = errorMessage;
     return result;
   }
@@ -7117,6 +7227,70 @@
     };
   }
 
+  function isWeakSearchableOcrResult(diagnostic, model = runtime.model) {
+    const diag = diagnostic && typeof diagnostic === "object" ? diagnostic : runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic || {};
+    const profile = model && model.pageProfile || {};
+    const quality = String(profile.ocrQuality || runtime.pdfOcr && runtime.pdfOcr.qualityState || diag.ocrQuality || "").toLowerCase();
+    const qualityScore = Number(profile.qualityScore || runtime.pdfOcr && runtime.pdfOcr.qualityScore || diag.qualityScore || 0) || 0;
+    const bestConfidence = Number(diag.bestConfidence || 0) || 0;
+    const parserFallbackUsed = Boolean(diag.parserFallbackUsed);
+    const variantResults = Array.isArray(diag.variantResults) ? diag.variantResults : [];
+    const variantWeak = variantResults.some((variant) => {
+      const confidence = Number(variant && variant.confidence || 0) || 0;
+      const textQuality = variant && variant.ocrTextQuality || null;
+      return Boolean(
+        confidence && confidence < 45
+        || textQuality && (textQuality.corrupted || textQuality.missedRegionLikely || textQuality.complete === false)
+        || Number(textQuality && textQuality.readableWordRatio || 1) < 0.56
+        || Number(textQuality && textQuality.textCompleteness || 1) < 0.42
+        || Number(textQuality && textQuality.pageCoverage || 1) < 0.52
+      );
+    });
+    const weakParserFallback = Boolean(
+      parserFallbackUsed
+      && (
+        quality === "weak_structure"
+        || quality === "low"
+        || !qualityScore
+        || qualityScore < 72
+        || bestConfidence > 0 && bestConfidence < 70
+        || variantWeak
+      )
+    );
+    const diagnosticCanRunBetter = Boolean(
+      diag.canRunBetter === true
+      && (
+        quality === "weak_structure"
+        || quality === "low"
+        || !qualityScore
+        || qualityScore < 72
+        || bestConfidence > 0 && bestConfidence < 70
+        || variantWeak
+        || weakParserFallback
+      )
+    );
+    return Boolean(
+      diagnosticCanRunBetter
+      || quality === "weak_structure"
+      || quality === "low"
+      || weakParserFallback
+      || bestConfidence > 0 && bestConfidence < 55
+      || qualityScore > 0 && qualityScore < 62
+      || variantWeak
+    );
+  }
+
+  function getWeakOcrBetterReason(diagnostic = runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic || null, model = runtime.model) {
+    const diag = diagnostic && typeof diagnostic === "object" ? diagnostic : {};
+    const profile = model && model.pageProfile || {};
+    if (diag.canRunBetter === true) return "final-diagnostic-can-run-better";
+    if (String(profile.ocrQuality || runtime.pdfOcr && runtime.pdfOcr.qualityState || "").toLowerCase() === "weak_structure") return "weak-structure";
+    if (diag.parserFallbackUsed && isWeakSearchableOcrResult(diag, model)) return "parser-fallback-with-weak-quality";
+    if (Number(diag.bestConfidence || 0) > 0 && Number(diag.bestConfidence || 0) < 55) return "low-ocr-confidence";
+    if (Number(profile.qualityScore || runtime.pdfOcr && runtime.pdfOcr.qualityScore || 0) > 0 && Number(profile.qualityScore || runtime.pdfOcr && runtime.pdfOcr.qualityScore || 0) < 62) return "low-quality-score";
+    return isWeakSearchableOcrResult(diag, model) ? "weak-ocr-quality" : "";
+  }
+
   function getPdfOcrFinishedRunSet() {
     if (!runtime.pdfOcr.finishedOcrRunIds || typeof runtime.pdfOcr.finishedOcrRunIds.has !== "function") {
       runtime.pdfOcr.finishedOcrRunIds = new Set();
@@ -7221,7 +7395,13 @@
   function shouldExposePdfOcrBetter(routeKey = getRouteCacheKey()) {
     const state = String(runtime.pdfOcr && runtime.pdfOcr.state || "").toLowerCase();
     const errorKind = String(runtime.pdfOcr && runtime.pdfOcr.errorKind || "").toLowerCase();
+    const weakReadyOcr = Boolean(
+      state === "ready"
+      && isWeakSearchableOcrResult(runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic, runtime.model)
+    );
     const betterEligibleState = Boolean(
+      weakReadyOcr
+      ||
       /^(needs-ocr|ocr-prompt|ocr-unreadable)$/i.test(state)
       || /^(ocr-low-text|ocr-unreadable)$/i.test(errorKind)
       || runtime.pdfOcr && runtime.pdfOcr.needsPrompt && !/^(ocr-failed|ocr-cancelled|fetch-error|ready)$/i.test(state)
@@ -7234,7 +7414,7 @@
       && !runtime.pdfOcr.retrying
       && !runtime.pdfOcr.cancelRequested
       && !runtime.pdfOcr.timedOut
-      && state !== "ready"
+      && (state !== "ready" || weakReadyOcr)
       && state !== "ocr-failed"
       && state !== "ocr-cancelled"
       && errorKind !== "ocr-timeout"
@@ -7413,6 +7593,18 @@
       })
     };
     runtime.pdfOcr.finalDiagnostic = diagnostic;
+    if (isWeakSearchableOcrResult(diagnostic, details.model || runtime.model)) {
+      runtime.pdfOcr.betterAvailableForRoute = details.routeKey || getRouteCacheKey();
+      runtime.pdfOcr.recommendedMode = "better";
+      emitDebug("section-query:better-ocr-offered", {
+        routeKey: runtime.pdfOcr.betterAvailableForRoute,
+        ocrQuality: runtime.pdfOcr.qualityState || runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.ocrQuality || "",
+        bestConfidence: Number(diagnostic.bestConfidence || 0) || 0,
+        parserFallbackUsed: Boolean(diagnostic.parserFallbackUsed),
+        reason: getWeakOcrBetterReason(diagnostic, details.model || runtime.model),
+        exactIssue: "Completed OCR produced a ready map, but quality is too weak for reliable local query search."
+      });
+    }
     emitDebug("pdf:ocr:final-diagnostic", diagnostic);
     if (hasReadyOcrModel) {
       saveReadyPdfOcrState("finishOcrRun", {
@@ -9496,17 +9688,24 @@
     const currentQuality = current.ocrTextQuality && typeof current.ocrTextQuality === "object"
       ? current.ocrTextQuality
       : evaluatePdfOcrTextQuality(current);
+    const candidateConfidence = Number(candidate.confidence || 0) || 0;
+    const currentConfidence = Number(current.confidence || 0) || 0;
     if (Boolean(candidateQuality.corrupted) !== Boolean(currentQuality.corrupted)) return !candidateQuality.corrupted;
     if (Boolean(candidateQuality.missedRegionLikely) !== Boolean(currentQuality.missedRegionLikely)) return !candidateQuality.missedRegionLikely;
+    if ((candidateConfidence < 35 || currentConfidence < 35) && Math.abs(candidateConfidence - currentConfidence) >= 12) {
+      return candidateConfidence > currentConfidence;
+    }
+    if (Math.abs((candidateQuality.readableWordRatio || 0) - (currentQuality.readableWordRatio || 0)) >= 0.14) return (candidateQuality.readableWordRatio || 0) > (currentQuality.readableWordRatio || 0);
     if (Math.abs((candidateQuality.score || 0) - (currentQuality.score || 0)) >= 12) return (candidateQuality.score || 0) > (currentQuality.score || 0);
     if (Boolean(candidateQuality.complete) !== Boolean(currentQuality.complete)) return Boolean(candidateQuality.complete);
+    if (Math.abs(candidateConfidence - currentConfidence) >= 18) return candidateConfidence > currentConfidence;
     if (Math.abs((candidateQuality.textCompleteness || 0) - (currentQuality.textCompleteness || 0)) >= 0.14) return (candidateQuality.textCompleteness || 0) > (currentQuality.textCompleteness || 0);
     if (Math.abs((candidateQuality.pageCoverage || 0) - (currentQuality.pageCoverage || 0)) >= 0.18) return (candidateQuality.pageCoverage || 0) > (currentQuality.pageCoverage || 0);
     if (Math.abs((candidateQuality.paragraphContinuity || 0) - (currentQuality.paragraphContinuity || 0)) >= 0.16) return (candidateQuality.paragraphContinuity || 0) > (currentQuality.paragraphContinuity || 0);
     if (candidate.words !== current.words) return candidate.words > current.words;
     if ((candidate.rawTextLength || 0) !== (current.rawTextLength || 0)) return (candidate.rawTextLength || 0) > (current.rawTextLength || 0);
     if (candidate.lines.length !== current.lines.length) return candidate.lines.length > current.lines.length;
-    return Number(candidate.confidence || 0) > Number(current.confidence || 0);
+    return candidateConfidence > currentConfidence;
   }
 
   function getFastPdfOcrFallbackVariants(rendered) {
@@ -10809,6 +11008,25 @@
   }
 
   function runManualPdfOcr(mode = "fast") {
+    try {
+      if (window.PagePilotRuntimeLoader && typeof window.PagePilotRuntimeLoader.ensureOcrRuntime === "function") {
+        window.PagePilotRuntimeLoader.ensureOcrRuntime(`manual-ocr:${getManualPdfOcrMode(mode)}`).catch((error) => {
+          emitDebug("runtime load failure", {
+            runtime: "ocr",
+            reason: `manual-ocr:${getManualPdfOcrMode(mode)}`,
+            error: String(error && error.message ? error.message : error),
+            exactIssue: "The OCR marker runtime could not be imported before manual OCR started."
+          });
+        });
+      }
+    } catch (error) {
+      emitDebug("runtime load failure", {
+        runtime: "ocr",
+        reason: "manual-ocr",
+        error: String(error && error.message ? error.message : error),
+        exactIssue: "The OCR marker runtime loader threw before manual OCR started."
+      });
+    }
     const routeKey = getRouteCacheKey();
     const ocrMode = getManualPdfOcrMode(mode);
     emitDebug("pdf:ocr:manual-click", {
@@ -10869,7 +11087,145 @@
     }
 
     runtime.pdfOcr.recommendedMode = ocrMode;
+    if (startTestPdfOcrRunIfAvailable(ocrMode, { source: "manual-ocr" })) {
+      return true;
+    }
     schedulePdfRecoveryAttempt("manual", { allowOcr: true, force: true, mode: ocrMode });
+    return true;
+  }
+
+  function getTestPdfOcrEntry() {
+    if (!globalThis.SKIMROUTE_DEV_MODE) return null;
+    const raw = window.__PAGEPILOT_TEST_OCR_RESULT__;
+    if (!raw || typeof raw !== "object") return null;
+    const pages = normalizePdfRecoveryPages(Array.isArray(raw.pages) ? raw.pages : []);
+    const text = String(raw.text || raw.reconstructedText || pages.map((page) => page && page.text || "").join(" ")).replace(/\s+/g, " ").trim();
+    if (!text) return null;
+    const words = Number(raw.words) || countPdfWords(text);
+    return {
+      ...raw,
+      source: "ocr",
+      text,
+      rawText: String(raw.rawText || text),
+      reconstructedText: String(raw.reconstructedText || text),
+      words,
+      pages,
+      pagesRead: Number(raw.pagesRead) || pages.length || Number(raw.numPages) || 0,
+      numPages: Number(raw.numPages) || pages.length || Number(raw.pagesRead) || 0,
+      confidence: Number(raw.confidence) || 90,
+      updatedAt: Date.now(),
+      ocrMode: String(raw.ocrMode || "test"),
+      ocrQuality: String(raw.ocrQuality || "readable"),
+      qualityScore: Number(raw.qualityScore) || 86,
+      qualityMessage: String(raw.qualityMessage || "OCR finished. SkimRoute found readable text and built a page map."),
+      ocrTextQuality: raw.ocrTextQuality || {
+        corrupted: false,
+        missedRegionLikely: false,
+        readable: true,
+        words,
+        confidence: Number(raw.confidence) || 90,
+        score: Number(raw.qualityScore) || 86
+      }
+    };
+  }
+
+  function startTestPdfOcrRunIfAvailable(mode = "fast", options = {}) {
+    const entry = getTestPdfOcrEntry();
+    if (!entry || !(isPdfRouteLocked() || isPdfLikePage())) return false;
+    const routeKey = getRouteCacheKey();
+    const ocrMode = getManualPdfOcrMode(mode || entry.ocrMode || "fast");
+    const attemptId = beginOcrRun({
+      mode: ocrMode,
+      routeKey,
+      reason: "test-ocr-seam"
+    });
+    runtime.pdfOcr.recommendedMode = ocrMode;
+    runtime.pdfOcr.state = "ocr";
+    runtime.pdfOcr.pending = true;
+    runtime.pdfOcr.retrying = false;
+    runtime.pdfOcr.progress = 12;
+    runtime.pdfOcr.currentStep = "test-ocr-running";
+    runtime.pdfOcr.progressMessage = "Reading scanned text locally...";
+    runtime.pdfOcr.source = "";
+    runtime.pdfOcr.words = 0;
+    runtime.pdfOcr.pages = 0;
+    runtime.pdfOcr.lastError = "";
+    runtime.pdfOcr.errorKind = "";
+    runtime.pdfOcr.needsPrompt = false;
+    runtime.model = buildPdfProcessingModel(runtime.model, "Reading scanned text locally...", "ocr");
+    render();
+    publishStatusUpdate("pdf:ocr:test-start");
+    emitDebug("pdf:ocr:test-seam-start", {
+      routeKey,
+      mode: ocrMode,
+      attemptId,
+      source: options.source || "",
+      textWords: entry.words,
+      pagesRead: entry.pagesRead,
+      exactIssue: "Development/test OCR seam is simulating normal OCR progress and completion without network-dependent OCR execution."
+    });
+    const delayMs = Math.max(80, Math.min(3000, Number(window.__PAGEPILOT_TEST_OCR_DELAY_MS__) || Number(entry.delayMs) || 550));
+    runtime.pdfOcr.activePromise = new Promise((resolve) => {
+      window.setTimeout(async () => {
+        if (runtime.pdfOcr.activeAttemptId !== attemptId || runtime.pdfOcr.cancelRequested) {
+          resolve(false);
+          return;
+        }
+        const cacheEntry = writePdfCacheEntry(routeKey, {
+          ...entry,
+          updatedAt: Date.now(),
+          fileName: getPdfFileNameFromRoute(routeKey),
+          ocrMode
+        });
+        runtime.pdfOcr.lastRecoveredEntry = cacheEntry;
+        runtime.pdfOcr.progress = 100;
+        runtime.pdfOcr.progressMessage = entry.qualityMessage || "OCR finished. SkimRoute found readable text and built a page map.";
+        runtime.pdfOcr.source = "ocr";
+        runtime.pdfOcr.words = cacheEntry && cacheEntry.words || entry.words || 0;
+        runtime.pdfOcr.pages = cacheEntry && (cacheEntry.pagesRead || cacheEntry.pages.length) || entry.pagesRead || entry.pages.length || 0;
+        runtime.pdfOcr.state = "ready";
+        runtime.pdfOcr.pending = false;
+        runtime.pdfOcr.retrying = false;
+        runtime.pdfOcr.completedForRoute = routeKey;
+        runtime.pdfOcr.qualityState = cacheEntry && cacheEntry.ocrQuality || entry.ocrQuality || "";
+        runtime.pdfOcr.qualityScore = Number(cacheEntry && cacheEntry.qualityScore || entry.qualityScore || 0);
+        runtime.pdfOcr.qualityMessage = cacheEntry && cacheEntry.qualityMessage || entry.qualityMessage || "";
+        await waitForPdfCachePersistence(routeKey);
+        const parserModel = buildRecoveredPdfModelFromCache(routeKey, "test-ocr-seam", runtime.model) || runtime.model;
+        if (parserModel && parserModel.pageProfile && parserModel.pageProfile.type === "pdf") {
+          runtime.model = parserModel;
+        }
+        finishOcrRun("success", {
+          result: cacheEntry || entry,
+          cacheEntry,
+          entry: cacheEntry,
+          ocrRunId: attemptId,
+          routeKey,
+          mode: ocrMode,
+          parserInputText: entry.text,
+          parserModel: runtime.model,
+          pageDiagnostics: Array.isArray(entry.pageDiagnostics) ? entry.pageDiagnostics : [],
+          parserFallbackUsed: Boolean(entry.parserFallbackUsed),
+          parserOutputSections: runtime.model && Array.isArray(runtime.model.sections) ? runtime.model.sections.length : 0,
+          parserOutputWords: runtime.model ? Number(runtime.model.totalReadableWords || runtime.model.totalWords || 0) : 0,
+          cachedAsSuccess: true,
+          canRunBetter: Boolean(entry.canRunBetter),
+          finalStatus: "success"
+        });
+        scanPage("test-ocr-seam");
+        await runPendingSectionQueryIfReady("test-ocr-seam");
+        render();
+        publishStatusUpdate("pdf:ocr:test-complete");
+        emitDebug("pdf:ocr:test-seam-complete", {
+          routeKey,
+          attemptId,
+          sections: runtime.model && Array.isArray(runtime.model.sections) ? runtime.model.sections.length : 0,
+          words: runtime.model && Number(runtime.model.totalReadableWords || runtime.model.totalWords || 0) || 0,
+          exactIssue: "none"
+        });
+        resolve(true);
+      }, delayMs);
+    });
     return true;
   }
 
@@ -10922,13 +11278,21 @@
     const pageType = runtime.model.pageProfile && runtime.model.pageProfile.type;
     const allowOcr = Boolean(options.allowOcr);
     const force = Boolean(options.force || allowOcr || reason === "manual");
-    if (useCachedPdfSnapshotBeforeRecovery(routeKey, reason, runtime.model)) {
+    const skipPreflightCacheForForcedOcr = Boolean(force && allowOcr);
+    if (!skipPreflightCacheForForcedOcr && useCachedPdfSnapshotBeforeRecovery(routeKey, reason, runtime.model)) {
       emitDebug("pdf:analysis:skipped-cache", {
         reason,
         routeKey,
         exactIssue: "A usable cached/stable PDF map existed before recovery, so SkimRoute did not start PDF.js extraction or OCR."
       });
       return true;
+    } else if (skipPreflightCacheForForcedOcr) {
+      emitDebug("pdf:analysis:forced-ocr-cache-bypass", {
+        reason,
+        routeKey,
+        mode: options.mode || runtime.pdfOcr && runtime.pdfOcr.recommendedMode || "",
+        exactIssue: "A manual forced OCR run bypassed the same-route cache so Better OCR can replace a weak completed OCR map."
+      });
     }
     const alreadyDone = runtime.pdfOcr.completedForRoute === routeKey;
     const alreadyPending = runtime.pdfOcr.pending && runtime.pdfOcr.attemptedForRoute === routeKey;
@@ -12766,10 +13130,13 @@
     (async () => {
       const routeKey = getRouteCacheKey();
       await hydratePdfCache(routeKey, { source: "manual-ocr" });
+      if (ocrMode === "better") prepareBetterOcrRetryForCurrentQuery(options.source || "popup");
       if (runtime.pdfOcr && runtime.pdfOcr.attemptedForRoute === routeKey) {
         runtime.pdfOcr.completedForRoute = "";
       }
-      runManualPdfOcr(ocrMode);
+      if (!startTestPdfOcrRunIfAvailable(ocrMode, options)) {
+        runManualPdfOcr(ocrMode);
+      }
       sendFreshPublicStats(sendResponse, {
         reason: "manual-ocr-status",
         delayMs: 0,
@@ -12848,11 +13215,24 @@
         return handlePdfActionMessage(sendResponse, "next", { focus: true, source: "popup" });
       }
       setMode("open", { focus: true, persist: true });
-      const section = getSectionForAction("next");
-      const ok = jumpToNextImportant();
+      const selection = selectNextTarget("message-next");
+      const section = selection.section || null;
+      const ok = jumpToNextImportant(selection);
       setActionResult("next", ok, { section });
       sendResponse(getPublicStats());
       return true;
+    }
+
+    if (message.type === "PAGEPILOT_QUERY_SECTION") {
+      return false;
+    }
+
+    if (message.type === "PAGEPILOT_NAVIGATE_QUERY_RESULT") {
+      return false;
+    }
+
+    if (message.type === "PAGEPILOT_CLEAR_QUERY") {
+      return false;
     }
 
     if (message.type === "PAGEPILOT_STATUS") {
@@ -12902,6 +13282,91 @@
     }
 
     return false;
+  }
+
+  async function handleExternalMessage(message, options = {}) {
+    if (!message || typeof message !== "object") return getPublicStatsSafely();
+    const type = String(message.type || "");
+    const source = options.source || "core-delegate";
+    if (type === "PAGEPILOT_QUERY_SECTION" || type === "PAGEPILOT_NAVIGATE_QUERY_RESULT" || type === "PAGEPILOT_CLEAR_QUERY") {
+      return handleQueryAction(message, { source });
+    }
+    if (type === "PAGEPILOT_STATUS") {
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_TOGGLE") {
+      runPdfAction("toggle", {
+        open: typeof message.open === "boolean" ? message.open : true,
+        focus: Boolean(message.open),
+        source
+      });
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_SCAN") {
+      scanPage("core-delegate");
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_JUMP_USEFUL") {
+      runPdfAction("jump", { focus: true, source });
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_NEXT_IMPORTANT") {
+      runPdfAction("next", { focus: true, source });
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_RUN_PDF_OCR") {
+      const mode = getManualPdfOcrMode(message.mode || "fast");
+      hydratePdfCache(getRouteCacheKey(), { source: "core-delegate-ocr" }).catch((error) => {
+        emitDebug("pdf:cache:hydrate-error", {
+          source,
+          error: String(error && error.message ? error.message : error),
+          exactIssue: "Core delegated an OCR command, but cache hydration failed before OCR start."
+        });
+      });
+      if (runtime.pdfOcr && runtime.pdfOcr.attemptedForRoute === getRouteCacheKey()) {
+        runtime.pdfOcr.completedForRoute = "";
+      }
+      if (mode === "better") prepareBetterOcrRetryForCurrentQuery(source);
+      if (!startTestPdfOcrRunIfAvailable(mode, { source })) {
+        runManualPdfOcr(mode);
+      }
+      return getPublicStatsSafely();
+    }
+    if (type === "PAGEPILOT_CANCEL_PDF_OCR") {
+      cancelPdfOcr(source);
+      return getPublicStatsSafely();
+    }
+    return getPublicStatsSafely();
+  }
+
+  async function handleQueryAction(message, options = {}) {
+    const type = String(message && message.type || "");
+    setMode("open", { focus: true, persist: true });
+    emitDebug("section-query:owner-selected", {
+      owner: "pdf-runtime",
+      type,
+      source: options.source || "pdf",
+      exactIssue: "none"
+    });
+    if (type === "PAGEPILOT_QUERY_SECTION") {
+      await runSectionQuery(message.query || "", {
+        source: options.source || "popup",
+        allowWeakNavigation: Boolean(message.allowWeakNavigation)
+      });
+      return getPublicStats();
+    }
+    if (type === "PAGEPILOT_NAVIGATE_QUERY_RESULT") {
+      await navigateCurrentQueryResult(options.source || "popup-weak-confirm", {
+        sectionId: message.sectionId || "",
+        passageId: message.passageId || ""
+      });
+      return getPublicStats();
+    }
+    if (type === "PAGEPILOT_CLEAR_QUERY") {
+      clearSectionQuery(options.source || "popup");
+      return getPublicStats();
+    }
+    return getPublicStats();
   }
 
   function watchPageChanges() {
@@ -12968,6 +13433,8 @@
     runtime.view.mode = "minimized";
     runtime.view.activeId = null;
     runtime.view.collapsedSectionIds.clear();
+    runtime.navigationHistory = createEmptyNavigationHistory();
+    resetSectionQuery("route-change");
     clearChatReadinessPolling();
     window.clearTimeout(runtime.pdfOcr.retryTimer);
     runtime.pdfOcr.pending = false;
@@ -13533,6 +14000,1743 @@
       || /\b(textLayer|page|pdf|viewer)\b/i.test(`${element.id || ""} ${element.className || ""}`);
   }
 
+  function reconcileNavigationStateAfterScan(reason) {
+    if (!runtime.model) return;
+    const routeKey = getRouteCacheKey();
+    const ids = new Set((runtime.model.sections || []).map((section) => section.id));
+    if (runtime.navigationHistory.routeKey && runtime.navigationHistory.routeKey !== routeKey) {
+      runtime.navigationHistory = createEmptyNavigationHistory(routeKey);
+      if (runtime.view.sectionQuery && runtime.view.sectionQuery.text) {
+        emitDebug("section-query:state-preserved", {
+          reason: "pdf-document-key-stable",
+          routeKey,
+          queryLength: runtime.view.sectionQuery.text.length,
+          exactIssue: "PDF scan reconciliation kept the query because the document route key is stable."
+        });
+      }
+    } else {
+      runtime.navigationHistory.routeKey = routeKey;
+      runtime.navigationHistory.recentSectionIds = runtime.navigationHistory.recentSectionIds.filter((id) => ids.has(id)).slice(-6);
+      if (!ids.has(runtime.navigationHistory.lastSelectedSectionId)) {
+        runtime.navigationHistory.lastSelectedSectionId = "";
+        runtime.navigationHistory.lastSelectedRole = "";
+        runtime.navigationHistory.lastSelectedAt = 0;
+      }
+    }
+    if (runtime.view.activeId && !ids.has(runtime.view.activeId)) runtime.view.activeId = null;
+    if (runtime.pendingSectionQuery && runtime.pendingSectionQuery.text) {
+      runPendingSectionQueryIfReady(`scan:${reason || "scan"}`).catch((error) => {
+        emitDebug("section-query:pending-query-error", {
+          reason: `scan:${reason || "scan"}`,
+          error: String(error && error.message ? error.message : error),
+          exactIssue: "A queued OCR query failed while running against the completed PDF model."
+        });
+      });
+    } else if (runtime.view.sectionQuery && runtime.view.sectionQuery.text && runtime.view.sectionQuery.status !== "waiting") {
+      runSectionQuery(runtime.view.sectionQuery.text, {
+        source: `rescan:${reason || "scan"}`,
+        preserveOnly: true,
+        requestId: runtime.view.sectionQuery.requestId
+      }).catch((error) => {
+        emitDebug("section-query:rescan-query-error", {
+          reason: `rescan:${reason || "scan"}`,
+          error: String(error && error.message ? error.message : error),
+          exactIssue: "A preserved PDF query failed during scan reconciliation."
+        });
+      });
+    }
+    refreshNextPreview("scan");
+  }
+
+  function refreshNextPreview(source) {
+    const selection = selectNextTarget(source || "preview", { preview: true });
+    if (runtime.model) {
+      runtime.model.nextImportantId = selection.sectionId || "";
+      runtime.model.nextReason = selection.reason || "";
+    }
+    return selection;
+  }
+
+  function selectNextTarget(source = "next", options = {}) {
+    if (!runtime.model || !window.PagePilotEngine || !window.PagePilotEngine.navigation) {
+      return { sectionId: "", section: null, reason: "No next useful section", diagnostics: null };
+    }
+    if (hasSyntheticPdfSections()) {
+      const pdfTarget = getNextPdfImportantSection()
+        || getFirstPdfImportantSection()
+        || runtime.model.importantSections.find((section) => (isSyntheticPdfSection(section) || isOcrPdfSection(section)) && section.id !== runtime.view.activeId)
+        || null;
+      return {
+        sectionId: pdfTarget && pdfTarget.id || "",
+        section: pdfTarget,
+        reason: pdfTarget ? "Next useful section" : "No next useful section",
+        diagnostics: null
+      };
+    }
+    refreshSectionPositions();
+    const marker = getCurrentScrollMarker();
+    const history = runtime.navigationHistory || createEmptyNavigationHistory();
+    const freshHistoryCurrent = history.lastSelectedSectionId && Date.now() - Number(history.lastSelectedAt || 0) < 3500;
+    const selection = window.PagePilotEngine.navigation.selectNextSection(runtime.model, {
+      currentSectionId: freshHistoryCurrent ? history.lastSelectedSectionId : runtime.view.activeId || "",
+      currentTop: marker,
+      lastSelectedSectionId: history.lastSelectedSectionId,
+      lastSelectedRole: history.lastSelectedRole,
+      recentSectionIds: history.recentSectionIds,
+      source,
+      isNavigable: canJumpToSection
+    });
+    const section = runtime.model.sections.find((item) => item.id === selection.sectionId) || null;
+    if (!options.preview && runtime.model.diagnostics) {
+      runtime.model.diagnostics.nextSelection = selection.diagnostics;
+    }
+    return {
+      sectionId: selection.sectionId || "",
+      section,
+      reason: selection.reason || "No next useful section",
+      diagnostics: selection.diagnostics || null
+    };
+  }
+
+  function getCurrentScrollMarker() {
+    try {
+      if (!runtime.model || !runtime.model.sections || !runtime.model.sections.length) {
+        return window.scrollY + Math.min(window.innerHeight * 0.42, 380);
+      }
+      const scrollContainer = findScrollContainer((runtime.model.sections[0] && runtime.model.sections[0].anchor) || runtime.model.articleRoot || document.body);
+      const scroller = scrollContainer && scrollContainer !== document.body && scrollContainer !== document.documentElement
+        ? scrollContainer
+        : null;
+      const scrollTop = scroller ? scroller.scrollTop : window.scrollY;
+      const viewportSize = scroller ? scroller.clientHeight : window.innerHeight;
+      return scrollTop + Math.min(viewportSize * 0.36, 300);
+    } catch (error) {
+      return window.scrollY + Math.min(window.innerHeight * 0.42, 380);
+    }
+  }
+
+  function recordNavigationSelection(section, source) {
+    if (!section || !runtime.model) return;
+    const routeKey = getRouteCacheKey();
+    if (runtime.navigationHistory.routeKey && runtime.navigationHistory.routeKey !== routeKey) {
+      runtime.navigationHistory = createEmptyNavigationHistory(routeKey);
+    }
+    const role = section.intelligence && section.intelligence.role
+      || section.metrics && section.metrics.sectionKind
+      || section.label
+      || "";
+    runtime.navigationHistory.routeKey = routeKey;
+    runtime.navigationHistory.lastSelectedSectionId = section.id;
+    runtime.navigationHistory.lastSelectedRole = role;
+    runtime.navigationHistory.lastActionSource = source || "";
+    runtime.navigationHistory.lastSelectedAt = Date.now();
+    runtime.navigationHistory.recentSectionIds = runtime.navigationHistory.recentSectionIds
+      .filter((id) => id && id !== section.id)
+      .concat(section.id)
+      .slice(-6);
+  }
+
+  function ensurePdfQueryModel(reason = "section-query") {
+    const readyOcrModel = getReadyPdfOcrModelCandidate({
+      routeKey: getPdfDocumentRouteKey(),
+      reason: `query-owner:${reason}`
+    });
+    if (readyOcrModel && isUsablePdfStatsModel(readyOcrModel, true)) {
+      runtime.model = normalizeRecoveredPdfModelForPublicStatus(
+        readyOcrModel,
+        getPdfDocumentRouteKey(),
+        runtime.pdfOcr && runtime.pdfOcr.lastRecoveredEntry || null,
+        runtime.model,
+        `query-owner:${reason}:ocr`
+      );
+      rememberStablePdfModel(runtime.model, `query-owner:${reason}:ocr`);
+      invalidatePdfQueryPassages(`query-owner:${reason}:ocr`);
+      return Boolean(window.PagePilotEngine && window.PagePilotEngine.navigation);
+    }
+    if (runtime.model && window.PagePilotEngine && window.PagePilotEngine.navigation) return true;
+    if (!(isPdfRouteLocked() || isPdfLikePage())) return false;
+    if (adoptAuthoritativePdfModel(reason)) return true;
+    const routeKey = getPdfDocumentRouteKey();
+    hydratePdfSessionCache(routeKey);
+    const recovered = buildRecoveredPdfModelFromCache(routeKey, reason, runtime.model);
+    if (recovered && isUsablePdfStatsModel(recovered, true)) {
+      runtime.model = recovered;
+      rememberStablePdfModel(runtime.model, reason);
+      render();
+      return true;
+    }
+    return adoptAuthoritativePdfModel(`${reason}:after-cache`);
+  }
+
+  function shouldWaitForOcrQuery() {
+    if (!(isPdfRouteLocked() || isPdfLikePage())) return false;
+    const ocrActive = Boolean(
+      runtime.pdfOcr
+      && (
+        runtime.pdfOcr.pending
+        || runtime.pdfOcr.retrying
+        || isPdfOcrActive()
+      )
+    );
+    if (!ocrActive) return false;
+    const readyOcr = getReadyPdfOcrModelCandidate({
+      routeKey: getPdfDocumentRouteKey(),
+      reason: "query-wait-check"
+    });
+    return !Boolean(readyOcr && isUsablePdfStatsModel(readyOcr, true));
+  }
+
+  function setWaitingSectionQuery(text, options = {}, requestId = nextSectionQueryRequestId()) {
+    runtime.pendingSectionQuery = {
+      text: String(text || "").slice(0, 120),
+      source: options.source || "query",
+      allowWeakNavigation: Boolean(options.allowWeakNavigation),
+      requestId,
+      createdAt: Date.now()
+    };
+    runtime.view.sectionQuery = {
+      ...createEmptySectionQuery(text),
+      requestId,
+      status: "waiting",
+      reason: "Waiting for OCR to finish...",
+      updatedAt: Date.now()
+    };
+    emitDebug("section-query:waiting-for-ocr", {
+      source: options.source || "query",
+      requestId,
+      queryLength: String(text || "").length,
+      pending: Boolean(runtime.pdfOcr && runtime.pdfOcr.pending),
+      retrying: Boolean(runtime.pdfOcr && runtime.pdfOcr.retrying),
+      state: runtime.pdfOcr && runtime.pdfOcr.state || "",
+      routeKey: getPdfDocumentRouteKey(),
+      exactIssue: "Query is preserved until the OCR-backed PDF model is usable."
+    });
+    render();
+    return runtime.view.sectionQuery;
+  }
+
+  async function runPendingSectionQueryIfReady(reason = "ocr-model-ready") {
+    const pending = runtime.pendingSectionQuery;
+    if (!pending || !pending.text) return false;
+    if (!ensurePdfQueryModel(`pending-query:${reason}`) || !isUsablePdfStatsModel(runtime.model, true)) return false;
+    runtime.pendingSectionQuery = null;
+    emitDebug("section-query:ocr-model-ready", {
+      requestId: pending.requestId || 0,
+      source: pending.source || "",
+      routeKey: getPdfDocumentRouteKey(),
+      sections: runtime.model && runtime.model.sections ? runtime.model.sections.length : 0,
+      words: runtime.model && runtime.model.totalReadableWords || 0,
+      exactIssue: "The queued query will now run against the completed OCR PDF model."
+    });
+    emitDebug("section-query:better-ocr-query-resumed", {
+      requestId: pending.requestId || 0,
+      source: pending.source || "",
+      routeKey: getPdfDocumentRouteKey(),
+      queryLength: String(pending.text || "").length,
+      exactIssue: "A preserved query is being rerun after OCR model commit; raw query text is not logged."
+    });
+    await runSectionQuery(pending.text, {
+      source: `${pending.source || "ocr-ready"}:${reason}`,
+      allowWeakNavigation: pending.allowWeakNavigation,
+      requestId: pending.requestId
+    });
+    return true;
+  }
+
+  function resetSectionQuery(reason, options = {}) {
+    const previousText = runtime.view.sectionQuery && runtime.view.sectionQuery.text || "";
+    runtime.pendingSectionQuery = null;
+    runtime.view.sectionQuery = createEmptySectionQuery(options.text || "");
+    runtime.view.sectionQuery.requestId = nextSectionQueryRequestId();
+    emitDebug("section-query:state-reset", {
+      reason: reason || "reset",
+      previousHadText: Boolean(previousText),
+      previousLength: previousText.length,
+      routeKey: getRouteCacheKey(),
+      exactIssue: "SkimRoute reset query state for the stated reason."
+    });
+    return runtime.view.sectionQuery;
+  }
+
+  async function runSectionQuery(query, options = {}) {
+    const text = String(query || "").slice(0, 120).trim();
+    const requestId = Number(options.requestId) || nextSectionQueryRequestId();
+    if (!text) {
+      clearSectionQuery(options.source || "empty-query");
+      return runtime.view.sectionQuery;
+    }
+    emitDebug("section-query:submitted", {
+      owner: "pdf-runtime",
+      source: options.source || "query",
+      requestId,
+      queryLength: text.length,
+      routeKey: getPdfDocumentRouteKey(),
+      exactIssue: "Raw query text is not logged."
+    });
+    if (shouldWaitForOcrQuery()) {
+      return setWaitingSectionQuery(text, options, requestId);
+    }
+    adoptAuthoritativePdfModel(`section-query:${options.source || "query"}`);
+    ensurePdfQueryModel(`section-query:${options.source || "query"}`);
+    if (!runtime.model || !window.PagePilotEngine || !window.PagePilotEngine.navigation) {
+      runtime.view.sectionQuery = {
+        ...createEmptySectionQuery(text),
+        requestId,
+        status: "none",
+        reason: "No strong section match found on this page.",
+        updatedAt: Date.now()
+      };
+      render();
+      return runtime.view.sectionQuery;
+    }
+    invalidatePdfQueryPassages("section-query");
+    preparePdfQueryPassagesForModel();
+    emitDebug("section-query:owner-selected", {
+      owner: "pdf-runtime",
+      source: options.source || "query",
+      exactIssue: "none"
+    });
+    const search = window.PagePilotEngine.navigation.searchSections(runtime.model, text, {
+      source: options.source || "query",
+      surface: "pdf",
+      getQueryPassages: getPdfQueryPassages,
+      isNavigable: canJumpToSection
+    });
+    runtime.model.diagnostics = runtime.model.diagnostics || {};
+    runtime.model.diagnostics.sectionQuery = search.diagnostics;
+    if (!search.result) {
+      const betterRetrySource = /better-ocr/i.test(String(options.source || ""));
+      if (!betterRetrySource && shouldOfferBetterOcrForSectionQuery(search)) {
+        const reason = "Fast OCR could not read this text clearly enough to search it.";
+        runtime.view.sectionQuery = {
+          ...createEmptySectionQuery(text),
+          requestId,
+          status: "error",
+          reason,
+          canRunBetterOcr: true,
+          updatedAt: Date.now()
+        };
+        emitDebug("section-query:ocr-quality-insufficient", {
+          requestId,
+          queryLength: text.length,
+          routeKey: getPdfDocumentRouteKey(),
+          ocrQuality: runtime.pdfOcr && runtime.pdfOcr.qualityState || runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.ocrQuality || "",
+          bestConfidence: runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic && Number(runtime.pdfOcr.finalDiagnostic.bestConfidence || 0) || 0,
+          parserFallbackUsed: Boolean(runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic && runtime.pdfOcr.finalDiagnostic.parserFallbackUsed),
+          queryPassageCount: runtime.pdfQueryPassages && runtime.pdfQueryPassages.size || 0,
+          betterReason: getWeakOcrBetterReason(runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic, runtime.model),
+          exactIssue: "Fast OCR produced an unreliable ready map and no credible query candidates; Better OCR is offered without clearing the query."
+        });
+        emitDebug("section-query:better-ocr-offered", {
+          requestId,
+          routeKey: getPdfDocumentRouteKey(),
+          reason: getWeakOcrBetterReason(runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic, runtime.model),
+          exactIssue: "The current OCR query can be retried with Better OCR."
+        });
+        emitPdfQueryNoMatchDiagnostics(search, text, options.source || "query", requestId);
+        render();
+        return runtime.view.sectionQuery;
+      }
+      runtime.view.sectionQuery = {
+        ...createEmptySectionQuery(text),
+        requestId,
+        status: "none",
+        reason: betterRetrySource && isWeakSearchableOcrResult(runtime.pdfOcr && runtime.pdfOcr.finalDiagnostic, runtime.model)
+          ? "Better OCR still could not read text resembling this query."
+          : getPdfQueryNoMatchReason(search),
+        updatedAt: Date.now()
+      };
+      emitPdfQueryNoMatchDiagnostics(search, text, options.source || "query", requestId);
+      render();
+      return runtime.view.sectionQuery;
+    }
+    runtime.view.sectionQuery = {
+      ...createEmptySectionQuery(text),
+      ...search.result,
+      text,
+      requestId,
+      navigation: createEmptyQueryNavigationResult(),
+      updatedAt: Date.now()
+    };
+    const shouldNavigate = !options.preserveOnly
+      && runtime.view.sectionQuery.canNavigate
+      && runtime.view.sectionQuery.status !== "weak";
+    if (shouldNavigate) {
+      const section = runtime.model.sections.find((item) => item.id === runtime.view.sectionQuery.sectionId) || null;
+      const navigation = await navigatePdfQueryResult(runtime.view.sectionQuery, options.source || "query");
+      if (!runtime.view.sectionQuery || Number(runtime.view.sectionQuery.requestId || 0) !== requestId) {
+        emitDebug("section-query:stale-navigation-discarded", {
+          requestId,
+          currentRequestId: runtime.view.sectionQuery && runtime.view.sectionQuery.requestId || 0,
+          source: options.source || "query",
+          exactIssue: "A PDF query navigation completed after a newer query replaced the public state."
+        });
+        return runtime.view.sectionQuery;
+      }
+      runtime.view.sectionQuery.navigation = navigation;
+      const ok = Boolean(navigation.navigated);
+      setActionResult("query", ok, {
+        section,
+        message: queryNavigationMessage(navigation)
+      });
+    }
+    render();
+    return runtime.view.sectionQuery;
+  }
+
+  function shouldOfferBetterOcrForSectionQuery(search) {
+    if (!runtime.pdfOcr || !shouldExposePdfOcrBetter(getRouteCacheKey())) return false;
+    if (!isWeakSearchableOcrResult(runtime.pdfOcr.finalDiagnostic, runtime.model)) return false;
+    const diagnostics = search && search.diagnostics || {};
+    const ocr = diagnostics.ocrNoMatch || {};
+    const exact = Number(ocr.exactMatchCount || 0) || 0;
+    const fuzzy = Number(ocr.fuzzyMatchCount || 0) || 0;
+    const top = Array.isArray(ocr.topCandidates) ? ocr.topCandidates : [];
+    return Boolean((Number(ocr.ocrPassageCount || 0) || runtime.pdfQueryPassages && runtime.pdfQueryPassages.size) && !exact && !fuzzy && !top.length);
+  }
+
+  function clearSectionQuery(source) {
+    resetSectionQuery(source || "clear");
+    emitDebug("section-query:clear", {
+      source: source || "clear",
+      exactIssue: "none"
+    });
+    render();
+    return runtime.view.sectionQuery;
+  }
+
+  function prepareBetterOcrRetryForCurrentQuery(source = "better-ocr") {
+    const query = runtime.view.sectionQuery || null;
+    if (!query || !query.text || !query.canRunBetterOcr) return false;
+    const requestId = Number(query.requestId || 0) || nextSectionQueryRequestId();
+    runtime.pendingSectionQuery = {
+      text: String(query.text || ""),
+      source: `${source}:better-ocr`,
+      allowWeakNavigation: false,
+      requestId
+    };
+    runtime.view.sectionQuery = {
+      ...query,
+      requestId,
+      status: "waiting",
+      reason: "Running Better OCR, then searching again...",
+      canRunBetterOcr: false,
+      updatedAt: Date.now()
+    };
+    emitDebug("section-query:better-ocr-started", {
+      requestId,
+      routeKey: getPdfDocumentRouteKey(),
+      queryLength: String(query.text || "").length,
+      exactIssue: "Better OCR started from a preserved query; raw query text is not logged."
+    });
+    render();
+    return true;
+  }
+
+  async function navigateCurrentQueryResult(source, target = {}) {
+    const query = runtime.view.sectionQuery || createEmptySectionQuery();
+    const selected = target && (target.sectionId || target.passageId)
+      ? resolveQueryAlternative(query, target) || query
+      : query;
+    if (!selected.sectionId || !runtime.model) return false;
+    const section = runtime.model.sections.find((item) => item.id === selected.sectionId) || null;
+    const requestId = Number(query.requestId || 0);
+    const navigation = await navigatePdfQueryResult(selected, source || "query-confirm");
+    if (requestId && runtime.view.sectionQuery && Number(runtime.view.sectionQuery.requestId || 0) !== requestId) {
+      emitDebug("section-query:stale-navigation-discarded", {
+        requestId,
+        currentRequestId: runtime.view.sectionQuery && runtime.view.sectionQuery.requestId || 0,
+        source: source || "query-confirm",
+        exactIssue: "A confirmed PDF query result completed after a newer query replaced the public state."
+      });
+      return false;
+    }
+    runtime.view.sectionQuery = {
+      ...runtime.view.sectionQuery,
+      ...selected,
+      navigation,
+      weakRequiresConfirm: false,
+      updatedAt: Date.now()
+    };
+    const ok = Boolean(navigation.navigated);
+    setActionResult("query", ok, {
+      section,
+      message: queryNavigationMessage(navigation)
+    });
+    render();
+    return ok;
+  }
+
+  function resolveQueryAlternative(query, target = {}) {
+    const alternatives = Array.isArray(query && query.alternatives) ? query.alternatives : [];
+    const wantedSection = String(target.sectionId || "");
+    const wantedPassage = String(target.passageId || "");
+    return alternatives.find((item) => {
+      if (wantedPassage && String(item.passageId || "") === wantedPassage) return true;
+      return wantedSection && String(item.sectionId || "") === wantedSection && (!wantedPassage || String(item.passageId || "") === wantedPassage);
+    }) || null;
+  }
+
+  function queryNavigationMessage(navigation) {
+    if (!navigation || !navigation.navigated) return navigation && navigation.reason || "Found a match, but the PDF viewer did not confirm navigation.";
+    if (!navigation.exact) return "Moved to the matching page; exact passage highlighting was unavailable.";
+    return "Moved to the matching passage.";
+  }
+
+  function getPdfQueryNoMatchReason(search) {
+    const diagnostics = search && search.diagnostics || {};
+    const ocr = diagnostics.ocrNoMatch || {};
+    const hasOcr = Boolean(
+      Number(ocr.ocrSectionCount || 0)
+      || Number(ocr.ocrPassageCount || 0)
+      || runtime.pdfQueryPassages && Array.from(runtime.pdfQueryPassages.values()).some((item) => item && item.passage && item.passage.sourceType === "ocr")
+    );
+    const credibleOcrEvidence = Boolean(
+      Number(ocr.exactMatchCount || 0)
+      || Number(ocr.fuzzyMatchCount || 0)
+      || Array.isArray(ocr.topCandidates) && ocr.topCandidates.some((item) => Number(item.score || 0) >= 8)
+    );
+    if (hasOcr && !credibleOcrEvidence) return "No OCR text resembling this query was found.";
+    return hasOcr ? "No strong section match found in the OCR text." : "No strong section match found on this page.";
+  }
+
+  function emitPdfQueryNoMatchDiagnostics(search, text, source, requestId) {
+    const diagnostics = search && search.diagnostics || {};
+    const ocr = diagnostics.ocrNoMatch || null;
+    if (!ocr && !(runtime.pdfQueryPassages && runtime.pdfQueryPassages.size)) return;
+    emitDebug("section-query:no-match", {
+      surface: "pdf",
+      source: source || "query",
+      requestId,
+      routeKey: getPdfDocumentRouteKey(),
+      queryLength: String(text || "").length,
+      tokenCount: diagnostics.tokenCount || 0,
+      candidateCount: diagnostics.candidateCount || 0,
+      recordCount: diagnostics.recordCount || 0,
+      ocrNoMatch: ocr ? {
+        modelSource: ocr.modelSource || "",
+        ocrSectionCount: ocr.ocrSectionCount || 0,
+        ocrPassageCount: ocr.ocrPassageCount || 0,
+        queryTokenCount: ocr.queryTokenCount || diagnostics.tokenCount || 0,
+        topCandidates: Array.isArray(ocr.topCandidates) ? ocr.topCandidates.slice(0, 5) : [],
+        exactMatchCount: ocr.exactMatchCount || 0,
+        fuzzyMatchCount: ocr.fuzzyMatchCount || 0,
+        confidencePenalties: ocr.confidencePenalties || 0,
+        rejectionReason: ocr.rejectionReason || ""
+      } : null,
+      exactIssue: ocr ? "OCR-backed PDF query produced no automatic match; details are redacted and truncated." : "PDF query produced no automatic match."
+    });
+  }
+
+  function getPdfQueryPassages(section) {
+    if (!section) return [];
+    const meta = section.unitMeta || {};
+    const sourceLines = normalizePdfOcrSourceLines(meta.ocrSourceLines);
+    const passages = sourceLines.length
+      ? buildPdfOcrQueryPassages(section, sourceLines)
+      : buildPdfTextQueryPassages(section);
+    passages.forEach((passage) => runtime.pdfQueryPassages.set(passage.id, { sectionId: section.id, passage }));
+    return passages;
+  }
+
+  function invalidatePdfQueryPassages(reason = "invalidate") {
+    runtime.pdfQueryPassages = new Map();
+    runtime.pdfQueryPassageSignature = "";
+    emitDebug("section-query:passage-index-invalidated", {
+      reason,
+      routeKey: getPdfDocumentRouteKey(),
+      exactIssue: "The PDF query passage index will be rebuilt before the next local section query."
+    });
+  }
+
+  function preparePdfQueryPassagesForModel() {
+    if (!runtime.model || !Array.isArray(runtime.model.sections)) return;
+    let ocrSectionCount = 0;
+    let ocrLineCount = 0;
+    let ocrPassageCount = 0;
+    let indexedWordCount = 0;
+    let ocrPassageMetadataIntact = true;
+    runtime.model.sections.forEach((section) => {
+      try {
+        const passages = getPdfQueryPassages(section);
+        const meta = section && section.unitMeta || {};
+        const sourceLines = normalizePdfOcrSourceLines(meta.ocrSourceLines);
+        if (meta.ocr || /ocr/i.test(String(meta.kind || meta.source || "")) || sourceLines.length) {
+          ocrSectionCount += 1;
+          ocrLineCount += sourceLines.length;
+          ocrPassageCount += passages.filter((passage) => passage && passage.sourceType === "ocr").length;
+          if (passages.some((passage) => passage && passage.sourceType !== "ocr" && /ocr/i.test(String(passage.sourceType || passage.passageType || passage.metadata && passage.metadata.sourceType || "")))) {
+            ocrPassageMetadataIntact = false;
+          }
+          if (sourceLines.length && passages.some((passage) => passage && passage.sourceType !== "ocr")) {
+            ocrPassageMetadataIntact = false;
+          }
+        }
+        passages.forEach((passage) => {
+          indexedWordCount += countWordsLocal(`${passage && passage.title || ""} ${passage && (passage.normalizedText || passage.text) || ""}`);
+        });
+        if (!section.unitMeta || typeof section.unitMeta !== "object") section.unitMeta = {};
+        section.queryPassages = passages;
+        section.unitMeta.queryPassages = passages;
+      } catch (error) {
+        emitDebug("section-query:passage-provider-error", {
+          surface: "pdf",
+          sectionId: section && section.id || "",
+          error: String(error && error.message ? error.message : error),
+          exactIssue: "PDF query passage construction failed for this section."
+        });
+      }
+    });
+    runtime.pdfQueryPassageSignature = [
+      getPdfDocumentRouteKey(),
+      runtime.model.sections.length,
+      runtime.pdfQueryPassages.size,
+      ocrSectionCount,
+      ocrLineCount,
+      indexedWordCount
+    ].join("|");
+    emitDebug("section-query:ocr-index-ready", {
+      routeKey: getPdfDocumentRouteKey(),
+      modelSource: runtime.pdfOcr && runtime.pdfOcr.source || runtime.model.diagnostics && runtime.model.diagnostics.recoveredPdfSource || "",
+      ocrSectionCount,
+      ocrLineCount,
+      ocrPassageCount,
+      passageCount: runtime.pdfQueryPassages.size,
+      indexedWordCount,
+      ocrPassageMetadataIntact,
+      allOcrPassagesMarked: ocrPassageMetadataIntact,
+      signature: runtime.pdfQueryPassageSignature,
+      exactIssue: ocrSectionCount ? "OCR-backed PDF query passages were rebuilt from the authoritative model." : "No OCR-backed passages were present in this PDF query index."
+    });
+  }
+
+  function buildPdfTextQueryPassages(section) {
+    const meta = section.unitMeta || {};
+    const text = stripPdfQueryFurnitureText(normalizePdfQueryText(section.text || meta.sectionText || ""));
+    if (!text) return [];
+    const chunks = splitPdfQueryText(text);
+    const baseRange = getPdfSectionRelativeYRange(section);
+    const pageNumber = getPdfSectionPageNumber(section);
+    const ocrBacked = Boolean(meta.ocr || /ocr/i.test(String(meta.kind || meta.source || "")));
+    const sourceType = ocrBacked ? "ocr" : meta.pdfjs ? "selectable" : meta.kind || "pdf";
+    return chunks.map((chunk, index) => {
+      const span = Math.max(0.035, (baseRange.end - baseRange.start) / Math.max(1, chunks.length));
+      const start = Math.max(0.02, Math.min(0.94, baseRange.start + span * index));
+      const end = Math.max(start + 0.035, Math.min(0.98, start + span * 0.92));
+      return {
+        id: `${section.id}:${ocrBacked ? "ocr-text" : "pdf"}:${index}:${hashPdfQueryText(chunk).slice(0, 10)}`,
+        surface: "pdf",
+        passageType: ocrBacked ? "ocr-text" : index === 0 && /^(abstract|summary|results|conclusion|methods)\b/i.test(chunk) ? "heading-paragraph" : "paragraph",
+        title: pdfQueryPassageTitle(section, chunk, pageNumber),
+        text: chunk,
+        roleLabel: section.metrics && section.metrics.sectionKindLabel || "",
+        pageNumber,
+        sourceType,
+        relativeY: (start + end) / 2,
+        relativeYStart: start,
+        relativeYEnd: end,
+        navigation: { strategy: ocrBacked ? "pdf-ocr-text-passage" : "pdf-passage", exact: true },
+        metadata: {
+          pdfSectionType: "",
+          sourceType,
+          ocrConfidence: ocrBacked ? Number(meta.ocrConfidence || 0) || 0 : 0
+        }
+      };
+    }).slice(0, 36);
+  }
+
+  function stripPdfQueryFurnitureText(text) {
+    const normalized = normalizePdfQueryText(text);
+    if (!normalized) return "";
+    const pieces = normalized
+      .split(/(?<=[.!?])\s+|[\r\n]+/)
+      .map((piece) => piece.trim())
+      .filter(Boolean)
+      .filter((piece) => !isPdfFurnitureText(piece));
+    return normalizePdfQueryText(pieces.join(" "));
+  }
+
+  function buildPdfOcrQueryPassages(section, sourceLines) {
+    const meta = section.unitMeta || {};
+    const pageNumber = getPdfSectionPageNumber(section);
+    const groups = [];
+    let current = [];
+    sourceLines.forEach((line) => {
+      const text = normalizePdfQueryText(line && line.text || "");
+      if (!text || isPdfFurnitureText(text)) return;
+      current.push(line);
+      if (current.length >= 3 || /[.!?]\s*$/.test(text)) {
+        groups.push(current);
+        current = [];
+      }
+    });
+    if (current.length) groups.push(current);
+    return groups.map((lines, index) => {
+      const rawText = lines.map((line) => line.text || "").join(" ");
+      const text = normalizePdfQueryText(rawText);
+      const normalizedText = normalizePdfQueryText(rawText.replace(/-\s+/g, "").replace(/\s*([,.;:!?])\s*/g, "$1 "));
+      const starts = lines.map((line) => Number(line.relativeYStart)).filter(Number.isFinite);
+      const ends = lines.map((line) => Number(line.relativeYEnd)).filter(Number.isFinite);
+      const centers = lines.map((line) => Number(line.relativeY)).filter(Number.isFinite);
+      const start = starts.length ? Math.min(...starts) : Math.max(0.02, (centers[0] || 0.14) - 0.025);
+      const end = ends.length ? Math.max(...ends) : Math.min(0.98, (centers[centers.length - 1] || start + 0.08) + 0.04);
+      const confidence = Math.round(lines.reduce((sum, line) => sum + (Number(line.confidence) || Number(meta.ocrConfidence) || 0), 0) / Math.max(1, lines.length));
+      const geometry = mergePdfOcrLineBackedGeometry(lines);
+      const lineIds = Array.from(new Set(lines.flatMap((line) => line.sourceLineIds && line.sourceLineIds.length ? line.sourceLineIds : [line.id]).filter(Boolean))).slice(0, 80);
+      return {
+        id: `${section.id}:ocr:${index}:${hashPdfQueryText(text).slice(0, 10)}`,
+        surface: "pdf",
+        passageType: "ocr-lines",
+        title: pdfQueryPassageTitle(section, text, pageNumber),
+        text: normalizedText || text,
+        rawText,
+        normalizedText: normalizedText || text,
+        roleLabel: section.metrics && section.metrics.sectionKindLabel || "OCR text",
+        pageNumber,
+        sourceType: "ocr",
+        ocrConfidence: confidence,
+        relativeY: (start + end) / 2,
+        relativeYStart: Math.max(0.02, Math.min(0.94, start)),
+        relativeYEnd: Math.max(start + 0.035, Math.min(0.98, end)),
+        sourceLineIds: lineIds,
+        lineIds,
+        ocrSourceLines: lines,
+        boundingBoxes: lines.map((line) => line.bbox || line.ocrGeometry && line.ocrGeometry.bbox || null).filter(Boolean).slice(0, 80),
+        navigation: { strategy: "pdf-ocr-passage", exact: true },
+        metadata: {
+          pdfSectionType: "",
+          sourceType: "ocr",
+          ocrConfidence: confidence,
+          rawText,
+          normalizedText: normalizedText || text,
+          sourceLineIds: lineIds,
+          lineCount: lines.length,
+          boundingBoxes: lines.map((line) => line.bbox || line.ocrGeometry && line.ocrGeometry.bbox || null).filter(Boolean).slice(0, 80),
+          ocrGeometry: geometry,
+          ocrSourceLines: lines
+        }
+      };
+    }).filter((passage) => passage.text && countWordsLocal(passage.text) >= 4).slice(0, 48);
+  }
+
+  async function navigatePdfQueryResult(query, source) {
+    const section = runtime.model && runtime.model.sections.find((item) => item.id === query.sectionId) || null;
+    const base = {
+      ...createEmptyQueryNavigationResult(),
+      found: Boolean(section),
+      surface: "pdf",
+      sectionId: query.sectionId || "",
+      passageId: query.passageId || "",
+      pageNumber: Number(query.pageNumber) || Number(section && (section.pageNumber || section.unitMeta && section.unitMeta.pageNumber)) || 0
+    };
+    if (!section) {
+      const missing = { ...base, reason: "Matched PDF section is no longer available.", strategy: "missing-section" };
+      emitPdfQueryNavigationDebug(missing, null);
+      return missing;
+    }
+    const ref = query.passageId && runtime.pdfQueryPassages && runtime.pdfQueryPassages.get(query.passageId);
+    const passage = ref && ref.passage ? { ...ref.passage, queryText: query.text || "" } : null;
+    let targetSection = createPdfQueryTargetSection(section, passage || query);
+    targetSection = refinePdfQueryTargetSectionForTextRect(targetSection, passage, getPdfSectionPageNumber(targetSection));
+    const pageNumber = getPdfSectionPageNumber(targetSection);
+    const queryAction = beginPdfQueryNavigationAction(query, targetSection, passage, pageNumber);
+    emitDebug("section-query:passage-selected", {
+      surface: "pdf",
+      sectionId: section.id,
+      passageId: query.passageId || "",
+      pageNumber,
+      yRange: targetSection.unitMeta ? [targetSection.unitMeta.relativeYStart, targetSection.unitMeta.relativeYEnd] : [],
+      sourceType: passage && passage.sourceType || "",
+      ocrConfidence: passage && passage.ocrConfidence || 0,
+      exactIssue: "none"
+    });
+    emitDebug("section-query:navigation-requested", {
+      surface: "pdf",
+      sectionId: section.id,
+      passageId: query.passageId || "",
+      pageNumber,
+      queryRequestId: Number(query.requestId || 0) || 0,
+      queryActionToken: queryAction.actionId || "",
+      source: source || "query",
+      exactIssue: "none"
+    });
+    const request = requestPdfQueryNavigation(targetSection, section, passage, pageNumber, source || "query", queryAction);
+    const beforeState = request.beforeState || getPdfQueryScrollState(pageNumber);
+    const verification = request.completionPromise
+      ? await request.completionPromise
+      : await waitForPdfQueryNavigation(targetSection, section, passage, pageNumber, request.strategy, beforeState, request);
+    const verified = Boolean(request.requested && verification.verified);
+    const exact = Boolean(verified && verification.exact);
+    const result = {
+      ...base,
+      pageNumber,
+      navigated: verified,
+      verified,
+      exact,
+      reason: verified
+        ? exact ? "Moved to the matching passage." : "Moved to the matching page; exact passage highlighting was unavailable."
+        : "Found a match, but the PDF viewer did not confirm navigation.",
+      strategy: verification.strategy || request.strategy
+    };
+    result.measurement = verification.measurement || null;
+    finishPdfQueryNavigationAction(queryAction, result, targetSection);
+    emitPdfQueryNavigationDebug(result, targetSection);
+    return result;
+  }
+
+  function beginPdfQueryNavigationAction(query, section, passage, pageNumber) {
+    const viewer = runtime.pdfControlledViewer || null;
+    const priorPending = viewer && viewer.pendingTarget ? { ...viewer.pendingTarget } : null;
+    const begin = beginPdfAction("query", {
+      forceNew: true,
+      section,
+      sectionId: section && section.id || query && query.sectionId || "",
+      passageId: query && query.passageId || passage && passage.id || "",
+      pageNumber,
+      routeKey: getPdfDocumentRouteKey() || getRouteCacheKey(),
+      queryRequestId: Number(query && query.requestId || 0) || 0
+    });
+    const actionId = begin && begin.actionId || runtime.pdfAction && runtime.pdfAction.activeActionId || "";
+    if (viewer && priorPending && priorPending.actionToken !== actionId) {
+      viewer.pendingTarget = null;
+      emitDebug("pdf-query-action:stale-target-replaced", {
+        requestId: Number(query && query.requestId || 0) || 0,
+        queryActionToken: actionId,
+        priorPendingToken: priorPending.actionToken || "",
+        priorPendingActionType: priorPending.actionType || "",
+        sectionId: section && section.id || "",
+        passageId: query && query.passageId || passage && passage.id || "",
+        targetPage: Number(pageNumber) || 0,
+        routeKey: getPdfDocumentRouteKey() || getRouteCacheKey(),
+        exactIssue: "A PDF query replaced stale controlled-viewer pending target state before scrolling."
+      });
+    }
+    emitDebug("pdf-query-action:started", {
+      requestId: Number(query && query.requestId || 0) || 0,
+      queryActionToken: actionId,
+      priorPendingToken: priorPending && priorPending.actionToken || "",
+      sectionId: section && section.id || "",
+      passageId: query && query.passageId || passage && passage.id || "",
+      targetPage: Number(pageNumber) || 0,
+      routeKey: getPdfDocumentRouteKey() || getRouteCacheKey(),
+      exactIssue: "PDF query navigation owns this action token through render, scroll, highlight, and measurement."
+    });
+    return {
+      actionId,
+      requestId: Number(query && query.requestId || 0) || 0,
+      passageId: query && query.passageId || passage && passage.id || "",
+      sectionId: section && section.id || "",
+      pageNumber: Number(pageNumber) || 0,
+      routeKey: getPdfDocumentRouteKey() || getRouteCacheKey()
+    };
+  }
+
+  function finishPdfQueryNavigationAction(queryAction, result, section) {
+    const actionId = queryAction && queryAction.actionId || "";
+    if (!actionId) return false;
+    if (!isPdfActionActive(actionId)) {
+      emitDebug("pdf-query-action:failed", {
+        requestId: queryAction.requestId || 0,
+        queryActionToken: actionId,
+        sectionId: queryAction.sectionId || section && section.id || "",
+        passageId: queryAction.passageId || "",
+        targetPage: queryAction.pageNumber || result && result.pageNumber || 0,
+        routeKey: queryAction.routeKey || getPdfDocumentRouteKey(),
+        reason: "query-action-superseded-before-completion",
+        exactIssue: "A newer PDF action superseded this query before final measurement."
+      });
+      return false;
+    }
+    const ok = Boolean(result && result.verified);
+    completePdfAction(actionId, ok ? "completed" : "blocked", {
+      type: "query",
+      routeKey: queryAction.routeKey || getPdfDocumentRouteKey(),
+      sectionId: queryAction.sectionId || section && section.id || "",
+      pageNumber: queryAction.pageNumber || result && result.pageNumber || 0,
+      blockedReason: ok ? "" : "pdf-query-navigation-not-verified",
+      exactIssue: ok ? "none" : "PDF query navigation did not verify visible page/passage movement."
+    });
+    emitDebug(ok ? "pdf-query-action:scroll-verified" : "pdf-query-action:failed", {
+      requestId: queryAction.requestId || 0,
+      queryActionToken: actionId,
+      sectionId: queryAction.sectionId || section && section.id || "",
+      passageId: queryAction.passageId || "",
+      targetPage: queryAction.pageNumber || result && result.pageNumber || 0,
+      routeKey: queryAction.routeKey || getPdfDocumentRouteKey(),
+      strategy: result && result.strategy || "",
+      verified: ok,
+      exact: Boolean(result && result.exact),
+      measurement: result && result.measurement || null,
+      exactIssue: ok ? "none" : "PDF query action finished without verified scroll."
+    });
+    return true;
+  }
+
+  function requestPdfQueryNavigation(targetSection, fallbackSection, passage, pageNumber, source, queryAction = {}) {
+    const prefersReducedMotion = true;
+    let requested = false;
+    let strategy = "";
+    let completionPromise = null;
+    let beforeState = null;
+    if (shouldUseControlledPdfQueryNavigation(pageNumber)) {
+      beforeState = getControlledPdfQueryScrollState();
+      strategy = "controlled-pdf-query";
+      requested = true;
+      completionPromise = navigateControlledPdfQueryTarget(targetSection, passage, pageNumber, { source, actionToken: queryAction.actionId || "", queryRequestId: queryAction.requestId || 0 });
+    }
+    if (!requested && pageNumber && findPdfPageElement(pageNumber)) {
+      requested = scrollPdfPageElementToSection(targetSection, pageNumber, prefersReducedMotion);
+      if (requested) showPdfSectionHighlight(targetSection, pageNumber, { mode: passage && passage.sourceType === "ocr" ? "query-ocr-passage" : "query-passage", immediate: false });
+      strategy = requested ? "pdf-page-passage" : strategy;
+    }
+    if (!requested && pageNumber) {
+      requested = performPdfSyntheticJump(targetSection, { highlight: true, actionType: "query", source, actionToken: queryAction.actionId || "" });
+      strategy = requested ? "pdf-synthetic-passage" : strategy;
+    }
+    if (!requested) {
+      requested = scrollToSection(fallbackSection.id, { highlight: true, actionType: "query", source });
+      strategy = requested ? "section-fallback" : "pdf-query-failed";
+    }
+    return { requested, strategy, requestedAt: Date.now(), completionPromise, beforeState, queryAction };
+  }
+
+  function shouldUseControlledPdfQueryNavigation(pageNumber) {
+    if (!pageNumber || !isPdfRouteLocked()) return false;
+    const viewer = runtime.pdfControlledViewer;
+    if (viewer && viewer.root && viewer.root.isConnected && viewer.scroll) return true;
+    return !findPdfPageElement(pageNumber);
+  }
+
+  async function navigateControlledPdfQueryTarget(section, passage, pageNumber, options = {}) {
+    const routeKey = getPdfDocumentRouteKey();
+    const startedAt = Date.now();
+    const targetPage = Number(pageNumber) || getPdfSectionPageNumber(section);
+    const actionToken = String(options.actionToken || "");
+    const queryRequestId = Number(options.queryRequestId || 0) || 0;
+    const beforeState = getControlledPdfQueryScrollState();
+    const baseMeasurement = {
+      strategy: "controlled-pdf-query",
+      viewerType: "controlled",
+      targetPage,
+      currentPageBefore: beforeState && beforeState.currentPage || 0,
+      scrollContainerBefore: beforeState && beforeState.identity || null,
+      scrollTopBefore: beforeState && Number(beforeState.scrollTop || 0) || 0
+    };
+    try {
+      if (!section || !targetPage || !routeKey || !isPdfRouteLocked()) {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: { ...baseMeasurement, reason: "controlled-query-missing-target" }
+        };
+      }
+      if (!actionToken || !isPdfActionActive(actionToken)) {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: {
+            ...baseMeasurement,
+            reason: actionToken ? "query-action-not-active" : "missing-query-action-token",
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          }
+        };
+      }
+      const existingViewer = runtime.pdfControlledViewer;
+      const alreadyOpen = Boolean(existingViewer && existingViewer.root && existingViewer.root.isConnected && existingViewer.scroll);
+      if (!alreadyOpen && !(await hasPagePilotPdfModeConsent(routeKey))) {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: {
+            ...baseMeasurement,
+            reason: "pdf-mode-consent-required",
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          }
+        };
+      }
+      const viewer = ensurePagePilotControlledPdfViewer();
+      if (!viewer || !viewer.root || !viewer.scroll) {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: {
+            ...baseMeasurement,
+            reason: "controlled-viewer-unavailable",
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          }
+        };
+      }
+      reopenPagePilotControlledPdfViewer(viewer);
+      showPagePilotControlledPdfLoading(targetPage);
+      updatePagePilotControlledPdfStatus(`${PDF_MODE_OPENING_COPY} Target page ${targetPage}.`);
+      setPdfActiveTarget(section, targetPage, "pagepilot-controlled-query-starting");
+      emitDebug("section-query:navigation-requested", {
+        surface: "pdf",
+        viewerType: "controlled",
+        strategy: "controlled-pdf-query",
+        sectionId: section && section.id || "",
+        passageId: passage && passage.id || "",
+        pageNumber: targetPage,
+        requestId: queryRequestId,
+        queryActionToken: actionToken,
+        source: options.source || "query",
+        exactIssue: "Controlled PDF query navigation will wait for render, scroll, highlight, and measurement."
+      });
+      await ensurePagePilotControlledPdfRendered(routeKey, targetPage);
+      const renderedPage = getControlledPdfQueryPage(targetPage);
+      if (!renderedPage || renderedPage.dataset.rendered !== "true") {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: {
+            ...baseMeasurement,
+            ...getControlledPdfQueryMeasurementState(section, passage, targetPage, beforeState),
+            reason: "controlled-target-page-not-rendered",
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          }
+        };
+      }
+      const requested = scrollPagePilotControlledPdfToSection(section, targetPage, {
+        highlight: true,
+        actionType: "query",
+        actionToken,
+        queryRequestId,
+        source: options.source || "query",
+        reason: "controlled-query-rendered"
+      });
+      if (!requested) {
+        return {
+          verified: false,
+          exact: false,
+          strategy: "controlled-pdf-query",
+          measurement: {
+            ...baseMeasurement,
+            ...getControlledPdfQueryMeasurementState(section, passage, targetPage, beforeState),
+            reason: "controlled-scroll-request-failed",
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          }
+        };
+      }
+      const settled = await waitForControlledPdfQueryScrollSettle(section, passage, targetPage, beforeState, PDF_QUERY_SCROLL_SETTLE_TIMEOUT_MS);
+      let verification = settled.measurement || verifyControlledPdfQueryNavigation(section, passage, targetPage, beforeState, {
+        attempts: settled.attempts
+      });
+      if (!verification.verified && PDF_QUERY_RENDER_RETRY_COUNT > 0) {
+        await sleepPdfQuery(PDF_QUERY_POLL_INTERVAL_MS * 2);
+        const retryPage = getControlledPdfQueryPage(targetPage);
+        if (!retryPage || retryPage.dataset.rendered !== "true") {
+          await ensurePagePilotControlledPdfRendered(routeKey, targetPage);
+        }
+        scrollPagePilotControlledPdfToSection(section, targetPage, {
+          highlight: true,
+          actionType: "query",
+          actionToken,
+          queryRequestId,
+          source: options.source || "query",
+          reason: "controlled-query-render-retry"
+        });
+        const retrySettled = await waitForControlledPdfQueryScrollSettle(section, passage, targetPage, beforeState, PDF_QUERY_SCROLL_SETTLE_TIMEOUT_MS);
+        verification = retrySettled.measurement || verification;
+        verification.retry = {
+          attempts: retrySettled.attempts,
+          elapsedMs: retrySettled.elapsedMs
+        };
+      }
+      return {
+        verified: Boolean(verification.verified),
+        exact: Boolean(verification.exact),
+        strategy: "controlled-pdf-query",
+        measurement: {
+          ...verification,
+          renderElapsedMs: Math.max(0, Date.now() - startedAt),
+          settleAttempts: settled.attempts
+        }
+      };
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (runtime.pdfControlledViewer) runtime.pdfControlledViewer.lastError = message;
+      emitDebug("section-query:navigation-failed", {
+        surface: "pdf",
+        viewerType: "controlled",
+        strategy: "controlled-pdf-query",
+        sectionId: section && section.id || "",
+        passageId: passage && passage.id || "",
+        pageNumber: targetPage,
+        error: message,
+        exactIssue: "Controlled PDF query navigation failed during render, scroll, or measurement."
+      });
+      return {
+        verified: false,
+        exact: false,
+        strategy: "controlled-pdf-query",
+        measurement: {
+          ...baseMeasurement,
+          reason: "controlled-query-error",
+          error: message,
+          elapsedMs: Math.max(0, Date.now() - startedAt)
+        }
+      };
+    }
+  }
+
+  async function waitForPdfQueryNavigation(targetSection, fallbackSection, passage, pageNumber, strategy, beforeState, request) {
+    let measurement = null;
+    let lastStrategy = strategy || "";
+    const attempts = [];
+    for (let retry = 0; retry <= PDF_QUERY_RENDER_RETRY_COUNT; retry += 1) {
+      const pageWait = await waitForPdfQueryPageReady(pageNumber, PDF_QUERY_NAVIGATION_TIMEOUT_MS, lastStrategy);
+      const scrollStateBefore = getPdfQueryScrollState(pageNumber);
+      if (pageNumber) {
+        const rerun = requestPdfQueryScrollAfterMount(targetSection, fallbackSection, passage, pageNumber, lastStrategy, request);
+        if (rerun.strategy) lastStrategy = rerun.strategy;
+      }
+      const settle = await waitForPdfQueryScrollSettle(targetSection, passage, pageNumber, lastStrategy, beforeState, PDF_QUERY_SCROLL_SETTLE_TIMEOUT_MS);
+      measurement = settle.measurement || verifyPdfQueryNavigation(targetSection, passage, pageNumber, lastStrategy, beforeState, {
+        attempts: settle.attempts,
+        pageWait,
+        scrollStateBefore
+      });
+      attempts.push({
+        retry,
+        pageWait,
+        settleAttempts: settle.attempts,
+        verified: measurement.verified,
+        exact: measurement.exact,
+        reason: measurement.reason || ""
+      });
+      if (measurement.verified) break;
+      if (retry < PDF_QUERY_RENDER_RETRY_COUNT) {
+        await sleepPdfQuery(PDF_QUERY_POLL_INTERVAL_MS * 2);
+      }
+    }
+    return {
+      verified: Boolean(measurement && measurement.verified),
+      exact: Boolean(measurement && measurement.exact),
+      strategy: lastStrategy,
+      measurement: measurement ? { ...measurement, attempts } : { attempts }
+    };
+  }
+
+  function requestPdfQueryScrollAfterMount(targetSection, fallbackSection, passage, pageNumber, strategy, request = {}) {
+    const prefersReducedMotion = true;
+    if (runtime.pdfControlledViewer && runtime.pdfControlledViewer.pages && runtime.pdfControlledViewer.pages.get(Number(pageNumber))) {
+      const ok = scrollPagePilotControlledPdfToSection(targetSection, pageNumber, {
+        highlight: true,
+        actionType: "query",
+        actionToken: request.queryAction && request.queryAction.actionId || "",
+        queryRequestId: request.queryAction && request.queryAction.requestId || 0,
+        source: "query-settle",
+        reason: "query-page-ready"
+      });
+      return { ok, strategy: ok ? "controlled-pdf-passage" : strategy };
+    }
+    const page = findPdfPageElement(pageNumber);
+    if (page) {
+      const ok = scrollPdfPageElementToSection(targetSection, pageNumber, prefersReducedMotion);
+      if (ok) showPdfSectionHighlight(targetSection, pageNumber, { mode: passage && passage.sourceType === "ocr" ? "query-ocr-passage" : "query-passage", immediate: false });
+      return { ok, strategy: ok ? "pdf-page-passage" : strategy };
+    }
+    return { ok: false, strategy };
+  }
+
+  async function waitForPdfQueryPageReady(pageNumber, timeoutMs, strategy) {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let mounted = false;
+    let currentPage = 0;
+    let visible = false;
+    while (Date.now() - startedAt <= timeoutMs) {
+      attempts += 1;
+      const page = pageNumber ? findPdfPageElement(pageNumber) : null;
+      const rect = page && page.getBoundingClientRect ? page.getBoundingClientRect() : null;
+      mounted = Boolean(page);
+      visible = rectIntersects(rect, getPdfQueryViewportRect(getPdfQueryScrollState(pageNumber).element), 8);
+      currentPage = readChromePdfViewerPageNumber() || runtime.pdfActivePage || getCurrentPdfPageFromUrl() || 0;
+      if (mounted || currentPage === Number(pageNumber)) break;
+      await sleepPdfQuery(PDF_QUERY_POLL_INTERVAL_MS);
+    }
+    return {
+      attempts,
+      elapsedMs: Date.now() - startedAt,
+      mounted,
+      visible,
+      currentPage,
+      targetPage: Number(pageNumber) || 0,
+      strategy: strategy || ""
+    };
+  }
+
+  async function waitForPdfQueryScrollSettle(section, passage, pageNumber, strategy, beforeState, timeoutMs) {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let last = null;
+    while (Date.now() - startedAt <= timeoutMs) {
+      attempts += 1;
+      last = verifyPdfQueryNavigation(section, passage, pageNumber, strategy, beforeState, { attempts });
+      if (last.verified) break;
+      await sleepPdfQuery(PDF_QUERY_POLL_INTERVAL_MS);
+    }
+    return {
+      attempts,
+      elapsedMs: Date.now() - startedAt,
+      measurement: last
+    };
+  }
+
+  async function waitForControlledPdfQueryScrollSettle(section, passage, pageNumber, beforeState, timeoutMs) {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let last = null;
+    while (Date.now() - startedAt <= timeoutMs) {
+      attempts += 1;
+      last = verifyControlledPdfQueryNavigation(section, passage, pageNumber, beforeState, { attempts });
+      if (last.verified) break;
+      await sleepPdfQuery(PDF_QUERY_POLL_INTERVAL_MS);
+    }
+    return {
+      attempts,
+      elapsedMs: Date.now() - startedAt,
+      measurement: last
+    };
+  }
+
+  function getControlledPdfQueryPage(pageNumber) {
+    const viewer = runtime.pdfControlledViewer;
+    const page = Number(pageNumber) || 0;
+    if (!viewer || !viewer.pages || !page) return null;
+    const pageHost = viewer.pages.get(page);
+    return pageHost && pageHost.isConnected ? pageHost : null;
+  }
+
+  function getControlledPdfQueryScrollState() {
+    const viewer = runtime.pdfControlledViewer || null;
+    const element = viewer && viewer.scroll || null;
+    const rect = element && element.getBoundingClientRect ? element.getBoundingClientRect() : null;
+    const rootRect = viewer && viewer.root && viewer.root.getBoundingClientRect ? viewer.root.getBoundingClientRect() : null;
+    const visible = Boolean(
+      viewer
+      && viewer.root
+      && viewer.root.isConnected
+      && viewer.root.getAttribute("aria-hidden") !== "true"
+      && viewer.root.classList.contains("pagepilot-pdf-controlled-visible")
+    );
+    return {
+      element,
+      identity: describePdfQueryScrollElement(element),
+      scrollTop: getPdfScrollPosition(element),
+      scrollLeft: Number(element && element.scrollLeft) || 0,
+      rect: compactRect(rect),
+      rootRect: compactRect(rootRect),
+      visible,
+      currentPage: getControlledPdfQueryVisiblePageNumber(element),
+      routeKey: viewer && viewer.routeKey || ""
+    };
+  }
+
+  function getControlledPdfQueryViewportRect() {
+    const viewer = runtime.pdfControlledViewer;
+    const scroll = viewer && viewer.scroll || null;
+    return getPdfQueryViewportRect(scroll);
+  }
+
+  function getControlledPdfQueryVisiblePageNumber(scrollElement) {
+    const viewer = runtime.pdfControlledViewer;
+    const viewport = getPdfQueryViewportRect(scrollElement || viewer && viewer.scroll);
+    if (!viewer || !viewer.pages || !viewport) return 0;
+    let bestPage = 0;
+    let bestOverlap = 0;
+    viewer.pages.forEach((pageHost, pageNumber) => {
+      if (!pageHost || !pageHost.getBoundingClientRect) return;
+      const rect = pageHost.getBoundingClientRect();
+      const width = Math.min(rect.right, viewport.right) - Math.max(rect.left, viewport.left);
+      const height = Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top);
+      const overlap = Math.max(0, width) * Math.max(0, height);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestPage = Number(pageNumber) || 0;
+      }
+    });
+    return bestPage;
+  }
+
+  function getControlledPdfQueryMeasurementState(section, passage, pageNumber, beforeState) {
+    const page = getControlledPdfQueryPage(pageNumber);
+    const pageRect = page && page.getBoundingClientRect ? page.getBoundingClientRect() : null;
+    const expectedRect = getPdfQueryRelativeRect(pageRect, section);
+    const highlight = resolvePdfQueryHighlightElement(page);
+    const highlightRect = highlight && highlight.getBoundingClientRect ? highlight.getBoundingClientRect() : null;
+    const afterState = getControlledPdfQueryScrollState();
+    const viewportRect = getControlledPdfQueryViewportRect();
+    const queryTarget = runtime.pdfControlledViewer && runtime.pdfControlledViewer.lastQueryScrollTarget || null;
+    const targetScrollTop = queryTarget && queryTarget.sectionId === (section && section.id) && Number(queryTarget.pageNumber) === Number(pageNumber)
+      ? Number(queryTarget.targetTop || 0)
+      : 0;
+    const scrollWithinTolerance = targetScrollTop
+      ? Math.abs((afterState && Number(afterState.scrollTop || 0) || 0) - targetScrollTop) <= Math.max(36, Math.round((viewportRect && viewportRect.height || 600) * 0.08))
+      : false;
+    const pageVisible = rectIntersects(pageRect, viewportRect, 8);
+    const targetVisible = rectIntersects(expectedRect, viewportRect, 2);
+    const highlightVisible = rectIntersects(highlightRect, viewportRect, 2);
+    const highlightOverlapsTarget = Boolean(highlightRect && expectedRect && rectsOverlap(highlightRect, expectedRect, 0.08));
+    const rendered = Boolean(page && page.dataset.rendered === "true");
+    const viewerVisible = Boolean(afterState && afterState.visible);
+    const scrollChanged = Boolean(
+      beforeState
+      && afterState
+      && beforeState.element === afterState.element
+      && (
+        Math.abs((afterState.scrollTop || 0) - (beforeState.scrollTop || 0)) > 2
+        || Math.abs((afterState.scrollLeft || 0) - (beforeState.scrollLeft || 0)) > 2
+      )
+    );
+    const ocrExact = isOcrPdfSection(section)
+      ? Boolean(getVerifiedPdfOcrHighlightGeometry(section).exact)
+      : false;
+    const hasPassageGeometry = Boolean(
+      passage && (passage.id || passage.relativeYStart || passage.relativeYEnd)
+      || section && section.unitMeta && (section.unitMeta.queryTextRectResolved || section.unitMeta.queryPassageId)
+    );
+    const verified = Boolean(viewerVisible && rendered && pageVisible && (targetVisible || highlightVisible) && (!highlightRect || highlightOverlapsTarget || highlightVisible));
+    const exact = Boolean(verified && highlightRect && highlightOverlapsTarget && (ocrExact || hasPassageGeometry));
+    const reason = verified
+      ? exact ? "controlled-exact-passage-visible" : "controlled-target-page-visible"
+      : !viewerVisible ? "controlled-viewer-not-visible"
+        : !page ? "controlled-target-page-not-mounted"
+          : !rendered ? "controlled-target-page-not-rendered"
+            : !pageVisible ? "controlled-target-page-not-visible"
+              : !targetVisible && !highlightVisible ? "controlled-target-passage-not-visible"
+                : highlightRect && !highlightOverlapsTarget ? "controlled-highlight-not-overlapping-target"
+                  : "controlled-not-confirmed";
+    return {
+      strategy: "controlled-pdf-query",
+      viewerType: "controlled",
+      currentPage: afterState && afterState.currentPage || 0,
+      currentPageBefore: beforeState && beforeState.currentPage || 0,
+      targetPage: Number(pageNumber) || 0,
+      viewerVisible,
+      rendered,
+      pageVisible,
+      targetVisible,
+      highlightVisible,
+      highlightOverlapsTarget,
+      scrollChanged,
+      scrollContainerBefore: beforeState && beforeState.identity || null,
+      scrollContainerAfter: afterState && afterState.identity || null,
+      scrollTopBefore: beforeState && Number(beforeState.scrollTop || 0) || 0,
+      scrollTopAfter: afterState && Number(afterState.scrollTop || 0) || 0,
+      targetScrollTop,
+      scrollWithinTolerance,
+      viewportRect: compactRect(viewportRect),
+      pageRect: compactRect(pageRect),
+      targetRect: compactRect(expectedRect),
+      highlightRect: compactRect(highlightRect),
+      rootRect: afterState && afterState.rootRect || null,
+      reason,
+      exact,
+      verified
+    };
+  }
+
+  function verifyControlledPdfQueryNavigation(section, passage, pageNumber, beforeState, options = {}) {
+    const measurement = getControlledPdfQueryMeasurementState(section, passage, pageNumber, beforeState);
+    emitDebug("section-query:navigation-measured", {
+      sectionId: section && section.id || "",
+      passageId: passage && passage.id || "",
+      pageNumber,
+      strategy: "controlled-pdf-query",
+      viewerType: "controlled",
+      currentPage: measurement.currentPage,
+      currentPageBefore: measurement.currentPageBefore,
+      pageVisible: measurement.pageVisible,
+      targetVisible: measurement.targetVisible,
+      highlightVisible: measurement.highlightVisible,
+      highlightOverlapsTarget: measurement.highlightOverlapsTarget,
+      scrollChanged: measurement.scrollChanged,
+      scrollContainerBefore: measurement.scrollContainerBefore,
+      scrollContainerAfter: measurement.scrollContainerAfter,
+      scrollTopBefore: measurement.scrollTopBefore,
+      scrollTopAfter: measurement.scrollTopAfter,
+      targetScrollTop: measurement.targetScrollTop,
+      scrollWithinTolerance: measurement.scrollWithinTolerance,
+      pollingAttempts: options.attempts || 0,
+      reason: measurement.reason,
+      exact: measurement.exact,
+      verified: measurement.verified,
+      viewportRect: measurement.viewportRect,
+      pageRect: measurement.pageRect,
+      targetRect: measurement.targetRect,
+      highlightRect: measurement.highlightRect,
+      rootRect: measurement.rootRect,
+      exactIssue: measurement.verified ? "none" : "Controlled PDF query navigation was measured but not visibly confirmed."
+    });
+    return measurement;
+  }
+
+  function sleepPdfQuery(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  }
+
+  function createPdfQueryTargetSection(section, passage) {
+    const meta = section.unitMeta && typeof section.unitMeta === "object" ? section.unitMeta : {};
+    const pageNumber = Number(passage && passage.pageNumber || section.pageNumber || meta.pageNumber) || 0;
+    const start = Number(passage && passage.relativeYStart);
+    const end = Number(passage && passage.relativeYEnd);
+    const center = Number(passage && passage.relativeY);
+    const text = normalizePdfQueryText(passage && passage.text || section.text || "");
+    const targetMeta = {
+      ...meta,
+      pageNumber,
+      queryPassageId: passage && passage.id || "",
+      queryPassageSurface: "pdf",
+      sectionText: text || meta.sectionText || section.text || "",
+      sectionTextSample: (text || section.text || "").slice(0, 300),
+      relativeY: Number.isFinite(center) ? center : Number.isFinite(start) && Number.isFinite(end) ? (start + end) / 2 : meta.relativeY,
+      relativeYStart: Number.isFinite(start) ? start : meta.relativeYStart,
+      relativeYEnd: Number.isFinite(end) ? end : meta.relativeYEnd,
+      sourceLineIds: Array.isArray(passage && passage.sourceLineIds) && passage.sourceLineIds.length ? passage.sourceLineIds : meta.sourceLineIds,
+      ocrSourceLines: Array.isArray(passage && passage.ocrSourceLines) && passage.ocrSourceLines.length ? passage.ocrSourceLines : meta.ocrSourceLines,
+      queryText: passage && passage.queryText || meta.queryText || "",
+      ocr: meta.ocr || passage && passage.sourceType === "ocr",
+      kind: passage && passage.sourceType === "ocr" ? "pdf-ocr" : meta.kind,
+      ocrConfidence: passage && passage.ocrConfidence || meta.ocrConfidence
+    };
+    return {
+      ...section,
+      pageNumber,
+      title: passage && (passage.title || passage.label) || section.title,
+      text: text || section.text,
+      unitMeta: targetMeta
+    };
+  }
+
+  function refinePdfQueryTargetSectionForTextRect(section, passage, pageNumber) {
+    if (!section || !passage || passage.sourceType === "ocr") return section;
+    const page = pageNumber ? findPdfPageElement(pageNumber) : null;
+    const pageRect = page && page.getBoundingClientRect ? page.getBoundingClientRect() : null;
+    const textRect = resolvePdfQueryTextRect(page, passage);
+    if (!pageRect || !textRect || !pageRect.height) return section;
+    const start = Math.max(0.02, Math.min(0.94, (textRect.top - pageRect.top) / pageRect.height));
+    const end = Math.max(start + 0.035, Math.min(0.98, (textRect.bottom - pageRect.top) / pageRect.height));
+    return {
+      ...section,
+      unitMeta: {
+        ...(section.unitMeta || {}),
+        relativeY: (start + end) / 2,
+        relativeYStart: start,
+        relativeYEnd: end,
+        queryTextRectResolved: true
+      }
+    };
+  }
+
+  function emitPdfQueryNavigationDebug(result, section) {
+    const event = result && result.navigated
+      ? result.exact ? "section-query:navigation-verified" : "section-query:navigation-approximate"
+      : "section-query:navigation-failed";
+    const pageNumber = result && result.pageNumber || section && getPdfSectionPageNumber(section) || 0;
+    const controlled = /^controlled/.test(String(result && result.strategy || ""));
+    const page = controlled ? getControlledPdfQueryPage(pageNumber) : pageNumber ? findPdfPageElement(pageNumber) : null;
+    const rect = page && page.getBoundingClientRect ? page.getBoundingClientRect() : null;
+    emitDebug(event, {
+      surface: "pdf",
+      sectionId: result && result.sectionId || section && section.id || "",
+      passageId: result && result.passageId || "",
+      pageNumber,
+      strategy: result && result.strategy || "",
+      reason: result && result.reason || "",
+      measurement: result && result.measurement || null,
+      visibleTargetRect: rect ? { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) } : null,
+      exactIssue: result && result.exact ? "none" : result && result.reason || "PDF passage navigation was not exact."
+    });
+  }
+
+  function getPdfQueryScrollState(pageNumber = 0) {
+    const page = pageNumber ? findPdfPageElement(pageNumber) : null;
+    if (page) {
+      const container = findPdfScrollableContainer(page);
+      const element = container === window ? document.scrollingElement || document.documentElement : container;
+      const rect = element && element.getBoundingClientRect ? element.getBoundingClientRect() : null;
+      return {
+        element,
+        scrollTop: getPdfScrollPosition(element),
+        scrollLeft: Number(element && element.scrollLeft) || 0,
+        rect: rect ? { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height } : null
+      };
+    }
+    const candidates = typeof getPdfScrollCandidatesDetailed === "function" ? getPdfScrollCandidatesDetailed() : [];
+    const first = candidates.find((item) => item && item.element && isPdfElementScrollableContainer(item.element)) || null;
+    const element = first && first.element || document.scrollingElement || document.documentElement;
+    const rect = element && element.getBoundingClientRect ? element.getBoundingClientRect() : null;
+    return {
+      element,
+      scrollTop: getPdfScrollPosition(element),
+      scrollLeft: Number(element && element.scrollLeft) || 0,
+      rect: rect ? { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height } : null
+    };
+  }
+
+  function verifyPdfQueryNavigation(section, passage, pageNumber, strategy, beforeState, options = {}) {
+    const page = pageNumber ? findPdfPageElement(pageNumber) : null;
+    const pageRect = page && page.getBoundingClientRect ? page.getBoundingClientRect() : null;
+    const textRect = resolvePdfQueryTextRect(page, passage);
+    const expectedRect = textRect || getPdfQueryRelativeRect(pageRect, section);
+    const highlight = resolvePdfQueryHighlightElement(page);
+    const highlightRect = highlight && highlight.getBoundingClientRect ? highlight.getBoundingClientRect() : null;
+    const afterState = getPdfQueryScrollState(pageNumber);
+    const viewportRect = getPdfQueryViewportRect(afterState && afterState.element);
+    const scrollChanged = Boolean(
+      beforeState
+      && afterState
+      && beforeState.element === afterState.element
+      && (
+        Math.abs((afterState.scrollTop || 0) - (beforeState.scrollTop || 0)) > 2
+        || Math.abs((afterState.scrollLeft || 0) - (beforeState.scrollLeft || 0)) > 2
+      )
+    );
+    const pageVisible = rectIntersects(pageRect, viewportRect, 8);
+    const targetVisible = rectIntersects(expectedRect, viewportRect, 2);
+    const highlightVisible = rectIntersects(highlightRect, viewportRect, 2);
+    const highlightOverlapsTarget = Boolean(highlightRect && expectedRect && rectsOverlap(highlightRect, expectedRect, 0.08));
+    const hasExactTarget = Boolean(textRect || passage && passage.sourceLineIds && passage.sourceLineIds.length);
+    const viewerPage = readChromePdfViewerPageNumber() || 0;
+    const currentPage = viewerPage || runtime.pdfActivePage || 0;
+    const nativePageConfirmed = Boolean(!pageRect && viewerPage && Number(viewerPage) === Number(pageNumber));
+    const verified = Boolean(
+      pageVisible && (targetVisible || highlightVisible) && (!highlightRect || highlightOverlapsTarget || highlightVisible)
+      || nativePageConfirmed
+    );
+    const exact = Boolean(verified && hasExactTarget && highlightRect && (highlightOverlapsTarget || textRect && rectsOverlap(highlightRect, textRect, 0.05)));
+    const beforeIdentity = beforeState && describePdfQueryScrollElement(beforeState.element) || null;
+    const afterIdentity = afterState && describePdfQueryScrollElement(afterState.element) || null;
+    const reason = verified
+      ? exact ? "exact-passage-visible" : nativePageConfirmed ? "native-viewer-page-confirmed" : "target-page-visible"
+      : !page ? "target-page-not-mounted"
+        : !pageVisible ? "target-page-not-visible"
+          : !targetVisible && !highlightVisible ? "target-passage-not-visible"
+            : highlightRect && !highlightOverlapsTarget ? "highlight-not-overlapping-target"
+              : "not-confirmed";
+    emitDebug("section-query:navigation-measured", {
+      sectionId: section && section.id || "",
+      passageId: passage && passage.id || "",
+      pageNumber,
+      strategy,
+      viewerType: runtime.pdfControlledViewer && runtime.pdfControlledViewer.root ? "controlled" : page ? "dom-page" : viewerPage ? "native-viewer" : "unknown",
+      currentPage,
+      viewerPage,
+      pageVisible,
+      targetVisible,
+      highlightVisible,
+      highlightOverlapsTarget,
+      scrollChanged,
+      scrollContainerBefore: beforeIdentity,
+      scrollContainerAfter: afterIdentity,
+      scrollTopBefore: beforeState && Number(beforeState.scrollTop || 0) || 0,
+      scrollTopAfter: afterState && Number(afterState.scrollTop || 0) || 0,
+      pollingAttempts: options.attempts || 0,
+      pageWait: options.pageWait || null,
+      reason,
+      exact,
+      verified,
+      viewportRect: compactRect(viewportRect),
+      pageRect: compactRect(pageRect),
+      targetRect: compactRect(expectedRect),
+      highlightRect: compactRect(highlightRect),
+      exactIssue: verified ? "none" : "PDF query navigation was measured but not visibly confirmed."
+    });
+    return {
+      verified,
+      exact,
+      pageVisible,
+      targetVisible,
+      highlightVisible,
+      highlightOverlapsTarget,
+      scrollChanged,
+      reason,
+      viewerType: runtime.pdfControlledViewer && runtime.pdfControlledViewer.root ? "controlled" : page ? "dom-page" : viewerPage ? "native-viewer" : "unknown",
+      currentPage,
+      viewerPage,
+      scrollContainerBefore: beforeIdentity,
+      scrollContainerAfter: afterIdentity,
+      scrollTopBefore: beforeState && Number(beforeState.scrollTop || 0) || 0,
+      scrollTopAfter: afterState && Number(afterState.scrollTop || 0) || 0,
+      viewportRect: compactRect(viewportRect),
+      pageRect: compactRect(pageRect),
+      targetRect: compactRect(expectedRect),
+      highlightRect: compactRect(highlightRect)
+    };
+  }
+
+  function describePdfQueryScrollElement(element) {
+    if (!element) return null;
+    if (element === window) return { kind: "window" };
+    if (element === document.scrollingElement || element === document.documentElement) return { kind: "document" };
+    if (typeof describePdfElement === "function") return describePdfElement(element);
+    return {
+      tag: element.tagName ? element.tagName.toLowerCase() : "",
+      id: element.id || "",
+      className: String(element.className || "").slice(0, 80)
+    };
+  }
+
+  function getPdfQueryViewportRect(scrollElement) {
+    if (scrollElement && scrollElement !== document.body && scrollElement !== document.documentElement && scrollElement.getBoundingClientRect) {
+      const rect = scrollElement.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height };
+    }
+    return { top: 0, left: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight };
+  }
+
+  function resolvePdfQueryTextRect(page, passage) {
+    if (!page || !passage || !passage.text) return null;
+    const text = normalizePdfQueryText(passage.text).slice(0, 160).toLowerCase();
+    const queryText = normalizePdfQueryText(passage.queryText || "").toLowerCase();
+    if (!text && !queryText) return null;
+    const queryTerms = queryText.split(/\s+/).filter((term) => term.length >= 4).slice(0, 10);
+    const terms = queryTerms.length
+      ? queryTerms
+      : text.split(/\s+/).filter((term) => term.length >= 5).slice(0, 8);
+    const candidates = Array.from(page.querySelectorAll(".textLayer p, .textLayer span, .textLayer div, [data-page-number] p, [data-page-number] span"))
+      .filter((node) => node && node.getBoundingClientRect);
+    let best = null;
+    let bestScore = 0;
+    candidates.forEach((node) => {
+      const value = normalizePdfQueryText(node.textContent || "").toLowerCase();
+      if (!value) return;
+      const phraseBonus = queryText && value.includes(queryText) ? 4 : 0;
+      const score = terms.reduce((sum, term) => sum + (value.includes(term) ? 1 : 0), 0) + phraseBonus;
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+    });
+    if (!best || bestScore < Math.min(queryTerms.length ? 2 : 2, terms.length || 1)) return null;
+    const rect = best.getBoundingClientRect();
+    return rect && rect.width && rect.height ? rect : null;
+  }
+
+  function getPdfQueryRelativeRect(pageRect, section) {
+    if (!pageRect) return null;
+    const range = getPdfSectionRelativeYRange(section);
+    const top = pageRect.top + pageRect.height * Math.max(0.02, Math.min(0.96, range.start));
+    const bottom = pageRect.top + pageRect.height * Math.max(range.start + 0.035, Math.min(0.98, range.end));
+    return {
+      top,
+      bottom,
+      left: pageRect.left,
+      right: pageRect.right,
+      width: pageRect.width,
+      height: Math.max(1, bottom - top)
+    };
+  }
+
+  function resolvePdfQueryHighlightElement(page) {
+    if (runtime.pdfControlledViewer && Array.isArray(runtime.pdfControlledViewer.highlights) && runtime.pdfControlledViewer.highlights.length) {
+      return runtime.pdfControlledViewer.highlights[0];
+    }
+    return page && page.querySelector
+      ? page.querySelector(".pagepilot-pdf-page-section-highlight, .pagepilot-controlled-pdf-highlight")
+      : document.querySelector(".pagepilot-pdf-page-section-highlight, .pagepilot-controlled-pdf-highlight, .pagepilot-pdf-focus-overlay");
+  }
+
+  function rectIntersects(rect, viewport, minPixels = 1) {
+    if (!rect || !viewport) return false;
+    const width = Math.min(rect.right, viewport.right) - Math.max(rect.left, viewport.left);
+    const height = Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top);
+    return width >= minPixels && height >= minPixels;
+  }
+
+  function rectsOverlap(a, b, minRatio = 0.05) {
+    if (!a || !b) return false;
+    const width = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    const height = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+    if (width <= 0 || height <= 0) return false;
+    const overlap = width * height;
+    const area = Math.max(1, Math.min((a.right - a.left) * (a.bottom - a.top), (b.right - b.left) * (b.bottom - b.top)));
+    return overlap / area >= minRatio;
+  }
+
+  function compactRect(rect) {
+    return rect ? {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      right: Math.round(rect.right),
+      bottom: Math.round(rect.bottom),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    } : null;
+  }
+
+  function normalizePdfQueryText(text) {
+    return String(text || "")
+      .replace(/\bdownloaded from journal homepage copyright page\s+\d+\s+of\s+\d+\b/gi, " ")
+      .replace(/\bpage\s+\d+\s+of\s+\d+\b/gi, " ")
+      .replace(/([A-Za-z]{2,})-\s+([a-z]{2,})/g, "$1$2 $1 $2")
+      .replace(/\s*\n\s*/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function splitPdfQueryText(text) {
+    const normalized = normalizePdfQueryText(text);
+    const paragraphs = normalized.split(/\s{2,}|(?<=\.)\s+(?=(?:Abstract|Methods|Results|Conclusion|Discussion|Figure|Table)\b)/i)
+      .map((item) => item.trim())
+      .filter((item) => countWordsLocal(item) >= 8 && !isPdfFurnitureText(item));
+    if (paragraphs.length > 1) return paragraphs;
+    const sentences = normalized.match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g) || [normalized];
+    const chunks = [];
+    let current = "";
+    sentences.forEach((sentence) => {
+      const next = normalizePdfQueryText(`${current} ${sentence}`);
+      if (countWordsLocal(next) > 95 && current) {
+        chunks.push(current);
+        current = normalizePdfQueryText(sentence);
+      } else {
+        current = next;
+      }
+    });
+    if (current) chunks.push(current);
+    return chunks.filter((item) => countWordsLocal(item) >= 6 && !isPdfFurnitureText(item)).slice(0, 36);
+  }
+
+  function pdfQueryPassageTitle(section, text, pageNumber) {
+    const clean = normalizePdfQueryText(text);
+    const first = clean.split(/[.!?]\s/)[0] || clean;
+    const prefix = pageNumber ? `Page ${pageNumber}` : section && section.title || "PDF";
+    return `${prefix}: ${first.slice(0, 90)}`;
+  }
+
+  function isPdfFurnitureText(text) {
+    const value = normalizePdfQueryText(text).toLowerCase();
+    if (!value) return true;
+    if (/^(copyright|all rights reserved|references|bibliography|works cited)\b/.test(value)) return true;
+    if (/^page\s+\d+\s*(?:of\s+\d+)?$/i.test(value)) return true;
+    if (countWordsLocal(value) <= 12 && /\b(doi|issn|isbn|copyright|downloaded|journal homepage|page)\b/.test(value)) return true;
+    return false;
+  }
+
+  function countWordsLocal(text) {
+    const matches = String(text || "").match(/\b[\w'-]+\b/g);
+    return matches ? matches.length : 0;
+  }
+
+  function hashPdfQueryText(text) {
+    if (runtime.engine && runtime.engine.helpers && typeof runtime.engine.helpers.hashText === "function") {
+      return runtime.engine.helpers.hashText(text);
+    }
+    let hash = 2166136261;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    return Math.abs(hash >>> 0).toString(36);
+  }
+
   function jumpToUsefulPart() {
     if (!runtime.model || !runtime.model.hasStrongTarget) {
       if (isGoogleDocsActionContext(runtime.model)) {
@@ -13554,7 +15758,9 @@
           || runtime.model.importantSections.find((section) => (isSyntheticPdfSection(section) || isOcrPdfSection(section)) && section.id !== runtime.view.activeId)
           || null;
       }
-      return runtime.model.sections.find((section) => section.id === runtime.model.nextImportantId)
+      const selection = selectNextTarget("action-peek", { preview: true });
+      return selection.section
+        || runtime.model.sections.find((section) => section.id === runtime.model.nextImportantId)
         || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)
         || null;
     }
@@ -13922,6 +16128,9 @@
     const targetKey = getPdfActionTargetKey(type, section, pageNumber, details);
     const current = runtime.pdfAction || {};
     if (
+      !details.forceNew
+      && type !== "query"
+      &&
       current.activeActionId
       && !current.completed
       && !current.cancelled
@@ -13956,6 +16165,9 @@
       phase: "starting",
       targetPage: pageNumber,
       targetSectionId: section && section.id || details.sectionId || "",
+      queryRequestId: Number(details.queryRequestId || 0) || 0,
+      passageId: String(details.passageId || ""),
+      routeKey,
       targetKey,
       startedAt: now,
       updatedAt: now,
@@ -14055,11 +16267,142 @@
     return true;
   }
 
+  function ensurePdfSidebarModel(reason = "sidebar-open") {
+    if (adoptAuthoritativePdfModel(reason)) return "authoritative";
+    if (adoptExistingPdfActionModel(reason)) return "stable";
+    if (hydratePdfSessionCache(getPdfDocumentRouteKey())) {
+      const recovered = buildRecoveredPdfModelFromCache(getPdfDocumentRouteKey(), reason, runtime.model);
+      if (recovered && isUsablePdfStatsModel(recovered, true)) {
+        runtime.model = recovered;
+        rememberStablePdfModel(runtime.model, reason);
+        return "session-cache";
+      }
+    }
+    if (!runtime.model && runtime.engine) {
+      try {
+        scanPage(reason);
+      } catch (error) {
+        emitDebug("pdf-sidebar:open-failed", {
+          reason,
+          error: String(error && error.message ? error.message : error),
+          exactIssue: "A sidebar-open scan failed before a PDF model could be rendered."
+        });
+      }
+    }
+    return runtime.model ? "runtime" : "";
+  }
+
+  function ensureSidebarRootConnected(reason = "sidebar-open") {
+    const root = runtime.ui && runtime.ui.getRoot ? runtime.ui.getRoot() : document.getElementById(ROOT_ID);
+    if (root && root.isConnected) {
+      const duplicates = Array.from(document.querySelectorAll(`#${ROOT_ID}`)).filter((item) => item !== root);
+      duplicates.forEach((item) => item.remove());
+      if (duplicates.length) {
+        emitDebug("pdf-sidebar:duplicate-root-prevented", {
+          count: duplicates.length,
+          reason,
+          exactIssue: "Duplicate sidebar roots were removed before opening the PDF sidebar."
+        });
+      }
+      return true;
+    }
+    if (root && !root.isConnected) {
+      emitDebug("pdf-sidebar:host-detached", {
+        reason,
+        exactIssue: "The existing sidebar root was detached; SkimRoute will remount the normal sidebar root."
+      });
+    }
+    try {
+      if (runtime.ui && typeof runtime.ui.destroy === "function") runtime.ui.destroy();
+      if (runtime.ui && typeof runtime.ui.mount === "function") runtime.ui.mount();
+      emitDebug("pdf-sidebar:mount-requested", {
+        reason,
+        exactIssue: "The normal SkimRoute sidebar root was mounted for a PDF surface."
+      });
+      return Boolean(runtime.ui && runtime.ui.getRoot && runtime.ui.getRoot() && runtime.ui.getRoot().isConnected);
+    } catch (error) {
+      emitDebug("pdf-sidebar:open-failed", {
+        reason,
+        error: String(error && error.message ? error.message : error),
+        exactIssue: "Sidebar root mount threw while opening on a PDF surface."
+      });
+      return false;
+    }
+  }
+
+  function measureSidebarOpenResult(requestedOpen, source, modelSource = "") {
+    const root = runtime.ui && runtime.ui.getRoot ? runtime.ui.getRoot() : document.getElementById(ROOT_ID);
+    const sidebar = root && root.querySelector ? root.querySelector(".pp-sidebar") : null;
+    const style = sidebar ? window.getComputedStyle(sidebar) : null;
+    const rect = sidebar && sidebar.getBoundingClientRect ? sidebar.getBoundingClientRect() : null;
+    const visible = Boolean(
+      requestedOpen
+      && root
+      && root.isConnected
+      && sidebar
+      && style
+      && style.display !== "none"
+      && style.visibility !== "hidden"
+      && Number(style.opacity || 0) > 0
+      && rect
+      && rect.width > 80
+      && rect.height > 80
+      && rect.right > 0
+      && rect.bottom > 0
+      && rect.left < window.innerWidth
+      && rect.top < window.innerHeight
+    );
+    const result = {
+      requested: Boolean(requestedOpen),
+      mounted: Boolean(root && root.isConnected && sidebar),
+      visible,
+      surface: "pdf",
+      modelSource: modelSource || (runtime.model ? "runtime" : ""),
+      reason: visible
+        ? "Sidebar opened."
+        : requestedOpen
+          ? "SkimRoute could not open the sidebar for this PDF. Try reloading the PDF."
+          : "Sidebar minimized.",
+      updatedAt: Date.now()
+    };
+    runtime.sidebarOpenResult = result;
+    emitDebug(visible ? "pdf-sidebar:visible" : requestedOpen ? "pdf-sidebar:open-failed" : "pdf-sidebar:mounted", {
+      source: source || "",
+      requested: result.requested,
+      mounted: result.mounted,
+      visible: result.visible,
+      surface: result.surface,
+      modelSource: result.modelSource,
+      sectionCount: runtime.model && runtime.model.sections ? runtime.model.sections.length : 0,
+      rootConnected: Boolean(root && root.isConnected),
+      display: style && style.display || "",
+      visibility: style && style.visibility || "",
+      opacity: style && style.opacity || "",
+      zIndex: style && style.zIndex || "",
+      pointerEvents: style && style.pointerEvents || "",
+      rect: rect ? { left: Math.round(rect.left), top: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) } : null,
+      exactIssue: visible ? "none" : result.reason
+    });
+    return result;
+  }
+
   function runPdfAction(type, options = {}) {
     if (!isPdfActionContext()) return false;
     const routeKey = getRouteCacheKey();
     emitPdfActionCommandRouted(type, options, { routeKey, stage: "action-controller", command: "pdf-navigation" });
     const wantsOpen = options.open !== false;
+    let sidebarModelSource = "";
+    if (type === "toggle") {
+      emitDebug("pdf-sidebar:open-requested", {
+        source: options.source || "",
+        requestedOpen: wantsOpen,
+        routeKey,
+        ocrState: runtime.pdfOcr && runtime.pdfOcr.state || "",
+        exactIssue: "none"
+      });
+      sidebarModelSource = ensurePdfSidebarModel("pdf-sidebar:open");
+      ensureSidebarRootConnected("pdf-sidebar:open");
+    }
     if (wantsOpen) {
       setMode("open", { focus: Boolean(options.focus), persist: true });
     } else if (type === "toggle") {
@@ -14067,6 +16410,7 @@
     }
 
     if (type === "toggle") {
+      const sidebarResult = measureSidebarOpenResult(wantsOpen, options.source || "popup", sidebarModelSource);
       const token = makePdfActionId("toggle");
       runtime.pdfAction = {
         token,
@@ -14097,10 +16441,10 @@
         pdfRetrying: Boolean(runtime.pdfOcr && runtime.pdfOcr.retrying),
         exactIssue: "PDF sidebar toggle does not require PDF status verification, cache hydration, OCR geometry, or a ready target section."
       });
-      setActionResult("toggle", true, {
+      setActionResult("toggle", wantsOpen ? sidebarResult.visible : true, {
         phase: "completed",
         actionToken: token,
-        message: wantsOpen ? "Sidebar opened." : "Sidebar minimized."
+        message: sidebarResult.reason
       });
       emitDebug("pdf:action:completed", {
         type,
@@ -14111,9 +16455,12 @@
         open: wantsOpen,
         durationMs: 0,
         blockedReason: "",
-        exactIssue: "PDF sidebar toggle completed without waiting for map readiness."
+        mounted: sidebarResult.mounted,
+        visible: sidebarResult.visible,
+        modelSource: sidebarResult.modelSource,
+        exactIssue: sidebarResult.visible || !wantsOpen ? "none" : sidebarResult.reason
       });
-      return true;
+      return wantsOpen ? sidebarResult.visible : true;
     }
 
     const targetSelectionStartedAt = Date.now();
@@ -14426,9 +16773,15 @@
           message = `Jumped${pageNumber ? ` to Page ${pageNumber}` : ""}.`;
         }
       } else if (ok) {
-        message = type === "next" ? "Moved to the next important section." : "Jumped to the useful section.";
+        message = type === "next"
+          ? runtime.model && runtime.model.nextReason || "Moved to the next useful section."
+          : type === "query"
+            ? "Found the matching section."
+            : "Jumped to the useful section.";
       } else {
-        message = isPdf
+        message = type === "query"
+          ? "No strong section match found on this page."
+          : isPdf
           ? "SkimRoute found a PDF map, but Chrome did not expose a reliable jump target yet."
           : "SkimRoute could not find a jump target on this page yet.";
       }
@@ -14489,7 +16842,7 @@
     return runtime.lastAction;
   }
 
-  function jumpToNextImportant() {
+  function jumpToNextImportant(existingSelection) {
     if (hasSyntheticPdfSections()) {
       refreshActivePdfSection();
       if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
@@ -14505,8 +16858,11 @@
       }
       return false;
     }
-    const targetId = runtime.model.nextImportantId
+    const selection = existingSelection && existingSelection.sectionId ? existingSelection : selectNextTarget("next");
+    const targetId = selection.sectionId || runtime.model.nextImportantId
       || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id;
+    runtime.model.nextImportantId = targetId || "";
+    runtime.model.nextReason = selection.reason || runtime.model.nextReason || "";
     return scrollToSection(targetId, { highlight: true, actionType: "next" });
   }
 
@@ -14866,6 +17222,7 @@
       return false;
     }
     runtime.view.activeId = section.id;
+    recordNavigationSelection(section, options.source || options.actionType || "section");
     if (expandAncestors(section.id)) {
       render();
     } else if (runtime.ui) {
@@ -15401,6 +17758,7 @@
     }
 
     runtime.view.activeId = section.id;
+    recordNavigationSelection(section, options && (options.source || options.actionType) || "section");
     if (expandAncestors(section.id)) {
       render();
     } else {
@@ -15817,6 +18175,7 @@
   function setPdfActiveTarget(section, pageNumber, mode) {
     if (!section) return;
     runtime.view.activeId = section.id;
+    recordNavigationSelection(section, mode || "pdf");
     runtime.lastPdfJumpTarget = {
       routeKey: getPdfDocumentRouteKey(),
       sectionId: section.id,
@@ -16069,7 +18428,7 @@
       const maxScroll = candidate === window
         ? Math.max(0, (document.scrollingElement || document.documentElement).scrollHeight - window.innerHeight)
         : Math.max(0, candidate.scrollHeight - candidate.clientHeight);
-      if (maxScroll < 24) continue;
+      if (maxScroll < 24 || !isPdfElementScrollableContainer(candidate)) continue;
       const top = Math.round(maxScroll * ratio);
       const before = getPdfScrollPosition(candidate);
       if (candidate === window) {
@@ -16306,11 +18665,9 @@
       if (sectionPosition <= marker) active = section;
     });
 
-    const nextImportant = runtime.model.importantSections.find((section) => {
-      const sectionPosition = scroller ? section.top - viewportTop + scrollTop : section.top;
-      return sectionPosition > marker + 80 && section.id !== active.id;
-    });
-    runtime.model.nextImportantId = nextImportant ? nextImportant.id : null;
+    const nextSelection = selectNextTarget("scroll-preview", { preview: true });
+    runtime.model.nextImportantId = nextSelection.sectionId || null;
+    runtime.model.nextReason = nextSelection.reason || "";
 
     if (active && active.id !== runtime.view.activeId) {
       runtime.view.activeId = active.id;
@@ -16621,6 +18978,9 @@
     const publicWords = Number(model.totalReadableWords || model.totalWords || 0);
     const pdfLike = Boolean(model.pageProfile.type === "pdf" || pdfRouteLocked);
     const bestSection = publicSections.find((section) => section.id === model.bestSectionId) || null;
+    if (model === runtime.model) {
+      refreshNextPreview("stats");
+    }
     if (hasSyntheticPdfSections()) {
       refreshActivePdfSection();
     }
@@ -16784,6 +19144,15 @@
       nextPage: getPdfSectionPageNumber(nextImportant),
       note: "Use pdf:action:* logs for clicks, pdf:cache:persistent-* logs for saved maps, and pdf:ocr:* logs for local OCR responsiveness."
     } : null;
+    if (
+      pdfLike
+      && runtime.view.mode === "open"
+      && runtime.sidebarOpenResult
+      && runtime.sidebarOpenResult.requested
+      && !runtime.sidebarOpenResult.visible
+    ) {
+      measureSidebarOpenResult(true, "status-recheck", runtime.sidebarOpenResult.modelSource || snapshot.snapshotSource || "runtime");
+    }
 
     const publicStats = {
       ok: true,
@@ -16829,7 +19198,7 @@
       pdfOcrCanRunBetter,
       pdfOcrTakingLong,
       pdfOcrCancelled,
-      pdfOcrRecommendedMode: runtime.pdfOcr && runtime.pdfOcr.recommendedMode ? runtime.pdfOcr.recommendedMode : "fast",
+      pdfOcrRecommendedMode: pdfOcrCanRunBetter ? "better" : runtime.pdfOcr && runtime.pdfOcr.recommendedMode ? runtime.pdfOcr.recommendedMode : "fast",
       needsPdfOcr,
       ocrUnreadable,
       pdfError: stableOcrReady ? "" : runtime.pdfOcr && runtime.pdfOcr.lastError ? runtime.pdfOcr.lastError : "",
@@ -16860,7 +19229,9 @@
       pdfPartial: Boolean(runtime.pdfOcr && runtime.pdfOcr.partial),
       canJump: Boolean(bestSection && (model.hasStrongTarget || stableOcrReady) && !quietMode && (!loading || pdfActionable) && canJumpToSection(bestSection)),
       canJumpNext: Boolean(nextImportant && !quietMode && (!loading || pdfNextActionable) && canJumpToSection(nextImportant)),
+      nextImportantId: nextImportant ? nextImportant.id : "",
       nextImportantTitle: nextImportant ? nextImportant.title : "",
+      nextReason: model.nextReason || (nextImportant ? "Next useful section" : ""),
       bestTitle: pdfTerminalCopy ? pdfTerminalCopy.bestTitle : bestSection && (model.hasStrongTarget || stableOcrReady) ? bestSection.title : "",
       bestReason: publicBestReason,
       whyReason: publicBestReason,
@@ -16870,11 +19241,98 @@
       bestKind: model.bestKind || bestSection && bestSection.intelligence && bestSection.intelligence.role || "",
       bestKindLabel: model.bestKindLabel || bestSection && bestSection.intelligence && bestSection.intelligence.roleLabel || bestSection && bestSection.metrics && bestSection.metrics.sectionKindLabel || "",
       targetConfidenceReason: model.targetConfidenceReason || "",
-      savedMinutes: model.savedMinutes
+      savedMinutes: model.savedMinutes,
+      sectionQuery: normalizePublicSectionQuery(runtime.view.sectionQuery),
+      sidebarOpenResult: normalizePublicSidebarOpenResult(runtime.sidebarOpenResult)
     };
     return pdfLike
       ? finalizePdfPublicStatus(publicStats, model, { emit: false, reason: `public-stats:${snapshot.snapshotSource || "runtime"}` })
       : publicStats;
+  }
+
+  function normalizePublicSectionQuery(query) {
+    const state = query || createEmptySectionQuery();
+    return {
+      text: String(state.text || ""),
+      status: String(state.status || "idle"),
+      sectionId: String(state.sectionId || ""),
+      passageId: String(state.passageId || ""),
+      surface: String(state.surface || ""),
+      pageNumber: Number(state.pageNumber) || 0,
+      title: String(state.title || ""),
+      label: String(state.label || ""),
+      roleLabel: String(state.roleLabel || ""),
+      snippet: String(state.snippet || ""),
+      confidenceLabel: String(state.confidenceLabel || ""),
+      score: Number(state.score) || 0,
+      ocrExactMatches: Number(state.ocrExactMatches) || 0,
+      ocrFuzzyMatches: Number(state.ocrFuzzyMatches) || 0,
+      ocrFuzzyTerms: Array.isArray(state.ocrFuzzyTerms) ? state.ocrFuzzyTerms.slice(0, 4).map(String) : [],
+      ocrPhraseAcrossLines: Boolean(state.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: Number(state.ocrConfidenceAdjustment) || 0,
+      reason: String(state.reason || ""),
+      canNavigate: Boolean(state.canNavigate),
+      weakRequiresConfirm: Boolean(state.weakRequiresConfirm),
+      canRunBetterOcr: Boolean(state.canRunBetterOcr),
+      navigation: normalizePublicQueryNavigation(state.navigation),
+      alternatives: Array.isArray(state.alternatives) ? state.alternatives.slice(0, 2).map(normalizePublicSectionQueryAlternative) : [],
+      requestId: Number(state.requestId) || 0,
+      updatedAt: Number(state.updatedAt) || 0
+    };
+  }
+
+  function normalizePublicSidebarOpenResult(result) {
+    const state = result && typeof result === "object" ? result : {};
+    return {
+      requested: Boolean(state.requested),
+      mounted: Boolean(state.mounted),
+      visible: Boolean(state.visible),
+      surface: String(state.surface || ""),
+      modelSource: String(state.modelSource || ""),
+      reason: String(state.reason || ""),
+      updatedAt: Number(state.updatedAt) || 0
+    };
+  }
+
+  function normalizePublicSectionQueryAlternative(item) {
+    return {
+      sectionId: String(item && item.sectionId || ""),
+      passageId: String(item && item.passageId || ""),
+      surface: String(item && item.surface || ""),
+      pageNumber: Number(item && item.pageNumber) || 0,
+      title: String(item && item.title || ""),
+      label: String(item && item.label || ""),
+      roleLabel: String(item && item.roleLabel || ""),
+      snippet: String(item && item.snippet || ""),
+      confidenceLabel: String(item && item.confidenceLabel || "Weak"),
+      score: Number(item && item.score) || 0,
+      ocrExactMatches: Number(item && item.ocrExactMatches) || 0,
+      ocrFuzzyMatches: Number(item && item.ocrFuzzyMatches) || 0,
+      ocrFuzzyTerms: Array.isArray(item && item.ocrFuzzyTerms) ? item.ocrFuzzyTerms.slice(0, 4).map(String) : [],
+      ocrPhraseAcrossLines: Boolean(item && item.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: Number(item && item.ocrConfidenceAdjustment) || 0,
+      status: String(item && item.status || "weak"),
+      reason: String(item && item.reason || ""),
+      canNavigate: Boolean(item && item.canNavigate),
+      weakRequiresConfirm: true,
+      navigation: normalizePublicQueryNavigation(item && item.navigation)
+    };
+  }
+
+  function normalizePublicQueryNavigation(navigation) {
+    const state = navigation || createEmptyQueryNavigationResult();
+    return {
+      found: Boolean(state.found),
+      navigated: Boolean(state.navigated),
+      verified: Boolean(state.verified),
+      exact: Boolean(state.exact),
+      surface: String(state.surface || ""),
+      sectionId: String(state.sectionId || ""),
+      passageId: String(state.passageId || ""),
+      pageNumber: Number(state.pageNumber) || 0,
+      reason: String(state.reason || ""),
+      strategy: String(state.strategy || "")
+    };
   }
 
   function reasonForPublicSection(section) {
@@ -18195,8 +20653,25 @@
   function scrollPagePilotControlledPdfToSection(section, pageNumber, options = {}) {
     const viewer = runtime.pdfControlledViewer;
     const pageHost = viewer && viewer.pages && viewer.pages.get(Number(pageNumber));
-    const actionToken = options.actionToken || viewer && viewer.pendingTarget && viewer.pendingTarget.actionToken || runtime.pdfAction && (runtime.pdfAction.activeActionId || runtime.pdfAction.actionId || runtime.pdfAction.token) || "";
-    const actionType = viewer && viewer.pendingTarget && viewer.pendingTarget.actionType || options.actionType || runtime.pdfAction && runtime.pdfAction.type || "jump";
+    const requestedActionType = String(options.actionType || "");
+    const isQueryAction = requestedActionType === "query";
+    const actionToken = isQueryAction
+      ? String(options.actionToken || "")
+      : options.actionToken || viewer && viewer.pendingTarget && viewer.pendingTarget.actionToken || runtime.pdfAction && (runtime.pdfAction.activeActionId || runtime.pdfAction.actionId || runtime.pdfAction.token) || "";
+    const actionType = isQueryAction
+      ? "query"
+      : viewer && viewer.pendingTarget && viewer.pendingTarget.actionType || options.actionType || runtime.pdfAction && runtime.pdfAction.type || "jump";
+    if (isQueryAction && !actionToken) {
+      emitDebug("pdf-query-action:failed", {
+        requestId: Number(options.queryRequestId || 0) || 0,
+        queryActionToken: "",
+        sectionId: section && section.id,
+        targetPage: Number(pageNumber) || 0,
+        reason: "missing-query-action-token",
+        exactIssue: "Controlled PDF query scroll refused to borrow a stale Jump/Next/PDF Mode token."
+      });
+      return false;
+    }
     if (actionToken && !isPdfActionActive(actionToken)) {
       emitDebug("pdf:action:cancelled", {
         actionId: actionToken,
@@ -18208,6 +20683,16 @@
         cancelledReason: "stale-before-scroll",
         exactIssue: "The PDF scroll step was ignored because a newer action replaced this target."
       });
+      if (isQueryAction) {
+        emitDebug("pdf-query-action:failed", {
+          requestId: Number(options.queryRequestId || 0) || 0,
+          queryActionToken: actionToken,
+          sectionId: section && section.id,
+          targetPage: Number(pageNumber) || 0,
+          reason: "stale-before-scroll",
+          exactIssue: "The query-owned PDF action token was inactive before controlled scroll."
+        });
+      }
       return false;
     }
     if (!viewer || !viewer.root || !viewer.scroll || !pageHost) {
@@ -18233,7 +20718,7 @@
           blockedReason: "target-page-render-retry-failed",
           exactIssue: "The target page was still not rendered after one bounded render retry."
         });
-        completePdfAction(actionToken, "blocked", {
+        if (!isQueryAction) completePdfAction(actionToken, "blocked", {
           type: actionType,
           sectionId: section && section.id,
           pageNumber,
@@ -18257,7 +20742,7 @@
           error: String(error && error.message ? error.message : error),
           exactIssue: "The bounded target-page render retry failed, so SkimRoute stopped the PDF action without fallback navigation."
         });
-        completePdfAction(actionToken, "blocked", {
+        if (!isQueryAction) completePdfAction(actionToken, "blocked", {
           type: actionType,
           sectionId: section && section.id,
           pageNumber,
@@ -18274,8 +20759,9 @@
       return true;
     }
 
+    const pendingToken = isQueryAction ? `${actionToken}:target` : viewer.pendingTarget && viewer.pendingTarget.token || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     viewer.pendingTarget = {
-      token: viewer.pendingTarget && viewer.pendingTarget.token || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      token: pendingToken,
       sectionId: section.id,
       pageNumber: Number(pageNumber),
       chunkIndex: getPdfSectionChunkIndex(section),
@@ -18285,7 +20771,8 @@
       highlight: true,
       requestedAt: Date.now(),
       actionType,
-      actionToken
+      actionToken,
+      queryRequestId: isQueryAction ? Number(options.queryRequestId || 0) || 0 : 0
     };
     const scrollHighlightStartedAt = Date.now();
     const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -18296,6 +20783,26 @@
     const topPadding = Math.min(160, Math.round(scrollRect.height * 0.22));
     const sectionOffset = Math.max(0, Math.round(pageHost.offsetHeight * Math.max(0.02, Math.min(0.94, relativeY))));
     const targetTop = Math.max(0, viewer.scroll.scrollTop + (pageRect.top - scrollRect.top) + sectionOffset - topPadding);
+    if (isQueryAction) {
+      viewer.lastQueryScrollTarget = {
+        actionToken,
+        requestId: Number(options.queryRequestId || 0) || 0,
+        sectionId: section && section.id || "",
+        pageNumber: Number(pageNumber) || 0,
+        targetTop,
+        requestedAt: Date.now()
+      };
+      emitDebug("pdf-query-action:scroll-requested", {
+        requestId: Number(options.queryRequestId || 0) || 0,
+        queryActionToken: actionToken,
+        sectionId: section && section.id || "",
+        targetPage: Number(pageNumber) || 0,
+        calculatedScrollTop: targetTop,
+        actualScrollTop: viewer.scroll.scrollTop,
+        routeKey: getPdfDocumentRouteKey(),
+        exactIssue: "Controlled PDF query requested scroll with its own action token."
+      });
+    }
     viewer.scroll.scrollTo({ top: targetTop, behavior: prefersReducedMotion ? "auto" : "smooth" });
     setPdfActiveTarget(section, pageNumber, "pagepilot-controlled-viewer");
     if (runtime.ui) runtime.ui.updateActiveClasses(runtime.view.activeId);
@@ -18315,7 +20822,7 @@
       reason: options.reason || "jump",
       exactIssue: "none"
     });
-    emitDebug("pdf:action:scroll-complete", {
+    emitDebug(isQueryAction ? "pdf-query-action:scroll-requested" : "pdf:action:scroll-complete", {
       type: viewer.pendingTarget.actionType,
       actionId: viewer.pendingTarget.actionToken,
       token: viewer.pendingTarget.actionToken,
@@ -18324,7 +20831,7 @@
       pdfJumpMode: "pagepilot-controlled-viewer",
       exactIssue: "none"
     });
-    setActionResult(viewer.pendingTarget.actionType || "jump", true, {
+    if (!isQueryAction) setActionResult(viewer.pendingTarget.actionType || "jump", true, {
       section,
       pageNumber,
       phase: "scrolled",
@@ -18336,8 +20843,8 @@
       if (actionToken && !isPdfActionActive(actionToken)) return;
       const rect = pageHost.getBoundingClientRect();
       const visible = rect.bottom > 72 && rect.top < window.innerHeight;
-      const latestActionType = viewer.pendingTarget && viewer.pendingTarget.actionType || options.actionType || runtime.pdfAction && runtime.pdfAction.type || "jump";
-      const latestActionToken = viewer.pendingTarget && viewer.pendingTarget.actionToken || options.actionToken || runtime.pdfAction && runtime.pdfAction.token || "";
+      const latestActionType = isQueryAction ? "query" : viewer.pendingTarget && viewer.pendingTarget.actionType || options.actionType || runtime.pdfAction && runtime.pdfAction.type || "jump";
+      const latestActionToken = isQueryAction ? actionToken : viewer.pendingTarget && viewer.pendingTarget.actionToken || options.actionToken || runtime.pdfAction && runtime.pdfAction.token || "";
       emitDebug(visible ? "pdf:controlled-viewer:scroll-verified" : "pdf:controlled-viewer:scroll-not-verified", {
         sectionId: section && section.id,
         pageNumber,
@@ -18348,6 +20855,19 @@
         viewerScrollTop: viewer.scroll.scrollTop,
         exactIssue: visible ? "none" : "SkimRoute rendered the PDF, but the target page is still not visible after scrolling the owned container."
       });
+      if (isQueryAction) {
+        emitDebug(visible ? "pdf-query-action:scroll-verified" : "pdf-query-action:failed", {
+          requestId: Number(options.queryRequestId || viewer.pendingTarget && viewer.pendingTarget.queryRequestId || 0) || 0,
+          queryActionToken: latestActionToken,
+          sectionId: section && section.id,
+          targetPage: Number(pageNumber) || 0,
+          calculatedScrollTop: viewer.lastQueryScrollTarget && viewer.lastQueryScrollTarget.actionToken === latestActionToken ? viewer.lastQueryScrollTarget.targetTop : 0,
+          actualScrollTop: viewer.scroll.scrollTop,
+          reason: visible ? "controlled-scroll-visible" : "controlled-scroll-not-visible",
+          exactIssue: visible ? "none" : "Controlled PDF query delayed scroll check did not see the target page."
+        });
+        return;
+      }
       if (visible) {
         completePdfAction(latestActionToken, "completed", {
           type: latestActionType,
@@ -18726,7 +21246,10 @@
       const offset = Math.max(0, Math.round(pageRect.height * Math.max(0.02, Math.min(0.92, relativeY))));
       const topPadding = Math.min(180, Math.round(window.innerHeight * 0.22));
       let targetTop = 0;
-      if (container && container !== window) {
+      const documentScroller = container === document.scrollingElement
+        || container === document.documentElement
+        || container === document.body;
+      if (container && container !== window && !documentScroller) {
         const containerRect = container.getBoundingClientRect();
         targetTop = Math.max(0, container.scrollTop + (pageRect.top - containerRect.top) + offset - topPadding);
         smoothScrollElementTo(container, targetTop, prefersReducedMotion);
@@ -18769,8 +21292,8 @@
       const candidate = info.element;
       const maxScroll = getMaxPdfScroll(candidate);
       const before = getPdfScrollPosition(candidate);
-      if (maxScroll < 24) {
-        attempts.push({ ...info.meta, maxScroll, before, skipped: "not-scrollable" });
+      if (maxScroll < 24 || !isPdfElementScrollableContainer(candidate)) {
+        attempts.push({ ...info.meta, maxScroll, before, skipped: maxScroll < 24 ? "not-scrollable" : "overflow-visible" });
         continue;
       }
       const top = Math.round(maxScroll * ratio);
@@ -18925,11 +21448,23 @@
   function findPdfScrollableContainer(element) {
     let current = element && element.parentElement ? element.parentElement : null;
     while (current && current !== document.body && current !== document.documentElement) {
-      if (getMaxPdfScroll(current) > 24) return current;
+      if (isPdfElementScrollableContainer(current)) return current;
       current = current.parentElement;
     }
     if (document.scrollingElement && getMaxPdfScroll(document.scrollingElement) > 24) return document.scrollingElement;
     return window;
+  }
+
+  function isPdfElementScrollableContainer(element) {
+    if (!element || getMaxPdfScroll(element) <= 24) return false;
+    if (element === window || element === document.scrollingElement || element === document.documentElement || element === document.body) return true;
+    try {
+      const style = window.getComputedStyle(element);
+      const overflow = `${style.overflowY || ""} ${style.overflow || ""}`;
+      return /\b(auto|scroll|overlay)\b/i.test(overflow);
+    } catch (error) {
+      return false;
+    }
   }
 
   function getMaxPdfScroll(target) {

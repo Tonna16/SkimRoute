@@ -1,9 +1,2 @@
-/**
- * SkimRoute logging switch.
- *
- * Production / Chrome Web Store: false
- * Local development / debugging: true
- *
- * Change only this value, then reload the unpacked extension.
- */
+/* SkimRoute logging switch. Set true for logging. False to disable. */
 globalThis.SKIMROUTE_DEV_MODE = true;

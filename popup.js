@@ -10,7 +10,10 @@ const els = {
   dismissOnboarding: document.getElementById("dismissOnboarding"),
   statusPanel: document.getElementById("statusPanel"),
   fileAccessSetup: document.getElementById("fileAccessSetup"),
-  fileAccessStatus: document.getElementById("fileAccessStatus")
+  fileAccessStatus: document.getElementById("fileAccessStatus"),
+  sectionQueryForm: document.getElementById("sectionQueryForm"),
+  sectionQueryInput: document.getElementById("sectionQueryInput"),
+  sectionQueryResult: document.getElementById("sectionQueryResult")
 };
 
 const buttons = {
@@ -18,16 +21,19 @@ const buttons = {
   nextImportant: document.getElementById("nextImportant"),
   openSidebar: document.getElementById("openSidebar"),
   rescanPage: document.getElementById("rescanPage"),
+  sectionQuerySubmit: document.getElementById("sectionQuerySubmit"),
+  sectionQueryClear: document.getElementById("sectionQueryClear"),
+  sectionQueryGo: document.getElementById("sectionQueryGo"),
   openExtensionSettings: document.getElementById("openExtensionSettings"),
   checkFileAccess: document.getElementById("checkFileAccess")
 };
 
 const CONTENT_FILES = [
   "debug-config.js",
-  "assets/adapters.js-BxVfMoxi.js",
-  "assets/engine.js-BJkAhsDZ.js",
-  "assets/ui.js-DPUnGKsp.js",
-  "assets/content.js-BzKMfaWY.js"
+  "assets/adapters.js",
+  "assets/engine.js",
+  "assets/ui.js",
+  "assets/content-core.js"
 ];
 const POLL_MS = 700;
 const MAX_POLLS = 52;
@@ -47,6 +53,7 @@ let pollTimer = null;
 let pollCount = 0;
 let currentTab = null;
 let fileAccessCheckInFlight = false;
+let lastRenderedQueryRequestId = 0;
 
 buttons.jumpUseful.addEventListener("click", async () => {
   const tab = await getActiveTab();
@@ -77,6 +84,60 @@ buttons.rescanPage.addEventListener("click", async () => {
     : { type: "PAGEPILOT_SCAN" };
   renderStats(await ensureAndSend(tab.id, message));
 });
+
+if (els.sectionQueryForm) {
+  els.sectionQueryForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await submitSectionQuery();
+  });
+}
+
+if (els.sectionQueryInput) {
+  els.sectionQueryInput.addEventListener("keydown", async (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    els.sectionQueryInput.value = "";
+    await clearSectionQuery();
+  });
+}
+
+if (buttons.sectionQueryClear) {
+  buttons.sectionQueryClear.addEventListener("click", async () => {
+    if (els.sectionQueryInput) els.sectionQueryInput.value = "";
+    await clearSectionQuery();
+  });
+}
+
+if (buttons.sectionQueryGo) {
+  buttons.sectionQueryGo.addEventListener("click", async () => {
+    const tab = await getActiveTab();
+    if (!tab) return;
+    renderStats(await ensureAndSend(tab.id, { type: "PAGEPILOT_NAVIGATE_QUERY_RESULT" }));
+  });
+}
+
+if (els.sectionQueryResult) {
+  els.sectionQueryResult.addEventListener("click", async (event) => {
+    const betterOcr = event.target.closest && event.target.closest(".query-better-ocr");
+    if (betterOcr) {
+      event.preventDefault();
+      const tab = await getActiveTab();
+      if (!tab) return;
+      renderStats(await ensureAndSend(tab.id, { type: "PAGEPILOT_RUN_PDF_OCR", mode: "better" }));
+      return;
+    }
+    const alt = event.target.closest && event.target.closest(".query-alt");
+    if (!alt) return;
+    event.preventDefault();
+    const tab = await getActiveTab();
+    if (!tab) return;
+    renderStats(await ensureAndSend(tab.id, {
+      type: "PAGEPILOT_NAVIGATE_QUERY_RESULT",
+      sectionId: alt.dataset.sectionId || "",
+      passageId: alt.dataset.passageId || ""
+    }));
+  });
+}
 
 if (els.dismissOnboarding) {
   els.dismissOnboarding.addEventListener("click", async () => {
@@ -163,12 +224,55 @@ async function loadTabStatus(tab) {
   }
 }
 
+async function submitSectionQuery() {
+  const query = els.sectionQueryInput ? String(els.sectionQueryInput.value || "").trim() : "";
+  if (!query) return;
+  const tab = await getActiveTab();
+  if (!tab) return;
+  renderStats(await ensureAndSend(tab.id, {
+    type: "PAGEPILOT_QUERY_SECTION",
+    query,
+    allowWeakNavigation: false
+  }));
+}
+
+async function clearSectionQuery() {
+  const tab = await getActiveTab();
+  if (!tab) {
+    renderSectionQuery(null, { loading: false });
+    return;
+  }
+  renderStats(await ensureAndSend(tab.id, { type: "PAGEPILOT_CLEAR_QUERY" }));
+}
+
 function getActiveTab() {
+  const testTabId = getDevTargetTabId();
+  if (testTabId) {
+    return new Promise((resolve) => {
+      chrome.tabs.get(testTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          resolve(null);
+          return;
+        }
+        resolve(tab);
+      });
+    });
+  }
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       resolve(tabs && tabs[0] ? tabs[0] : null);
     });
   });
+}
+
+function getDevTargetTabId() {
+  try {
+    const value = new URLSearchParams(window.location.search || "").get("tabId");
+    const tabId = Number(value);
+    return Number.isInteger(tabId) && tabId > 0 ? tabId : 0;
+  } catch (error) {
+    return 0;
+  }
 }
 
 function isLocalPdfUrl(url) {
@@ -392,6 +496,7 @@ function renderStats(stats) {
   buttons.nextImportant.disabled = loading || !stats.canJumpNext;
   buttons.rescanPage.textContent = canCancelOcr ? "Cancel OCR" : canRunBetterOcr ? "Better OCR" : canRunFastOcr || needsOcr ? "Run OCR" : loading ? "Scanning" : pdfAccessIssue ? "Retry PDF" : "Rescan";
   buttons.rescanPage.disabled = loading && !needsOcr && !canCancelOcr && !canRunBetterOcr && !canRunFastOcr;
+  renderSectionQuery(stats.sectionQuery, { loading, sectionCount: stats.sections });
 
   if (loading) {
     const copy = isPdf ? pdfLoadingCopy(stats) : null;
@@ -470,6 +575,7 @@ function showStarting(title, reason) {
   buttons.nextImportant.disabled = true;
   buttons.rescanPage.textContent = "Rescan";
   buttons.rescanPage.disabled = true;
+  renderSectionQuery(null, { loading: true });
 }
 
 function showUnavailable(stats) {
@@ -484,7 +590,66 @@ function showUnavailable(stats) {
   buttons.nextImportant.disabled = true;
   buttons.rescanPage.textContent = "Rescan";
   buttons.rescanPage.disabled = true;
+  renderSectionQuery(null, { loading: false });
   stopPolling();
+}
+
+function renderSectionQuery(sectionQuery, state = {}) {
+  if (!els.sectionQueryForm) return;
+  const query = sectionQuery || {};
+  const requestId = Number(query.requestId) || 0;
+  if (requestId && requestId < lastRenderedQueryRequestId) return;
+  if (requestId) lastRenderedQueryRequestId = requestId;
+  const loading = Boolean(state.loading);
+  const waiting = query.status === "waiting";
+  const disabled = !waiting && (loading || state.sectionCount === 0);
+  if (els.sectionQueryInput && document.activeElement !== els.sectionQueryInput) {
+    els.sectionQueryInput.value = String(query.text || "");
+  }
+  if (els.sectionQueryInput) els.sectionQueryInput.disabled = disabled;
+  if (buttons.sectionQuerySubmit) buttons.sectionQuerySubmit.disabled = disabled;
+  if (buttons.sectionQueryClear) buttons.sectionQueryClear.disabled = !query.text && (!query.status || query.status === "idle");
+  if (buttons.sectionQueryGo) {
+    buttons.sectionQueryGo.hidden = !(query.weakRequiresConfirm && query.canNavigate && query.sectionId);
+    buttons.sectionQueryGo.disabled = !query.weakRequiresConfirm || !query.canNavigate;
+  }
+  if (!els.sectionQueryResult) return;
+  const hasResult = Boolean(query.status && query.status !== "idle");
+  els.sectionQueryResult.hidden = !hasResult;
+  if (!hasResult) {
+    els.sectionQueryResult.innerHTML = "";
+    return;
+  }
+  if (query.status === "none") {
+    els.sectionQueryResult.innerHTML = "<strong>No strong section match found on this page.</strong>";
+    return;
+  }
+  if (query.status === "waiting" || query.status === "error") {
+    els.sectionQueryResult.innerHTML = `
+      <strong>${query.status === "waiting" ? "Waiting for OCR" : "Search issue"}</strong>
+      <p>${escapeHtml(query.reason || (query.status === "waiting" ? "Waiting for OCR to finish..." : "SkimRoute could not search this page."))}</p>
+      ${query.canRunBetterOcr ? `<button class="query-better-ocr" type="button">Search again with Better OCR</button>` : ""}
+    `;
+    return;
+  }
+  const role = query.roleLabel ? `<span>${escapeHtml(query.roleLabel)}</span>` : "";
+  const confidence = query.confidenceLabel ? `<span>${escapeHtml(query.confidenceLabel)}</span>` : "";
+  const navigation = query.navigation && query.navigation.reason ? query.navigation.reason : query.reason || "";
+  const alternatives = Array.isArray(query.alternatives) && query.alternatives.length
+    ? `<div class="query-alternatives">${query.alternatives.map((item) => `
+      <button class="query-alt" type="button" data-section-id="${escapeHtml(item.sectionId || "")}" data-passage-id="${escapeHtml(item.passageId || "")}">
+        <span>${escapeHtml(item.title || "Matched section")}</span>
+        <small>${escapeHtml(item.snippet || item.reason || "")}</small>
+      </button>
+    `).join("")}</div>`
+    : "";
+  els.sectionQueryResult.innerHTML = `
+    <strong>${escapeHtml(query.title || "Matched section")}</strong>
+    <div class="query-meta">${role}${confidence}</div>
+    <p>${escapeHtml(query.snippet || query.reason || "")}</p>
+    <em>${escapeHtml(navigation)}</em>
+    ${alternatives}
+  `;
 }
 
 function isRestricted(stats) {
@@ -570,6 +735,15 @@ function formatReason(reason) {
   const value = String(reason || "").trim();
   if (!value) return "";
   return /^why:/i.test(value) ? value : `Why: ${value}`;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 async function renderOnboarding() {

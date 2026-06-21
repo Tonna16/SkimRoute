@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture tutorial setup steps troubleshooting</title><link rel="stylesheet" href="./fixture.css"></head>
+  <body>
+    <main>
+      <article class="tutorial">
+        <h1>Build a deterministic extension test harness</h1>
+        <p>This tutorial explains a local browser workflow with setup, steps, code, and troubleshooting.</p>
+        <h2>Prerequisites</h2>
+        <p>Install a local browser, keep fixtures sanitized, and confirm that no internet dependency is required. These prerequisites prepare the test workflow but are not the final useful section.</p>
+        <h2>Setup</h2>
+        <p>Create a persistent browser profile, load the unpacked extension, start a local fixture server, and map fixture hostnames to localhost. The setup verifies that content scripts initialize, generated assets are current, and the extension can receive messages from the popup and sidebar.</p>
+        <pre><code>const context = await chromium.launchPersistentContext(profile, { args: extensionArgs });</code></pre>
+        <h2>Step-by-step implementation</h2>
+        <ol>
+          <li>Serve sanitized HTML snapshots from a local HTTP server.</li>
+          <li>Launch Chromium with the unpacked extension and wait for the service worker.</li>
+          <li>Send PAGEPILOT_STATUS from the extension context and assert page type, quiet mode, and best section.</li>
+          <li>Trigger Jump and Next, then verify scroll movement and exact highlight placement.</li>
+        </ol>
+        <p>The implementation section is the best target because it gives concrete commands, deterministic checks, and the complete local workflow needed to prove the runtime split.</p>
+        <h2>Troubleshooting</h2>
+        <p>If the browser cannot load an extension, install Playwright Chromium and rerun the test. If a fixture fails, inspect semantic DOM assertions before changing expected results.</p>
+      </article>
+    </main>
+  </body>
+</html>

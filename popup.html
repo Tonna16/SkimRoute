@@ -141,6 +141,119 @@
         gap: 8px;
       }
 
+      .query {
+        display: grid;
+        gap: 7px;
+      }
+
+      .query label {
+        color: #64748b;
+        font-size: 10.5px;
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+
+      .query-row {
+        display: grid;
+        gap: 6px;
+        grid-template-columns: 1fr 54px 58px;
+      }
+
+      .query input {
+        background: #ffffff;
+        border: 1px solid rgba(15, 23, 42, 0.14);
+        border-radius: 10px;
+        color: #111827;
+        font: inherit;
+        font-size: 12.5px;
+        min-height: 38px;
+        min-width: 0;
+        outline: none;
+        padding: 8px 10px;
+      }
+
+      .query input:focus-visible {
+        border-color: rgba(37, 99, 235, 0.52);
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+      }
+
+      .query .icon-button {
+        min-height: 38px;
+        padding: 8px;
+      }
+
+      .query-result {
+        background: #f8fafc;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 10px;
+        display: grid;
+        gap: 4px;
+        padding: 8px;
+      }
+
+      .query-result strong {
+        color: #111827;
+        font-size: 12.5px;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+
+      .query-result p,
+      .query-result em {
+        color: #64748b;
+        display: block;
+        font-size: 11.5px;
+        font-style: normal;
+        line-height: 1.35;
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+
+      .query-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .query-meta span {
+        background: rgba(15, 23, 42, 0.055);
+        border-radius: 999px;
+        color: #475569;
+        font-size: 10.5px;
+        font-weight: 760;
+        padding: 3px 6px;
+      }
+
+      .query-alternatives {
+        display: grid;
+        gap: 5px;
+        margin-top: 2px;
+      }
+
+      .query-alt {
+        background: #ffffff;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 7px;
+        color: #0f172a;
+        cursor: pointer;
+        display: grid;
+        gap: 2px;
+        padding: 6px 7px;
+        text-align: left;
+      }
+
+      .query-alt span {
+        font-size: 11.5px;
+        font-weight: 760;
+        line-height: 1.25;
+      }
+
+      .query-alt small {
+        color: #64748b;
+        font-size: 10.5px;
+        line-height: 1.25;
+      }
+
       .secondary-actions {
         display: grid;
         gap: 8px;
@@ -191,6 +304,10 @@
       button:focus-visible {
         outline: 3px solid rgba(37, 99, 235, 0.4);
         outline-offset: 3px;
+      }
+
+      .icon-button {
+        min-width: 38px;
       }
 
       .primary {
@@ -346,6 +463,22 @@
           color: #f8fafc;
         }
 
+        .query input,
+        .query-result {
+          background: #0f172a;
+          border-color: rgba(226, 232, 240, 0.14);
+          color: #f8fafc;
+        }
+
+        .query-result strong {
+          color: #f8fafc;
+        }
+
+        .query-meta span {
+          background: rgba(226, 232, 240, 0.12);
+          color: #cbd5e1;
+        }
+
         button:disabled {
           color: #cbd5e1;
           opacity: 0.72;
@@ -377,7 +510,7 @@
       }
     </style>
     <script src="/debug-config.js"></script>
-    <script type="module" crossorigin src="/assets/popup.html-C-AIiryS.js"></script>
+    <script type="module" crossorigin src="/assets/popup.js"></script>
   </head>
   <body>
     <main class="wrap">
@@ -431,6 +564,17 @@
             <span>words</span>
           </div>
         </div>
+
+        <form class="query" id="sectionQueryForm">
+          <label for="sectionQueryInput">Find</label>
+          <div class="query-row">
+            <input id="sectionQueryInput" type="search" placeholder="Find the part about..." autocomplete="off" spellcheck="false">
+            <button class="secondary icon-button" id="sectionQuerySubmit" type="submit" title="Find section" aria-label="Find section">Find</button>
+            <button class="secondary icon-button" id="sectionQueryClear" type="button" title="Clear search" aria-label="Clear search">Clear</button>
+          </div>
+          <div class="query-result" id="sectionQueryResult" role="status" aria-live="polite" hidden></div>
+          <button class="secondary" id="sectionQueryGo" type="button" hidden>Go anyway</button>
+        </form>
 
         <div class="actions">
           <button class="primary" id="jumpUseful" type="button" title="Jump to useful part (Alt+J / Option+J)">Jump to useful part</button>

@@ -35,8 +35,10 @@
       mode: "minimized",
       activeId: null,
       showOnboarding: false,
-      collapsedSectionIds: new Set()
+      collapsedSectionIds: new Set(),
+      sectionQuery: createEmptySectionQuery()
     },
+    navigationHistory: createEmptyNavigationHistory(),
     currentUrl: "",
     scanTimer: null,
     warmupTimers: [],
@@ -51,6 +53,8 @@
     jumpEffectActive: false,
     highlightedElements: [],
     dimmedElements: [],
+    chatQueryPassages: new Map(),
+    queryRequestSeq: 0,
     lastAction: null,
     listeners: [],
     optionalRuntimes: {
@@ -120,6 +124,61 @@
       initializedAt: state && state.initializedAt || 0,
       reasons: state && Array.isArray(state.reasons) ? state.reasons.slice() : []
     };
+  }
+
+  function createEmptyNavigationHistory(routeKey = "") {
+    return {
+      routeKey,
+      lastSelectedSectionId: "",
+      lastSelectedRole: "",
+      recentSectionIds: [],
+      lastActionSource: "",
+      lastSelectedAt: 0
+    };
+  }
+
+  function createEmptySectionQuery(text = "") {
+    return {
+      text: String(text || ""),
+      status: "idle",
+      sectionId: "",
+      passageId: "",
+      surface: "",
+      pageNumber: 0,
+      title: "",
+      label: "",
+      roleLabel: "",
+      snippet: "",
+      confidenceLabel: "",
+      score: 0,
+      reason: "",
+      canNavigate: false,
+      weakRequiresConfirm: false,
+      navigation: createEmptyQueryNavigationResult(),
+      alternatives: [],
+      requestId: 0,
+      updatedAt: 0
+    };
+  }
+
+  function createEmptyQueryNavigationResult() {
+    return {
+      found: false,
+      navigated: false,
+      verified: false,
+      exact: false,
+      surface: "",
+      sectionId: "",
+      passageId: "",
+      pageNumber: 0,
+      reason: "",
+      strategy: ""
+    };
+  }
+
+  function nextSectionQueryRequestId() {
+    runtime.queryRequestSeq = (Number(runtime.queryRequestSeq) || 0) + 1;
+    return runtime.queryRequestSeq;
   }
 
   function cleanupStaleSkimRouteDom(reason) {
@@ -202,6 +261,7 @@
     if (!document.body) return;
     runtime.currentUrl = getCurrentUrl();
     if (isPdfLikePage()) {
+      attachGlobalEvents();
       await ensurePdfRuntime("initial-pdf-surface");
       return;
     }
@@ -221,8 +281,9 @@
           return ok;
         },
         onNext: () => {
-          const section = getSectionForAction("next");
-          const ok = jumpToNextImportant();
+          const selection = selectNextTarget("sidebar-next");
+          const section = selection.section || null;
+          const ok = jumpToNextImportant(selection);
           setActionResult("next", ok, { section });
           return ok;
         },
@@ -234,6 +295,10 @@
           setActionResult("section", ok, { section });
           return ok;
         },
+        onQuery: (query) => runSectionQuery(query, { source: "sidebar", allowWeakNavigation: false }),
+        onClearQuery: () => clearSectionQuery("sidebar-clear"),
+        onRunQueryBetterOcr: () => ensurePdfRuntime("sidebar-query-better-ocr"),
+        onNavigateQueryResult: (target) => navigateCurrentQueryResult("sidebar-weak-confirm", target || {}),
         onToggleCollapse: (id) => toggleSectionCollapse(id),
         onDismissTip: () => dismissOnboarding()
       }
@@ -270,6 +335,7 @@
         reason
       });
       runtime.model = reconcileGoogleDocsLiveModel(runtime.model, reason);
+      reconcileNavigationStateAfterScan(reason);
       runtime.lastScanAt = Date.now();
       runtime.view.mode = resolveMode(runtime.view.mode);
       emitDebug(`scan:${reason}`, {
@@ -282,6 +348,7 @@
         && previousQuiet === runtime.model.pageProfile.quietMode
       ) {
         refreshActiveSection();
+        render();
         return;
       }
       render();
@@ -430,22 +497,12 @@
   function handleMessage(message, sender, sendResponse) {
     if (!message || typeof message !== "object") return false;
 
+    if (isSectionQueryMessage(message) && isPdfLikePage()) {
+      return handlePdfQueryMessage(message, sendResponse);
+    }
+
     if (isPdfMessage(message) || isPdfLikePage()) {
-      ensurePdfRuntime(`message:${message.type || "unknown"}`)
-        .then(() => {
-          try {
-            chrome.runtime.sendMessage;
-            sendResponse({ ok: false, loading: true, pageType: "pdf", error: "PDF runtime is taking over this page." });
-          } catch (error) {
-            sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
-          }
-        })
-        .catch((error) => sendResponse({
-          ok: false,
-          pageType: "pdf",
-          error: String(error && error.message ? error.message : error)
-        }));
-      return true;
+      return handlePdfRuntimeMessage(message, sendResponse, `message:${message.type || "unknown"}`);
     }
 
     if (message.type === "PAGEPILOT_TOGGLE") {
@@ -476,9 +533,36 @@
 
     if (message.type === "PAGEPILOT_NEXT_IMPORTANT") {
       setMode("open", { focus: true, persist: true });
-      const section = getSectionForAction("next");
-      const ok = jumpToNextImportant();
+      const selection = selectNextTarget("message-next");
+      const section = selection.section || null;
+      const ok = jumpToNextImportant(selection);
       setActionResult("next", ok, { section });
+      sendResponse(getPublicStats());
+      return true;
+    }
+
+    if (message.type === "PAGEPILOT_QUERY_SECTION") {
+      setMode("open", { focus: true, persist: true });
+      runSectionQuery(message.query || "", {
+        source: "popup",
+        allowWeakNavigation: Boolean(message.allowWeakNavigation)
+      });
+      sendResponse(getPublicStats());
+      return true;
+    }
+
+    if (message.type === "PAGEPILOT_NAVIGATE_QUERY_RESULT") {
+      setMode("open", { focus: true, persist: true });
+      navigateCurrentQueryResult("popup-weak-confirm", {
+        sectionId: message.sectionId || "",
+        passageId: message.passageId || ""
+      });
+      sendResponse(getPublicStats());
+      return true;
+    }
+
+    if (message.type === "PAGEPILOT_CLEAR_QUERY") {
+      clearSectionQuery("popup");
       sendResponse(getPublicStats());
       return true;
     }
@@ -488,6 +572,66 @@
     }
 
     return false;
+  }
+
+  function isSectionQueryMessage(message) {
+    const type = String(message && message.type || "");
+    return type === "PAGEPILOT_QUERY_SECTION"
+      || type === "PAGEPILOT_NAVIGATE_QUERY_RESULT"
+      || type === "PAGEPILOT_CLEAR_QUERY";
+  }
+
+  function handlePdfQueryMessage(message, sendResponse) {
+    ensurePdfRuntime(`query:${message.type || "unknown"}`)
+      .then(() => {
+        const pdfApi = window.PagePilotPdfRuntime;
+        if (!pdfApi || typeof pdfApi.handleQueryAction !== "function") {
+          sendResponse({ ok: false, pageType: "pdf", error: "PDF runtime did not expose query navigation." });
+          return;
+        }
+        emitDebug("section-query:owner-selected", {
+          owner: "pdf-runtime",
+          type: message.type,
+          exactIssue: "none"
+        });
+        try {
+          Promise.resolve(pdfApi.handleQueryAction(message, { source: "core-delegate" }))
+            .then((stats) => sendResponse(stats || { ok: false, pageType: "pdf", error: "PDF query handler returned no status." }))
+            .catch((error) => sendResponse({ ok: false, pageType: "pdf", error: String(error && error.message ? error.message : error) }));
+        } catch (error) {
+          sendResponse({ ok: false, pageType: "pdf", error: String(error && error.message ? error.message : error) });
+        }
+      })
+      .catch((error) => sendResponse({
+        ok: false,
+        pageType: "pdf",
+        error: String(error && error.message ? error.message : error)
+      }));
+    return true;
+  }
+
+  function handlePdfRuntimeMessage(message, sendResponse, reason = "pdf-message") {
+    ensurePdfRuntime(reason)
+      .then(() => {
+        const pdfApi = window.PagePilotPdfRuntime;
+        if (!pdfApi || typeof pdfApi.handleExternalMessage !== "function") {
+          sendResponse({ ok: false, loading: true, pageType: "pdf", error: "PDF runtime is loading." });
+          return;
+        }
+        try {
+          Promise.resolve(pdfApi.handleExternalMessage(message, { source: "core-delegate" }))
+            .then((stats) => sendResponse(stats || { ok: false, pageType: "pdf", error: "PDF runtime returned no status." }))
+            .catch((error) => sendResponse({ ok: false, pageType: "pdf", error: String(error && error.message ? error.message : error) }));
+        } catch (error) {
+          sendResponse({ ok: false, pageType: "pdf", error: String(error && error.message ? error.message : error) });
+        }
+      })
+      .catch((error) => sendResponse({
+        ok: false,
+        pageType: "pdf",
+        error: String(error && error.message ? error.message : error)
+      }));
+    return true;
   }
 
   function isPdfMessage(message) {
@@ -583,6 +727,8 @@
     runtime.currentUrl = nextUrl;
     runtime.view.activeId = null;
     runtime.view.collapsedSectionIds = new Set();
+    runtime.navigationHistory = createEmptyNavigationHistory();
+    runtime.view.sectionQuery = createEmptySectionQuery();
     clearJumpEffect();
     if (isPdfLikePage()) {
       void ensurePdfRuntime("route-pdf-surface");
@@ -657,24 +803,439 @@
     return /\.pdf(?:$|[?#])/i.test(String(url || ""));
   }
 
+  function reconcileNavigationStateAfterScan(reason) {
+    if (!runtime.model) return;
+    const routeKey = getRouteCacheKey();
+    const ids = new Set((runtime.model.sections || []).map((section) => section.id));
+    if (runtime.navigationHistory.routeKey && runtime.navigationHistory.routeKey !== routeKey) {
+      runtime.navigationHistory = createEmptyNavigationHistory(routeKey);
+      runtime.view.sectionQuery = createEmptySectionQuery();
+    } else {
+      runtime.navigationHistory.routeKey = routeKey;
+      runtime.navigationHistory.recentSectionIds = runtime.navigationHistory.recentSectionIds.filter((id) => ids.has(id)).slice(-6);
+      if (!ids.has(runtime.navigationHistory.lastSelectedSectionId)) {
+        runtime.navigationHistory.lastSelectedSectionId = "";
+        runtime.navigationHistory.lastSelectedRole = "";
+        runtime.navigationHistory.lastSelectedAt = 0;
+      }
+    }
+    if (runtime.view.activeId && !ids.has(runtime.view.activeId)) runtime.view.activeId = null;
+    if (runtime.view.sectionQuery && runtime.view.sectionQuery.text) {
+      runSectionQuery(runtime.view.sectionQuery.text, {
+        source: `rescan:${reason || "scan"}`,
+        preserveOnly: true
+      });
+    }
+    refreshNextPreview("scan");
+  }
+
+  function refreshNextPreview(source) {
+    const selection = selectNextTarget(source || "preview", { preview: true });
+    if (runtime.model) {
+      runtime.model.nextImportantId = selection.sectionId || "";
+      runtime.model.nextReason = selection.reason || "";
+    }
+    return selection;
+  }
+
+  function selectNextTarget(source = "next", options = {}) {
+    if (!runtime.model || !window.PagePilotEngine || !window.PagePilotEngine.navigation) {
+      return { sectionId: "", section: null, reason: "No next useful section", diagnostics: null };
+    }
+    refreshSectionPositions();
+    const marker = window.scrollY + Math.min(window.innerHeight * 0.42, 380);
+    const currentId = runtime.view.activeId || "";
+    const history = runtime.navigationHistory || createEmptyNavigationHistory();
+    const freshHistoryCurrent = history.lastSelectedSectionId && Date.now() - Number(history.lastSelectedAt || 0) < 3500;
+    const selection = window.PagePilotEngine.navigation.selectNextSection(runtime.model, {
+      currentSectionId: freshHistoryCurrent ? history.lastSelectedSectionId : currentId,
+      currentTop: marker,
+      lastSelectedSectionId: history.lastSelectedSectionId,
+      lastSelectedRole: history.lastSelectedRole,
+      recentSectionIds: history.recentSectionIds,
+      source,
+      isNavigable: canJumpToSection
+    });
+    const section = runtime.model.sections.find((item) => item.id === selection.sectionId) || null;
+    if (!options.preview && runtime.model.diagnostics) {
+      runtime.model.diagnostics.nextSelection = selection.diagnostics;
+    }
+    return {
+      sectionId: selection.sectionId || "",
+      section,
+      reason: selection.reason || "No next useful section",
+      diagnostics: selection.diagnostics || null
+    };
+  }
+
+  function recordNavigationSelection(section, source) {
+    if (!section || !runtime.model) return;
+    const routeKey = getRouteCacheKey();
+    if (runtime.navigationHistory.routeKey && runtime.navigationHistory.routeKey !== routeKey) {
+      runtime.navigationHistory = createEmptyNavigationHistory(routeKey);
+    }
+    const role = section.intelligence && section.intelligence.role
+      || section.metrics && section.metrics.sectionKind
+      || section.label
+      || "";
+    runtime.navigationHistory.routeKey = routeKey;
+    runtime.navigationHistory.lastSelectedSectionId = section.id;
+    runtime.navigationHistory.lastSelectedRole = role;
+    runtime.navigationHistory.lastActionSource = source || "";
+    runtime.navigationHistory.lastSelectedAt = Date.now();
+    runtime.navigationHistory.recentSectionIds = runtime.navigationHistory.recentSectionIds
+      .filter((id) => id && id !== section.id)
+      .concat(section.id)
+      .slice(-6);
+  }
+
+  function runSectionQuery(query, options = {}) {
+    const text = String(query || "").slice(0, 120).trim();
+    const requestId = Number(options.requestId) || nextSectionQueryRequestId();
+    if (!text) {
+      clearSectionQuery(options.source || "empty-query");
+      return runtime.view.sectionQuery;
+    }
+    emitDebug("section-query:submitted", {
+      owner: "core",
+      source: options.source || "query",
+      requestId,
+      queryLength: text.length,
+      routeKey: getRouteCacheKey(),
+      exactIssue: "Raw query text is not logged."
+    });
+    if (!runtime.model || !window.PagePilotEngine || !window.PagePilotEngine.navigation) {
+      runtime.view.sectionQuery = {
+        ...createEmptySectionQuery(text),
+        requestId,
+        status: "none",
+        reason: "No strong section match found on this page.",
+        updatedAt: Date.now()
+      };
+      render();
+      return runtime.view.sectionQuery;
+    }
+    const isChatSurface = runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.type === "chat";
+    if (isChatSurface) runtime.chatQueryPassages = new Map();
+    emitDebug("section-query:owner-selected", {
+      owner: isChatSurface ? "core-chat" : "core",
+      source: options.source || "query",
+      exactIssue: "none"
+    });
+    const search = window.PagePilotEngine.navigation.searchSections(runtime.model, text, {
+      source: options.source || "query",
+      surface: isChatSurface ? "chat" : "",
+      getQueryPassages: isChatSurface ? getChatQueryPassages : null,
+      isNavigable: canJumpToSection
+    });
+    runtime.model.diagnostics = runtime.model.diagnostics || {};
+    runtime.model.diagnostics.sectionQuery = search.diagnostics;
+    if (!search.result) {
+      runtime.view.sectionQuery = {
+        ...createEmptySectionQuery(text),
+        requestId,
+        status: "none",
+        reason: "No strong section match found on this page.",
+        updatedAt: Date.now()
+      };
+      render();
+      return runtime.view.sectionQuery;
+    }
+
+    runtime.view.sectionQuery = {
+      ...createEmptySectionQuery(text),
+      ...search.result,
+      text,
+      requestId,
+      navigation: createEmptyQueryNavigationResult(),
+      updatedAt: Date.now()
+    };
+    const shouldNavigate = !options.preserveOnly
+      && runtime.view.sectionQuery.canNavigate
+      && runtime.view.sectionQuery.status !== "weak";
+    if (shouldNavigate) {
+      const section = runtime.model.sections.find((item) => item.id === runtime.view.sectionQuery.sectionId) || null;
+      const navigation = navigateQueryResult(runtime.view.sectionQuery, options.source || "query");
+      runtime.view.sectionQuery.navigation = navigation;
+      const ok = Boolean(navigation.navigated);
+      setActionResult("query", ok, {
+        section,
+        message: queryNavigationMessage(navigation, runtime.view.sectionQuery.title)
+      });
+    }
+    render();
+    return runtime.view.sectionQuery;
+  }
+
+  function clearSectionQuery(source) {
+    runtime.view.sectionQuery = createEmptySectionQuery();
+    runtime.view.sectionQuery.requestId = nextSectionQueryRequestId();
+    emitDebug("section-query:clear", {
+      source: source || "clear",
+      exactIssue: "none"
+    });
+    render();
+    return runtime.view.sectionQuery;
+  }
+
+  function navigateCurrentQueryResult(source, target = {}) {
+    const query = runtime.view.sectionQuery || createEmptySectionQuery();
+    const selected = target && (target.sectionId || target.passageId)
+      ? resolveQueryAlternative(query, target) || query
+      : query;
+    if (!selected.sectionId || !runtime.model) return false;
+    const section = runtime.model.sections.find((item) => item.id === selected.sectionId) || null;
+    const navigation = navigateQueryResult(selected, source || "query-confirm");
+    runtime.view.sectionQuery = {
+      ...runtime.view.sectionQuery,
+      ...selected,
+      navigation,
+      weakRequiresConfirm: false,
+      updatedAt: Date.now()
+    };
+    const ok = Boolean(navigation.navigated);
+    setActionResult("query", ok, {
+      section,
+      message: queryNavigationMessage(navigation, selected.title || section && section.title || "matched section")
+    });
+    render();
+    return ok;
+  }
+
+  function resolveQueryAlternative(query, target = {}) {
+    const alternatives = Array.isArray(query && query.alternatives) ? query.alternatives : [];
+    const wantedSection = String(target.sectionId || "");
+    const wantedPassage = String(target.passageId || "");
+    return alternatives.find((item) => {
+      if (wantedPassage && String(item.passageId || "") === wantedPassage) return true;
+      return wantedSection && String(item.sectionId || "") === wantedSection && (!wantedPassage || String(item.passageId || "") === wantedPassage);
+    }) || null;
+  }
+
+  function navigateQueryResult(query, source) {
+    const section = runtime.model && runtime.model.sections.find((item) => item.id === query.sectionId) || null;
+    const base = {
+      ...createEmptyQueryNavigationResult(),
+      found: Boolean(section),
+      surface: query.surface || (section && isGoogleDocsSection(section) ? "docs" : runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.type || "page"),
+      sectionId: query.sectionId || "",
+      passageId: query.passageId || "",
+      pageNumber: Number(query.pageNumber) || Number(section && (section.pageNumber || section.unitMeta && section.unitMeta.pageNumber)) || 0
+    };
+    if (!section) {
+      return { ...base, reason: "Matched section is no longer available.", strategy: "missing-section" };
+    }
+    emitDebug("section-query:navigation-requested", {
+      surface: base.surface,
+      sectionId: base.sectionId,
+      passageId: base.passageId,
+      pageNumber: base.pageNumber,
+      source: source || "query",
+      exactIssue: "none"
+    });
+    if (base.surface === "chat" && query.passageId) {
+      return scrollToChatQueryPassage(section, query, base, source);
+    }
+    const googleDocsExact = isGoogleDocsSection(section) ? isGoogleDocsExactTarget(resolveGoogleDocsTarget(section)) : true;
+    const ok = scrollToSection(section.id, { highlight: true, actionType: "query", source: source || "query" });
+    const result = {
+      ...base,
+      navigated: ok,
+      verified: ok,
+      exact: Boolean(ok && googleDocsExact),
+      reason: ok ? googleDocsExact ? "Moved to the matching passage." : "Moved to the matching page; exact passage highlighting was unavailable." : "Found a match, but SkimRoute did not confirm navigation.",
+      strategy: isGoogleDocsSection(section) ? googleDocsExact ? "google-docs-exact" : "google-docs-approximate" : "section-scroll"
+    };
+    emitQueryNavigationDebug(result);
+    return result;
+  }
+
+  function queryNavigationMessage(navigation, title) {
+    if (!navigation || !navigation.navigated) return navigation && navigation.reason || "Found a match, but SkimRoute did not confirm navigation.";
+    if (!navigation.exact) return "Moved to the matching page; exact passage highlighting was unavailable.";
+    return "Moved to the matching passage.";
+  }
+
+  function getChatQueryPassages(section) {
+    if (!section || !section.anchor) return [];
+    const helpers = runtime.engine && runtime.engine.helpers || {};
+    const nodes = Array.from(section.anchor.querySelectorAll ? section.anchor.querySelectorAll("h1,h2,h3,[role='heading'],p,li,pre,code,blockquote,table") : []);
+    const candidates = nodes.length ? nodes : [section.anchor];
+    const meta = section.unitMeta || {};
+    const passages = [];
+    candidates.forEach((node, index) => {
+      if (!node || node.closest && node.closest(`#${ROOT_ID}`)) return;
+      if (node.tagName && node.tagName.toLowerCase() === "code" && node.closest("pre")) return;
+      if (helpers.isVisible && !helpers.isVisible(node)) return;
+      const rawText = node.innerText || node.textContent || "";
+      const text = normalizeText(rawText);
+      if (!text || countWordsLocal(text) < 4) return;
+      const passageType = getChatPassageType(node);
+      const passageId = `${section.id}:chat:${index}:${hashLocal(`${passageType}:${text.slice(0, 160)}`).slice(0, 10)}`;
+      const role = String(meta.role || node.getAttribute && node.getAttribute("data-message-author-role") || "").toLowerCase();
+      const passage = {
+        id: passageId,
+        surface: "chat",
+        passageType,
+        title: getChatPassageTitle(node, section, passageType),
+        text,
+        roleLabel: role === "assistant" ? "Assistant answer" : role === "user" ? "User prompt" : "",
+        metadata: {
+          ...meta,
+          role,
+          passageType,
+          turnIndex: meta.turnIndex,
+          platform: meta.platform || "",
+          finalAnswer: Boolean(meta.hasFinalAnswer || meta.hasRevision || meta.isCompleteAssistantAnswer || /corrected final answer|final response|final answer/i.test(text.slice(0, 180))),
+          superseded: Boolean(meta.isSuperseded || meta.hasFailedAnswer || /older draft|initial draft|incomplete|superseded|replaces older/i.test(text.slice(0, 260)))
+        }
+      };
+      runtime.chatQueryPassages.set(passageId, { sectionId: section.id, element: node, passage });
+      passages.push(passage);
+    });
+    return passages.slice(0, 80);
+  }
+
+  function getChatPassageType(node) {
+    const tag = node && node.tagName ? node.tagName.toLowerCase() : "";
+    if (/^h[1-6]$/.test(tag) || node && node.getAttribute && node.getAttribute("role") === "heading") return "heading";
+    if (tag === "pre" || tag === "code") return "code";
+    if (tag === "li") return "list";
+    if (tag === "blockquote") return "quote";
+    if (tag === "table") return "table";
+    return "paragraph";
+  }
+
+  function getChatPassageTitle(node, section, passageType) {
+    if (passageType === "heading") return normalizeText(node.innerText || node.textContent || "").slice(0, 120);
+    return section && section.title || "Chat answer";
+  }
+
+  function scrollToChatQueryPassage(section, query, base, source) {
+    let ref = runtime.chatQueryPassages && runtime.chatQueryPassages.get(query.passageId);
+    if (!ref || !ref.element || !document.documentElement.contains(ref.element)) {
+      getChatQueryPassages(section);
+      ref = runtime.chatQueryPassages && runtime.chatQueryPassages.get(query.passageId);
+    }
+    const element = ref && ref.element || null;
+    if (!element || !element.getBoundingClientRect) {
+      const ok = scrollToSection(section.id, { highlight: true, actionType: "query", source: source || "query" });
+      const result = {
+        ...base,
+        navigated: ok,
+        verified: ok,
+        exact: false,
+        reason: ok ? "Moved to the matching page; exact passage highlighting was unavailable." : "Found a match, but SkimRoute did not confirm navigation.",
+        strategy: "chat-turn-fallback"
+      };
+      emitQueryNavigationDebug(result);
+      return result;
+    }
+    const container = findScrollContainer(element);
+    const before = captureScrollPosition(container);
+    try {
+      element.scrollIntoView({ behavior: "auto", block: "center", inline: "nearest" });
+    } catch (error) {
+      // Fallback to the parent section below.
+    }
+    runtime.view.activeId = section.id;
+    recordNavigationSelection(section, source || "query");
+    if (runtime.ui) runtime.ui.updateActiveClasses(runtime.view.activeId);
+    activateJumpEffect({ ...section, anchor: element, blocks: [element] });
+    const after = captureScrollPosition(container);
+    const rect = element.getBoundingClientRect();
+    const visible = Boolean(rect.bottom > 48 && rect.top < window.innerHeight - 48);
+    const result = {
+      ...base,
+      navigated: true,
+      verified: visible,
+      exact: visible,
+      reason: visible ? "Moved to the matching passage." : "Moved to the matching page; exact passage highlighting was unavailable.",
+      strategy: visible ? "chat-passage-scroll" : "chat-passage-unverified"
+    };
+    emitDebug(visible ? "section-query:navigation-verified" : "section-query:navigation-approximate", {
+      surface: "chat",
+      sectionId: section.id,
+      passageId: query.passageId || "",
+      role: section.unitMeta && section.unitMeta.role || "",
+      passageType: ref && ref.passage && ref.passage.passageType || "",
+      scrollContainer: container === window ? "window" : describeElement(container),
+      before,
+      after,
+      rect: rect ? { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) } : null,
+      exactIssue: visible ? "none" : "The chat passage exists, but the post-scroll rectangle was not fully visible."
+    });
+    return result;
+  }
+
+  function emitQueryNavigationDebug(result) {
+    emitDebug(result && result.navigated
+      ? result.exact ? "section-query:navigation-verified" : "section-query:navigation-approximate"
+      : "section-query:navigation-failed", {
+      surface: result && result.surface || "",
+      sectionId: result && result.sectionId || "",
+      passageId: result && result.passageId || "",
+      pageNumber: result && result.pageNumber || 0,
+      strategy: result && result.strategy || "",
+      reason: result && result.reason || "",
+      exactIssue: result && result.exact ? "none" : result && result.reason || "Navigation was not exact."
+    });
+  }
+
+  function captureScrollPosition(container) {
+    if (!container || container === window) return { type: "window", top: Math.round(window.scrollY || 0) };
+    return { type: describeElement(container), top: Math.round(container.scrollTop || 0) };
+  }
+
+  function describeElement(element) {
+    if (!element) return "";
+    const tag = element.tagName ? element.tagName.toLowerCase() : "element";
+    const id = element.id ? `#${element.id}` : "";
+    const cls = typeof element.className === "string" && element.className.trim()
+      ? `.${element.className.trim().split(/\s+/).slice(0, 2).join(".")}`
+      : "";
+    return `${tag}${id}${cls}`.slice(0, 80);
+  }
+
+  function countWordsLocal(text) {
+    const matches = String(text || "").match(/\b[\w'-]+\b/g);
+    return matches ? matches.length : 0;
+  }
+
+  function hashLocal(text) {
+    if (runtime.engine && runtime.engine.helpers && typeof runtime.engine.helpers.hashText === "function") {
+      return runtime.engine.helpers.hashText(text);
+    }
+    let hash = 2166136261;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    return Math.abs(hash >>> 0).toString(36);
+  }
+
   function jumpToUsefulPart() {
     if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
     const targetId = runtime.model.bestSectionId || runtime.model.skipTargetId;
     return scrollToSection(targetId, { highlight: true, actionType: "jump" });
   }
 
-  function jumpToNextImportant() {
+  function jumpToNextImportant(existingSelection) {
     refreshActiveSection();
     if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
-    const targetId = runtime.model.nextImportantId
+    const selection = existingSelection && existingSelection.sectionId ? existingSelection : selectNextTarget("next");
+    const targetId = selection.sectionId || runtime.model.nextImportantId
       || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id;
+    runtime.model.nextImportantId = targetId || "";
+    runtime.model.nextReason = selection.reason || runtime.model.nextReason || "";
     return scrollToSection(targetId, { highlight: true, actionType: "next" });
   }
 
   function getSectionForAction(type) {
     if (!runtime.model || !Array.isArray(runtime.model.sections)) return null;
     const id = type === "next"
-      ? runtime.model.nextImportantId || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id
+      ? selectNextTarget("action-peek", { preview: true }).sectionId || runtime.model.nextImportantId || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id
       : runtime.model.bestSectionId || runtime.model.skipTargetId;
     return runtime.model.sections.find((section) => section.id === id) || null;
   }
@@ -694,6 +1255,7 @@
     const top = Math.max(0, window.scrollY + anchor.getBoundingClientRect().top - offset);
     window.scrollTo({ top, behavior: prefersReducedMotion ? "auto" : "smooth" });
     runtime.view.activeId = section.id;
+    recordNavigationSelection(section, options.source || options.actionType || "section");
     if (runtime.ui) runtime.ui.updateActiveClasses(runtime.view.activeId);
     if (options.highlight) {
       window.clearTimeout(runtime.jumpEffectTimer);
@@ -736,6 +1298,7 @@
       scrollContainer.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
     }
     runtime.view.activeId = section.id;
+    recordNavigationSelection(section, options.source || options.actionType || "section");
     if (runtime.ui) runtime.ui.updateActiveClasses(runtime.view.activeId);
     if (options.highlight && isGoogleDocsExactTarget(target)) {
       showGoogleDocsHighlight(target, section);
@@ -984,7 +1547,15 @@
     runtime.lastAction = {
       ok: Boolean(ok),
       type,
-      message: details.message || (ok ? type === "next" ? "Moved to the next important section." : "Jumped to the useful section." : "SkimRoute could not find a jump target on this page yet."),
+      message: details.message || (ok
+        ? type === "next"
+          ? (runtime.model && runtime.model.nextReason || "Moved to the next useful section.")
+          : type === "query"
+            ? "Found the matching section."
+            : "Jumped to the useful section."
+        : type === "query"
+          ? "No strong section match found on this page."
+          : "SkimRoute could not find a jump target on this page yet."),
       at: Date.now(),
       phase: details.phase || (ok ? "completed" : "blocked"),
       pageNumber: 0,
@@ -1006,6 +1577,7 @@
     const importantSections = Array.isArray(model.importantSections) ? model.importantSections : [];
     const words = Number(model.totalReadableWords || model.totalWords || 0);
     const bestSection = sections.find((section) => section.id === model.bestSectionId) || null;
+    refreshNextPreview("stats");
     const nextImportant = sections.find((section) => section.id === model.nextImportantId)
       || importantSections.find((section) => !bestSection || section.id !== bestSection.id)
       || null;
@@ -1043,7 +1615,9 @@
       loadingReason: model.pageProfile.diagnosticHint || model.pageProfile.reason || "",
       canJump: Boolean(bestSection && model.hasStrongTarget && !quietMode && canJumpToSection(bestSection)),
       canJumpNext: Boolean(nextImportant && !quietMode && canJumpToSection(nextImportant)),
+      nextImportantId: nextImportant ? nextImportant.id : "",
       nextImportantTitle: nextImportant ? nextImportant.title : "",
+      nextReason: model.nextReason || (nextImportant ? "Next useful section" : ""),
       bestTitle: bestSection && model.hasStrongTarget ? bestSection.title : "",
       bestReason,
       whyReason: bestReason,
@@ -1060,9 +1634,81 @@
       lastActionPhase: action ? action.phase || "" : "",
       lastActionTargetPage: 0,
       lastActionAt: action ? action.at || 0 : 0,
+      sectionQuery: normalizePublicSectionQuery(runtime.view.sectionQuery),
       runtimeState: window.PagePilotRuntimeLoader && window.PagePilotRuntimeLoader.getRuntimeState
         ? window.PagePilotRuntimeLoader.getRuntimeState()
         : null
+    };
+  }
+
+  function normalizePublicSectionQuery(query) {
+    const state = query || createEmptySectionQuery();
+    return {
+      text: String(state.text || ""),
+      status: String(state.status || "idle"),
+      sectionId: String(state.sectionId || ""),
+      passageId: String(state.passageId || ""),
+      surface: String(state.surface || ""),
+      pageNumber: Number(state.pageNumber) || 0,
+      title: String(state.title || ""),
+      label: String(state.label || ""),
+      roleLabel: String(state.roleLabel || ""),
+      snippet: String(state.snippet || ""),
+      confidenceLabel: String(state.confidenceLabel || ""),
+      score: Number(state.score) || 0,
+      ocrExactMatches: Number(state.ocrExactMatches) || 0,
+      ocrFuzzyMatches: Number(state.ocrFuzzyMatches) || 0,
+      ocrFuzzyTerms: Array.isArray(state.ocrFuzzyTerms) ? state.ocrFuzzyTerms.slice(0, 4).map(String) : [],
+      ocrPhraseAcrossLines: Boolean(state.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: Number(state.ocrConfidenceAdjustment) || 0,
+      reason: String(state.reason || ""),
+      canNavigate: Boolean(state.canNavigate),
+      weakRequiresConfirm: Boolean(state.weakRequiresConfirm),
+      navigation: normalizePublicQueryNavigation(state.navigation),
+      alternatives: Array.isArray(state.alternatives) ? state.alternatives.slice(0, 2).map(normalizePublicSectionQueryAlternative) : [],
+      requestId: Number(state.requestId) || 0,
+      updatedAt: Number(state.updatedAt) || 0
+    };
+  }
+
+  function normalizePublicSectionQueryAlternative(item) {
+    return {
+      sectionId: String(item && item.sectionId || ""),
+      passageId: String(item && item.passageId || ""),
+      surface: String(item && item.surface || ""),
+      pageNumber: Number(item && item.pageNumber) || 0,
+      title: String(item && item.title || ""),
+      label: String(item && item.label || ""),
+      roleLabel: String(item && item.roleLabel || ""),
+      snippet: String(item && item.snippet || ""),
+      confidenceLabel: String(item && item.confidenceLabel || "Weak"),
+      score: Number(item && item.score) || 0,
+      ocrExactMatches: Number(item && item.ocrExactMatches) || 0,
+      ocrFuzzyMatches: Number(item && item.ocrFuzzyMatches) || 0,
+      ocrFuzzyTerms: Array.isArray(item && item.ocrFuzzyTerms) ? item.ocrFuzzyTerms.slice(0, 4).map(String) : [],
+      ocrPhraseAcrossLines: Boolean(item && item.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: Number(item && item.ocrConfidenceAdjustment) || 0,
+      status: String(item && item.status || "weak"),
+      reason: String(item && item.reason || ""),
+      canNavigate: Boolean(item && item.canNavigate),
+      weakRequiresConfirm: true,
+      navigation: normalizePublicQueryNavigation(item && item.navigation)
+    };
+  }
+
+  function normalizePublicQueryNavigation(navigation) {
+    const state = navigation || createEmptyQueryNavigationResult();
+    return {
+      found: Boolean(state.found),
+      navigated: Boolean(state.navigated),
+      verified: Boolean(state.verified),
+      exact: Boolean(state.exact),
+      surface: String(state.surface || ""),
+      sectionId: String(state.sectionId || ""),
+      passageId: String(state.passageId || ""),
+      pageNumber: Number(state.pageNumber) || 0,
+      reason: String(state.reason || ""),
+      strategy: String(state.strategy || "")
     };
   }
 

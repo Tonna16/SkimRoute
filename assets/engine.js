@@ -13,6 +13,34 @@
   const MAX_CONTENT_BLOCKS = 850;
   const MAX_HEADINGS = 260;
   const MAX_SECTIONS = 180;
+  const DOCUMENT_SALIENCE_MAX_SCORE_BOOST = 14;
+  const DOCUMENT_SALIENCE_MAX_USEFUL_BOOST = 8;
+  const DOCUMENT_SALIENCE_MAX_IMPORTANCE_BOOST = 6;
+  const LOCAL_TOPIC_MAX_SCORE_BOOST = 18;
+  const NEXT_PROGRESSION_BONUS_CAP = 18;
+  const NEXT_DISTANCE_BONUS_CAP = 12;
+  const NEXT_SIMILARITY_PENALTY_CAP = 32;
+  const NEXT_RECENT_SECTION_PENALTY_CAP = 12;
+  const SECTION_QUERY_MAX_CHARS = 120;
+  const SECTION_QUERY_MAX_TOKENS = 16;
+  const SECTION_QUERY_SNIPPET_CHARS = 180;
+  const SECTION_QUERY_STRONG_SCORE = 58;
+  const SECTION_QUERY_POSSIBLE_SCORE = 34;
+  const SECTION_QUERY_WEAK_SCORE = 18;
+  const SECTION_QUERY_MIN_AUTO_MARGIN = 7;
+  const SECTION_QUERY_WORD_FORM_SCORE_CAP = 14;
+  const SECTION_QUERY_SYNONYM_SCORE_CAP = 10;
+  const SECTION_QUERY_TYPO_SCORE_CAP = 8;
+  const SECTION_QUERY_EXPANSION_COVERAGE_CAP = 8;
+  const SECTION_QUERY_OCR_FUZZY_SCORE_CAP = 12;
+  const SECTION_QUERY_OCR_FUZZY_TERM_CAP = 4;
+  const SECTION_QUERY_OCR_MIN_FUZZY_TERM_LENGTH = 5;
+  const SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH = 4;
+  const SECTION_QUERY_OCR_LONG_TERM_EDIT_DISTANCE = 2;
+  const SECTION_QUERY_OCR_TRIGRAM_MIN_SIMILARITY = 0.78;
+  const SECTION_QUERY_OCR_SHORT_TRIGRAM_MIN_SIMILARITY = 0.9;
+  const SECTION_QUERY_OCR_LOW_CONFIDENCE_PENALTY = 8;
+  const SECTION_QUERY_OCR_VERY_LOW_CONFIDENCE_PENALTY = 18;
   const LOW_CONFIDENCE_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
   const QUIET_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
   const AMBIGUOUS_PAGE_TYPES = new Set(["search_results", "shopping_product", "app_dashboard", "low_structure"]);
@@ -336,6 +364,34 @@
     "while", "with", "would", "your", "page", "section", "article", "guide", "click",
     "home", "menu", "navigation", "subscribe", "newsletter", "comment", "comments", "related"
   ]);
+  const DOCUMENT_SALIENCE_STOPWORDS = new Set([
+    ...THEME_INTENT_STOPWORDS,
+    "able", "across", "almost", "along", "already", "among", "another", "around", "back",
+    "best", "better", "can", "change", "content", "current", "different", "enough",
+    "broad", "every", "first", "following", "found", "general", "give", "given", "good", "great", "guidance", "help",
+    "helps", "important", "including", "inside", "keep", "last", "later", "long",
+    "make", "makes", "many", "might", "must", "near", "need", "needs", "often",
+    "part", "parts", "point", "possible", "probably", "quite", "really", "right",
+    "several", "show", "shows", "simple", "small", "still", "strong", "take",
+    "using", "value", "want", "way", "well", "will", "without", "work", "works",
+    "you", "and", "the", "for", "not", "are", "was", "were", "has", "had", "but",
+    "anyone", "context", "describe", "describes", "detail", "details", "example", "explains", "gives", "instructions", "notes", "orientation", "parameters", "plain-language", "project", "quickly", "reader", "recap", "reviewing", "short", "skimming", "steps", "takeaway", "useful",
+    "abstract", "appendix", "article", "author", "background", "bibliography", "chapter",
+    "conclusion", "contents", "copyright", "discussion", "evidence", "figure", "finding",
+    "findings", "guide", "heading", "introduction", "links", "main", "method", "methods",
+    "overview", "privacy", "references", "related", "results", "section", "sections",
+    "sources", "summary", "table", "terms", "tips", "title"
+  ]);
+  const SECTION_QUERY_SYNONYM_GROUPS = [
+    ["cost", "price", "fee", "fees"],
+    ["requirement", "requirements", "eligibility", "qualification", "qualifications"],
+    ["setup", "installation", "install", "getting", "started", "start", "quickstart", "quick_start"],
+    ["problem", "issue", "error", "troubleshooting", "trouble"],
+    ["result", "results", "outcome", "outcomes", "finding", "findings"],
+    ["step", "steps", "instruction", "instructions", "procedure", "procedures"],
+    ["warning", "caution", "risk", "risks"]
+  ];
+  const SECTION_QUERY_SYNONYM_MAP = buildSectionQuerySynonymMap(SECTION_QUERY_SYNONYM_GROUPS);
 
   function createEngine(options) {
     const context = createContext(options);
@@ -392,6 +448,16 @@
           url: context.location && context.location.href || ""
         })
       );
+      const salienceResult = applyDocumentSalienceBoosts(
+        rankedSections,
+        pageProfile,
+        buildDocumentSalienceContext(rankedSections, pageProfile, {
+          title: context.document && context.document.title || "",
+          primaryTitle: getPrimaryDocumentHeading(root, helpers),
+          url: context.location && context.location.href || ""
+        })
+      );
+      rankedSections = salienceResult.sections;
       rankedSections = rankSections(rankedSections, pageProfile);
       const sections = buildSectionHierarchy(rankedSections, collapsedSectionIds);
       refreshSectionPositions(sections);
@@ -416,6 +482,11 @@
         confidence: recommendation.confidence,
         confidenceTier: recommendation.confidenceTier,
         confidenceLabel: recommendation.confidenceLabel,
+        confidenceFamilies: recommendation.confidenceFamilies,
+        positiveFamilyCount: recommendation.positiveFamilyCount,
+        ambiguityPenalties: recommendation.ambiguityPenalties,
+        confidenceCapReason: recommendation.confidenceCapReason,
+        calibratedConfidence: recommendation.calibratedConfidence,
         hasStrongTarget: recommendation.hasStrongTarget,
         bestLabel: recommendation.bestLabel,
         savedMinutes: recommendation.savedMinutes,
@@ -439,6 +510,7 @@
           fallbackSectionsCount: fallbackSections.length,
           unitSectionsCount: unitSections.length,
           rawSectionCount: rawSections.length,
+          documentSalience: salienceResult.diagnostics,
           pageProfileBefore: rawProfile,
           pageProfileAfter: pageProfile,
           ...(adapterDiagnostics || {})
@@ -475,9 +547,20 @@
       return fallback || context.document.body;
     }
 
+    function getPrimaryDocumentHeading(root, helpers) {
+      const heading = root && root.querySelector
+        ? root.querySelector("h1, [role='heading'][aria-level='1'], [data-pagepilot-primary-title]")
+        : null;
+      return heading ? helpers.cleanText(heading.innerText || heading.textContent || "") : "";
+    }
+
     return {
       scan,
       helpers,
+      navigation: {
+        selectNextSection,
+        searchSections
+      },
       refreshSectionPositions,
       getScrollOffset() {
         return getScrollOffset(context, helpers);
@@ -2185,6 +2268,431 @@
     return sections;
   }
 
+  function buildDocumentSalienceContext(sections, pageProfile, source) {
+    const title = cleanText(source && source.title || "");
+    const primaryTitle = cleanText(source && source.primaryTitle || "");
+    const adapterLabels = uniqueStrings((sections || [])
+      .map((section) => section && section.metrics && section.metrics.sectionKindLabel || "")
+      .concat((sections || []).map((section) => section && section.metrics && section.metrics.googleDocsRoleLabel || ""))
+      .filter((label) => label && !/^(useful section|useful|unknown|steps?|instructions?|parameters?|examples?|tips?|definition)$/i.test(label)))
+      .slice(0, 12);
+    const topicText = [title, primaryTitle].concat(adapterLabels).filter(Boolean).join(" ");
+    const topicTokens = buildSalienceWeightedTokens(topicText, 2.4);
+    return {
+      title,
+      primaryTitle,
+      topicText,
+      topicTokens,
+      adapterLabels,
+      pageType: pageProfile && pageProfile.type || "",
+      url: source && source.url || ""
+    };
+  }
+
+  function applyDocumentSalienceBoosts(sections, pageProfile, context) {
+    const safeSections = sections || [];
+    const diagnostics = {
+      sectionCount: safeSections.length,
+      indexedSectionCount: 0,
+      indexedTokenCount: 0,
+      topDistinctiveTerms: [],
+      sectionScores: []
+    };
+    safeSections.forEach((section) => ensureDocumentSalienceMetrics(section, null));
+    if (!safeSections.length || !context || pageProfile && pageProfile.quietMode) {
+      return { sections: safeSections, diagnostics };
+    }
+
+    const eligible = safeSections.filter((section) => section && section.metrics && !shouldSkipDocumentSalienceBoost(section, pageProfile));
+    if (eligible.length < 2) {
+      return { sections: safeSections, diagnostics };
+    }
+
+    const entries = eligible.map((section) => buildDocumentSalienceSectionEntry(section));
+    const avgLength = entries.reduce((sum, entry) => sum + entry.length, 0) / Math.max(1, entries.length);
+    const documentFrequency = new Map();
+    let indexedTokenCount = 0;
+    entries.forEach((entry) => {
+      indexedTokenCount += entry.length;
+      entry.termWeights.forEach((weight, term) => {
+        if (weight > 0) documentFrequency.set(term, (documentFrequency.get(term) || 0) + 1);
+      });
+    });
+
+    const distinctiveTerms = getDocumentDistinctiveTerms(entries, documentFrequency);
+    const topicTerms = context.topicTokens && context.topicTokens.size
+      ? context.topicTokens
+      : buildFallbackTopicTokens(distinctiveTerms);
+    entries.forEach((entry) => {
+      const result = scoreDocumentSalienceEntry(entry, {
+        sectionCount: entries.length,
+        avgLength,
+        documentFrequency,
+        distinctiveTerms,
+        topicTerms,
+        pageProfile
+      });
+      applyDocumentSalienceResult(entry.section, result);
+      diagnostics.sectionScores.push({
+        id: entry.section.id || "",
+        title: entry.section.title || "",
+        rawScore: result.rawScore,
+        contribution: result.contribution,
+        titleOverlapContribution: result.titleOverlapContribution,
+        terms: result.terms.slice(0, 6)
+      });
+    });
+
+    diagnostics.indexedSectionCount = entries.length;
+    diagnostics.indexedTokenCount = indexedTokenCount;
+    diagnostics.topDistinctiveTerms = distinctiveTerms.slice(0, 12).map((item) => ({
+      term: item.term,
+      documentFrequency: item.documentFrequency,
+      weight: roundMetric(item.weight)
+    }));
+    diagnostics.sectionScores.sort((a, b) => b.contribution - a.contribution || b.rawScore - a.rawScore);
+    return { sections: safeSections, diagnostics };
+  }
+
+  function ensureDocumentSalienceMetrics(section, result) {
+    if (!section || !section.metrics) return;
+    const metrics = section.metrics;
+    metrics.documentSalienceScore = result ? result.score : 0;
+    metrics.documentSalienceRawScore = result ? result.rawScore : 0;
+    metrics.documentSalienceContribution = result ? result.contribution : 0;
+    metrics.documentSalienceTerms = result ? result.terms.slice(0, 8) : [];
+    metrics.titleOverlapTerms = result ? result.titleOverlapTerms.slice(0, 6) : [];
+    metrics.salienceReason = result ? result.reason : "";
+    metrics.documentSalienceTitleContribution = result ? result.titleOverlapContribution : 0;
+  }
+
+  function shouldSkipDocumentSalienceBoost(section, pageProfile) {
+    if (!section || !section.metrics) return true;
+    if (pageProfile && pageProfile.quietMode) return true;
+    if (shouldSkipThemeIntentBoost(section, pageProfile)) return true;
+    const metrics = section.metrics;
+    const matched = metrics.matched || {};
+    if (section.wordCount < 24 && !(metrics.codeBlocks || 0) && !(metrics.tables || 0)) return true;
+    if (metrics.fluffScore >= 82 || metrics.negativePatternHit || metrics.isDenseLinks) return true;
+    if (matched.boilerplate || matched.references || matched.citationOnly || matched.tableOfContents || matched.pageTypeClutter) return true;
+    return false;
+  }
+
+  function buildDocumentSalienceSectionEntry(section) {
+    const titleTokens = buildSalienceWeightedTokens(section.title || "", 2.5);
+    const bodyTokens = buildSalienceWeightedTokens(section.text || "", 1);
+    const labelTokens = buildSalienceWeightedTokens([
+      section.metrics && section.metrics.sectionKindLabel || "",
+      section.metrics && section.metrics.googleDocsRoleLabel || "",
+      section.unitMeta && section.unitMeta.diagnosticReason || ""
+    ].filter(Boolean).join(" "), 0.8);
+    const termWeights = new Map();
+    const titleTerms = new Set();
+    const addWeighted = (tokens, isTitle) => {
+      tokens.forEach((weight, term) => {
+        termWeights.set(term, (termWeights.get(term) || 0) + weight);
+        if (isTitle) titleTerms.add(term);
+      });
+    };
+    addWeighted(titleTokens, true);
+    addWeighted(bodyTokens, false);
+    addWeighted(labelTokens, false);
+    const length = Array.from(termWeights.values()).reduce((sum, weight) => sum + weight, 0);
+    return {
+      section,
+      termWeights,
+      titleTerms,
+      length: Math.max(1, length)
+    };
+  }
+
+  function buildSectionQueryEntriesForSection(section, context = {}, model = null) {
+    const passages = getSectionQueryPassages(section, context, model);
+    if (!passages.length) {
+      return [buildSectionQueryRecordEntry(section, null, 0)];
+    }
+    return passages
+      .map((passage, index) => normalizeSectionQueryPassage(section, passage, index, context))
+      .filter((passage) => isSectionQueryPassageEligible(passage))
+      .map((passage, index) => buildSectionQueryRecordEntry(section, passage, index));
+  }
+
+  function getSectionQueryPassages(section, context = {}, model = null) {
+    let provided = null;
+    if (context && typeof context.getQueryPassages === "function") {
+      provided = safeCall(() => context.getQueryPassages(section, model), null);
+    }
+    if (!Array.isArray(provided)) {
+      provided = section && Array.isArray(section.queryPassages) ? section.queryPassages
+        : section && section.unitMeta && Array.isArray(section.unitMeta.queryPassages) ? section.unitMeta.queryPassages
+          : [];
+    }
+    return provided.slice(0, 80);
+  }
+
+  function hasSectionQueryPassageRecords(section, context = {}, model = null) {
+    return getSectionQueryPassages(section, context, model).some((passage, index) => {
+      const normalized = normalizeSectionQueryPassage(section, passage, index, context);
+      return isSectionQueryPassageEligible(normalized);
+    });
+  }
+
+  function normalizeSectionQueryPassage(section, passage, index, context = {}) {
+    const meta = passage && (passage.metadata || passage.meta) || {};
+    const id = String(passage && (passage.id || passage.passageId) || `${section && section.id || "section"}:passage:${index}`).slice(0, 180);
+    const title = cleanText(passage && (passage.title || passage.heading || passage.label) || section && section.title || "");
+    const text = cleanText(passage && (passage.text || passage.normalizedText || passage.body || passage.snippet) || "");
+    const surface = String(passage && passage.surface || meta.surface || context.surface || inferSectionQuerySurface(section)).slice(0, 40);
+    const pageNumber = Number(passage && passage.pageNumber || meta.pageNumber || section && (section.pageNumber || section.unitMeta && section.unitMeta.pageNumber) || 0) || 0;
+    return {
+      id,
+      title,
+      text,
+      label: cleanText(passage && (passage.label || passage.heading) || ""),
+      roleLabel: cleanText(passage && (passage.roleLabel || meta.roleLabel) || ""),
+      surface,
+      passageType: String(passage && (passage.passageType || passage.type) || meta.passageType || "").slice(0, 60),
+      pageNumber,
+      sourceType: String(passage && passage.sourceType || meta.sourceType || "").slice(0, 60),
+      ocrConfidence: Number(passage && passage.ocrConfidence || meta.ocrConfidence || 0) || 0,
+      rawText: cleanText(passage && passage.rawText || meta.rawText || ""),
+      normalizedText: cleanText(passage && passage.normalizedText || meta.normalizedText || text),
+      navigation: passage && passage.navigation && typeof passage.navigation === "object" ? passage.navigation : {},
+      metadata: meta,
+      relativeY: passage && passage.relativeY,
+      relativeYStart: passage && passage.relativeYStart,
+      relativeYEnd: passage && passage.relativeYEnd,
+      sourceLineIds: Array.isArray(passage && passage.sourceLineIds) ? passage.sourceLineIds.slice(0, 80) : [],
+      ocrSourceLines: Array.isArray(passage && passage.ocrSourceLines) ? passage.ocrSourceLines.slice(0, 80) : []
+    };
+  }
+
+  function buildSectionQueryRecordEntry(section, passage, recordIndex) {
+    const titleText = passage ? passage.title || section.title || "" : section.title || "";
+    const bodyText = passage ? passage.normalizedText || passage.text || "" : section.text || "";
+    const labelText = [
+      passage && passage.label || "",
+      passage && passage.roleLabel || "",
+      passage && passage.passageType || "",
+      section.metrics && section.metrics.sectionKindLabel || "",
+      section.metrics && section.metrics.googleDocsRoleLabel || "",
+      section.unitMeta && section.unitMeta.diagnosticReason || ""
+    ].filter(Boolean).join(" ");
+    const titleTokens = buildSalienceWeightedTokens(titleText, passage ? 2.9 : 2.5);
+    const bodyTokens = buildSalienceWeightedTokens(bodyText, 1);
+    const labelTokens = buildSalienceWeightedTokens(labelText, 0.8);
+    const termWeights = new Map();
+    const titleTerms = new Set();
+    const addWeighted = (tokens, isTitle) => {
+      tokens.forEach((weight, term) => {
+        termWeights.set(term, (termWeights.get(term) || 0) + weight);
+        if (isTitle) titleTerms.add(term);
+      });
+    };
+    addWeighted(titleTokens, true);
+    addWeighted(bodyTokens, false);
+    addWeighted(labelTokens, false);
+    const length = Array.from(termWeights.values()).reduce((sum, weight) => sum + weight, 0);
+    return {
+      section,
+      passage,
+      recordIndex: Number(recordIndex) || 0,
+      titleText,
+      bodyText,
+      labelText,
+      surface: passage && passage.surface || inferSectionQuerySurface(section),
+      termWeights,
+      titleTerms,
+      length: Math.max(1, length)
+    };
+  }
+
+  function isSectionQueryPassageEligible(passage) {
+    if (!passage) return false;
+    const text = cleanText(`${passage.title || ""} ${passage.text || ""}`);
+    if (countWords(text) < 4) return false;
+    if (passage.metadata && passage.metadata.hidden) return false;
+    if (passage.metadata && passage.metadata.duplicate) return false;
+    return true;
+  }
+
+  function inferSectionQuerySurface(section) {
+    const meta = section && section.unitMeta || {};
+    if (section && (section.source === "pdf" || section.pageNumber || meta.pageNumber || meta.pdfjs || meta.kind === "pdf-ocr")) return "pdf";
+    if (meta.role === "assistant" || meta.role === "user") return "chat";
+    if (meta.kind === "google-docs" || meta.source === "google-docs" || meta.googleDocsUnitId) return "docs";
+    return "page";
+  }
+
+  function buildSalienceWeightedTokens(text, baseWeight) {
+    const weights = new Map();
+    tokenizeDocumentSalienceText(text).forEach((token) => {
+      weights.set(token.term, (weights.get(token.term) || 0) + baseWeight * token.weight);
+    });
+    return weights;
+  }
+
+  function tokenizeDocumentSalienceText(text) {
+    const raw = String(text || "");
+    const matches = raw.match(/[A-Za-z][A-Za-z0-9_./+#-]{1,}|[A-Z]{2,}\d*|\b\d+[A-Za-z][A-Za-z0-9./+#-]*\b/g) || [];
+    return matches.map((token) => {
+      const technical = isTechnicalSalienceToken(token);
+      const term = normalizeDocumentSalienceToken(token, technical);
+      if (!term) return null;
+      const weight = technical ? 1.25 : 1;
+      return { term, weight };
+    }).filter(Boolean).slice(0, 900);
+  }
+
+  function normalizeDocumentSalienceToken(token, technical) {
+    const value = String(token || "")
+      .replace(/^[^A-Za-z0-9+#]+|[^A-Za-z0-9+#]+$/g, "")
+      .toLowerCase();
+    if (!value) return "";
+    if (DOCUMENT_SALIENCE_STOPWORDS.has(value)) return "";
+    if (!technical && value.length < 3) return "";
+    if (/^\d+$/.test(value)) return "";
+    return value;
+  }
+
+  function isTechnicalSalienceToken(token) {
+    const value = String(token || "");
+    return /[A-Z]{2,}/.test(value)
+      || /[A-Za-z]+[A-Z][A-Za-z0-9]/.test(value)
+      || /[A-Za-z]+[-_./+#][A-Za-z0-9]/.test(value)
+      || /[A-Za-z]+\d/.test(value)
+      || /\d[A-Za-z]+/.test(value);
+  }
+
+  function isDocumentSalienceTechnicalTerm(term) {
+    const value = String(term || "");
+    return /[0-9]/.test(value) || /[-_./+#]/.test(value);
+  }
+
+  function getDocumentDistinctiveTerms(entries, documentFrequency) {
+    const sectionCount = Math.max(1, entries.length);
+    const totals = new Map();
+    entries.forEach((entry) => {
+      entry.termWeights.forEach((weight, term) => {
+        totals.set(term, (totals.get(term) || 0) + weight);
+      });
+    });
+    return Array.from(totals.entries())
+      .map(([term, totalWeight]) => {
+        const df = documentFrequency.get(term) || 0;
+        const idf = getDocumentSalienceIdf(sectionCount, df);
+        return {
+          term,
+          totalWeight,
+          documentFrequency: df,
+          idf,
+          weight: idf * Math.sqrt(totalWeight)
+        };
+      })
+      .filter((item) => item.documentFrequency < sectionCount && item.weight > 0.18)
+      .sort((a, b) => b.weight - a.weight || b.idf - a.idf || a.term.localeCompare(b.term))
+      .slice(0, 40);
+  }
+
+  function buildFallbackTopicTokens(distinctiveTerms) {
+    const tokens = new Map();
+    (distinctiveTerms || []).slice(0, 10).forEach((item) => tokens.set(item.term, 1.4));
+    return tokens;
+  }
+
+  function scoreDocumentSalienceEntry(entry, details) {
+    const sectionCount = Math.max(1, details.sectionCount || 1);
+    const avgLength = Math.max(1, details.avgLength || entry.length || 1);
+    const distinctive = new Map((details.distinctiveTerms || []).map((item) => [item.term, item]));
+    const topicTerms = details.topicTerms || new Map();
+    const hasExplicitTopicTerms = topicTerms && topicTerms.size > 0;
+    const titleOverlapTerms = [];
+    const scoredTerms = [];
+    let rawScore = 0;
+    let titleOverlapContribution = 0;
+
+    entry.termWeights.forEach((weight, term) => {
+      const df = details.documentFrequency.get(term) || 0;
+      const idf = getDocumentSalienceIdf(sectionCount, df);
+      const topicWeight = topicTerms.get(term) || 0;
+      const distinctiveItem = distinctive.get(term);
+      const headingMultiplier = entry.titleTerms.has(term) ? 1.45 : 1;
+      const bm25 = getDocumentSalienceBm25(weight, entry.length, avgLength);
+      const distinctiveWeight = distinctiveItem ? Math.max(0.45, distinctiveItem.weight) : 0;
+      const technicalTopicLike = isDocumentSalienceTechnicalTerm(term);
+      let termScore = bm25 * idf * headingMultiplier * (0.62 + Math.min(1.8, topicWeight * 0.38) + Math.min(0.6, distinctiveWeight * 0.12));
+      if (topicWeight > 0) termScore *= 1.75;
+      else if (hasExplicitTopicTerms && !technicalTopicLike) termScore *= 0.18;
+      if (termScore <= 0.04) return;
+      rawScore += termScore;
+      if (topicWeight > 0) {
+        titleOverlapContribution += Math.min(1.8, termScore * 0.38 + topicWeight * 0.18);
+        titleOverlapTerms.push(term);
+      }
+      if (distinctiveItem || topicWeight > 0) {
+        scoredTerms.push({ term, score: termScore, title: topicWeight > 0 });
+      }
+    });
+
+    const uniqueTerms = uniqueStrings(scoredTerms.sort((a, b) => b.score - a.score).map((item) => item.term));
+    const uniqueTitleTerms = uniqueStrings(titleOverlapTerms);
+    if (uniqueTerms.length < 2 && uniqueTitleTerms.length < 2) rawScore *= 0.35;
+    if (uniqueTerms.length >= 4) rawScore *= 1.12;
+    const existingLocalBoost = entry.section.metrics && entry.section.metrics.themeIntent && entry.section.metrics.themeIntent.boost || 0;
+    const availableLocalBoost = Math.max(0, LOCAL_TOPIC_MAX_SCORE_BOOST - existingLocalBoost);
+    const baseContribution = Math.round(Math.min(DOCUMENT_SALIENCE_MAX_SCORE_BOOST, rawScore * 1.9 + Math.min(4, uniqueTerms.length) + Math.min(3, uniqueTitleTerms.length)));
+    let contribution = Math.max(0, Math.min(baseContribution, DOCUMENT_SALIENCE_MAX_SCORE_BOOST, availableLocalBoost));
+    const baseEvidence = entry.section.score >= 30
+      || entry.section.usefulScore >= 24
+      || getSignalCount(entry.section.metrics) > 0
+      || Boolean(entry.section.unitMeta && (entry.section.unitMeta.searchBlockType || entry.section.unitMeta.role === "assistant"));
+    if (!baseEvidence) contribution = Math.min(contribution, 4);
+    const reason = getDocumentSalienceReason(uniqueTerms, uniqueTitleTerms, contribution);
+    return {
+      rawScore: roundMetric(rawScore),
+      score: contribution,
+      contribution,
+      usefulContribution: Math.min(DOCUMENT_SALIENCE_MAX_USEFUL_BOOST, Math.ceil(contribution * 0.54)),
+      importanceContribution: Math.min(DOCUMENT_SALIENCE_MAX_IMPORTANCE_BOOST, Math.ceil(contribution * 0.42)),
+      titleOverlapContribution: roundMetric(titleOverlapContribution),
+      terms: uniqueTerms.slice(0, 8),
+      titleOverlapTerms: uniqueTitleTerms.slice(0, 6),
+      reason
+    };
+  }
+
+  function applyDocumentSalienceResult(section, result) {
+    ensureDocumentSalienceMetrics(section, result);
+    if (!section || !section.metrics || !result || result.contribution <= 0) return;
+    section.score += result.contribution;
+    section.usefulScore += result.usefulContribution;
+    section.importanceScore += result.importanceContribution;
+  }
+
+  function getDocumentSalienceReason(terms, titleTerms, contribution) {
+    if (!contribution) return "";
+    if (titleTerms && titleTerms.length >= 2) return "Strongly matches the document's main topic.";
+    if (titleTerms && titleTerms.length >= 1) return "Heading matches the document's central subject.";
+    if (terms && terms.length >= 3) return "Uses several terms distinctive to this document.";
+    return "Uses a distinctive term from this document.";
+  }
+
+  function getDocumentSalienceIdf(sectionCount, documentFrequency) {
+    const idf = Math.log(1 + (sectionCount - documentFrequency + 0.5) / (documentFrequency + 0.5));
+    return Math.max(0, idf);
+  }
+
+  function getDocumentSalienceBm25(weight, length, avgLength) {
+    const k1 = 1.2;
+    const b = 0.72;
+    const normalizedLength = Math.max(0.25, length / Math.max(1, avgLength));
+    return (weight * (k1 + 1)) / (weight + k1 * (1 - b + b * normalizedLength));
+  }
+
+  function roundMetric(value) {
+    return Math.round((Number(value) || 0) * 1000) / 1000;
+  }
+
   function buildEmptyThemeIntent(intent, themeTerms) {
     return {
       intent: intent && intent.intent || "",
@@ -2465,6 +2973,7 @@
     if (metrics.themeIntent && Array.isArray(metrics.themeIntent.reasons)) {
       metrics.themeIntent.reasons.slice(0, 2).forEach((reason) => reasons.push(reason));
     }
+    if (metrics.salienceReason) reasons.push(metrics.salienceReason);
     if (INTELLIGENCE_ROLE_REASONS[role]) reasons.push(INTELLIGENCE_ROLE_REASONS[role]);
     getSectionSignalReasons(section).forEach((reason) => reasons.push(reason));
     if (!reasons.length && metrics.sectionKindLabel) reasons.push(`${metrics.sectionKindLabel} signal with enough confidence`);
@@ -2550,6 +3059,12 @@
       }
       if (Array.isArray(metrics.themeIntent.matchedTerms) && metrics.themeIntent.matchedTerms.length) {
         addPositive("theme.match", Math.min(8, metrics.themeIntent.boost), `Matches local theme terms: ${metrics.themeIntent.matchedTerms.slice(0, 3).join(", ")}.`);
+      }
+    }
+    if (metrics.documentSalienceContribution > 0) {
+      addPositive("documentSalience.match", metrics.documentSalienceContribution, metrics.salienceReason || "Uses distinctive terms from this document.");
+      if (Array.isArray(metrics.titleOverlapTerms) && metrics.titleOverlapTerms.length) {
+        addPositive("documentSalience.titleOverlap", Math.min(8, metrics.titleOverlapTerms.length * 3), `Matches document topic terms: ${metrics.titleOverlapTerms.slice(0, 3).join(", ")}.`);
       }
     }
     if (metrics.fluffScore >= 82) addNegative("fluff.high", -metrics.fluffScore, "High boilerplate or fluff score.");
@@ -3186,13 +3701,17 @@ function getPageEvidence(details) {
     const margin = second ? bestSection.score - second.score : 28;
     const searchPage = pageProfile.type === "search_results";
     const ambiguousPage = !searchPage && (Boolean(pageProfile.isAmbiguous) || AMBIGUOUS_PAGE_TYPES.has(pageProfile.type));
-    const scoreStrength = Math.max(0, Math.min(1, (bestSection.score - 30) / 112));
-    const marginStrength = Math.max(0, Math.min(1, (margin + 8) / 58));
-    const signalStrength = Math.max(0, Math.min(1, getSignalCount(bestSection.metrics) / 7));
-    const usefulStrength = Math.max(0, Math.min(1, bestSection.usefulScore / 96));
-    const confidence = Math.round((scoreStrength * 0.34 + marginStrength * 0.22 + signalStrength * 0.18 + usefulStrength * 0.26) * 100);
     const pageConfidence = pageProfile.readingConfidence || 50;
-    const finalConfidence = Math.max(0, Math.min(96, Math.round(confidence * 0.74 + pageConfidence * 0.26)));
+    const calibration = calibrateTargetConfidence({
+      bestSection,
+      second,
+      sections,
+      pageProfile,
+      margin,
+      ambiguousPage,
+      pageConfidence
+    });
+    const finalConfidence = calibration.finalConfidence;
     const tier = getConfidenceTier(finalConfidence);
     const minimumConfidence = ambiguousPage
       ? Math.max(68, STRONG_TARGET_CONFIDENCE)
@@ -3258,13 +3777,279 @@ function getPageEvidence(details) {
       confidence: finalConfidence,
       confidenceTier: tier,
       confidenceLabel: confidenceLabelForTier(tier),
+      confidenceFamilies: calibration.families,
+      positiveFamilyCount: calibration.positiveFamilyCount,
+      ambiguityPenalties: calibration.ambiguityPenalties,
+      confidenceCapReason: calibration.capReason,
+      calibratedConfidence: finalConfidence,
       hasStrongTarget,
       bestLabel: hasStrongTarget ? bestLabelForSection(bestSection, tier, pageProfile) : "No clear standout",
       bestKind: bestKindForSection(bestSection),
       bestKindLabel: bestKindLabelForSection(bestSection),
-      targetConfidenceReason: targetConfidenceReason({ bestSection, second, finalConfidence, pageConfidence, margin, ambiguousPage, hasStrongTarget }),
+      targetConfidenceReason: targetConfidenceReason({ bestSection, second, finalConfidence, pageConfidence, margin, ambiguousPage, hasStrongTarget, calibration }),
       savedMinutes: hasStrongTarget ? estimateSavedMinutes(bestSection, sections) : 0
     };
+  }
+
+  function calibrateTargetConfidence(details) {
+    const bestSection = details.bestSection;
+    const pageProfile = details.pageProfile || {};
+    const margin = Number(details.margin) || 0;
+    const pageConfidence = Number(details.pageConfidence) || 50;
+    const families = buildConfidenceFamilies(bestSection, details.second, details.sections || [], pageProfile, margin);
+    const positiveFamilyNames = ["structural", "role", "pageIntent", "documentSpecific", "adapter"];
+    const positiveStrengths = positiveFamilyNames
+      .map((name) => ({ name, strength: families[name].strength }))
+      .filter((item) => item.strength >= 18);
+    const positiveFamilyCount = positiveStrengths.filter((item) => item.strength >= 28).length;
+    const positiveAverage = positiveStrengths.length
+      ? positiveStrengths.reduce((sum, item) => sum + item.strength, 0) / positiveStrengths.length
+      : 0;
+    const marginSupport = clampNumber((margin + 4) / 44 * 100, 0, 100);
+    const breadthBonus = Math.min(18, positiveFamilyCount * 5);
+    let finalConfidence = Math.round(
+      positiveAverage * 0.64
+      + breadthBonus
+      + marginSupport * 0.08
+      + pageConfidence * 0.14
+      - families.negative.strength * 0.18
+    );
+
+    const ambiguityPenalties = [];
+    const applyCap = (cap, reason) => {
+      if (finalConfidence > cap) {
+        ambiguityPenalties.push({ reason, cap });
+        finalConfidence = cap;
+      }
+    };
+
+    const strongAdapterException = families.adapter.strength >= 86
+      && families.structural.strength >= 42
+      && families.negative.strength < 36
+      && (families.role.strength >= 30 || families.pageIntent.strength >= 30);
+    if (positiveFamilyCount < 2) applyCap(60, "Only one positive evidence family is strong.");
+    if (positiveFamilyCount < 3 && !strongAdapterException) applyCap(76, "High confidence needs three independent evidence families.");
+    if (families.role.strength >= 70
+      && families.structural.strength < 28
+      && families.pageIntent.strength < 28
+      && families.documentSpecific.strength < 28
+      && families.adapter.strength < 28) {
+      applyCap(60, "Role-language evidence is not independently confirmed.");
+    }
+    if (pageProfile.googleDocsPartial || pageProfile.googleDocsMode === "partial") applyCap(68, "Partial Google Docs extraction caps confidence.");
+    if (isLowQualityOcrSection(bestSection)) applyCap(66, "Low-quality OCR caps confidence.");
+    if (pageConfidence < 44) applyCap(58, "Weak page extraction caps confidence.");
+    if (bestSection && bestSection.metrics && bestSection.metrics.fluffScore >= 74) applyCap(58, "High boilerplate likelihood caps confidence.");
+    if (margin < 4) applyCap(58, "Two close candidates reduce confidence.");
+    else if (margin < 8) applyCap(70, "Several sections look similarly useful.");
+    if (details.ambiguousPage && !strongAdapterException) applyCap(74, "Ambiguous page type caps confidence.");
+
+    finalConfidence = clampNumber(finalConfidence, 0, 96);
+    const capReason = ambiguityPenalties.length ? ambiguityPenalties[0].reason : "";
+    return {
+      families,
+      positiveFamilyCount,
+      ambiguityPenalties,
+      capReason,
+      finalConfidence
+    };
+  }
+
+  function buildConfidenceFamilies(section, second, sections, pageProfile, margin) {
+    const families = buildEmptyConfidenceFamilies();
+    if (!section || !section.metrics) return families;
+    families.structural = buildStructuralConfidenceFamily(section);
+    families.role = buildRoleConfidenceFamily(section, pageProfile);
+    families.pageIntent = buildPageIntentConfidenceFamily(section, pageProfile);
+    families.documentSpecific = buildDocumentSpecificConfidenceFamily(section);
+    families.adapter = buildAdapterConfidenceFamily(section, pageProfile);
+    if (families.role.strength >= 70
+      && families.pageIntent.strength >= 28
+      && families.structural.strength < 50
+      && families.documentSpecific.strength < 28
+      && families.adapter.strength < 28) {
+      families.pageIntent = confidenceFamily(Math.min(24, families.pageIntent.strength), ["Page-intent role is not independently confirmed."]);
+    }
+    families.negative = buildNegativeConfidenceFamily(section, second, sections, pageProfile, margin);
+    return families;
+  }
+
+  function buildEmptyConfidenceFamilies() {
+    return {
+      structural: confidenceFamily(0, []),
+      role: confidenceFamily(0, []),
+      pageIntent: confidenceFamily(0, []),
+      documentSpecific: confidenceFamily(0, []),
+      adapter: confidenceFamily(0, []),
+      negative: confidenceFamily(0, [])
+    };
+  }
+
+  function confidenceFamily(strength, reasons) {
+    return {
+      strength: clampNumber(Math.round(strength || 0), 0, 100),
+      reasons: uniqueStrings(reasons || []).slice(0, 4)
+    };
+  }
+
+  function buildStructuralConfidenceFamily(section) {
+    const metrics = section.metrics || {};
+    let strength = 0;
+    const reasons = [];
+    if (section.wordCount >= 80) {
+      strength += 24;
+      reasons.push("Substantial section text.");
+    } else if (section.wordCount >= 40) {
+      strength += 14;
+      reasons.push("Enough readable section text.");
+    }
+    if ((metrics.paragraphs || 0) >= 2 || metrics.hasReadableParagraphs) {
+      strength += 18;
+      reasons.push("Readable paragraph structure.");
+    }
+    if ((metrics.listItems || 0) >= 3) {
+      strength += 14;
+      reasons.push("Structured list is easy to scan.");
+    }
+    if ((metrics.codeBlocks || 0) > 0 || (metrics.tables || 0) > 0) {
+      strength += 16;
+      reasons.push("Contains structured code or table content.");
+    }
+    if (metrics.hasNumbers) {
+      strength += 8;
+      reasons.push("Contains concrete details.");
+    }
+    if (section.score >= 76 && metrics.fluffScore < 58) strength += 14;
+    return confidenceFamily(strength, reasons);
+  }
+
+  function buildRoleConfidenceFamily(section, pageProfile) {
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    const reasons = [];
+    let strength = 0;
+    const add = (amount, reason) => {
+      strength += amount;
+      if (reason) reasons.push(reason);
+    };
+    if (matched.correctedAnswer || matched.replacesFailedAttempt) add(88, "Corrected or replacement answer role.");
+    if (matched.latestCompleteAssistantAnswer || matched.finalAnswer || matched.finalRecommendation) add(76, "Final or latest answer role.");
+    if (matched.finalCode || matched.completeCode) add(72, "Complete code role.");
+    if (matched.stepByStepAnswer || matched.procedure || matched.directAction) add(58, "Actionable step role.");
+    if (matched.summary || matched.conclusion || matched.mainArgument || matched.results) add(54, "Summary, conclusion, argument, or results role.");
+    if (matched.answer || matched.conciseAnswer || matched.keyExplanation) add(44, "Direct answer or key explanation role.");
+    if (metrics.googleDocsRole && ["summary", "main_claim", "steps", "evidence", "results", "conclusion"].includes(metrics.googleDocsRole)) add(64, "Google Docs role metadata.");
+    if (normalizePdfOcrRole(metrics.ocrRole || section.unitMeta && section.unitMeta.ocrRole || "") === "body") add(72, "OCR body role metadata.");
+    if (pageProfile && pageProfile.type === "search_results" && section.unitMeta && section.unitMeta.searchBlockType) add(54, "Search result block role.");
+    return confidenceFamily(Math.min(100, strength), reasons);
+  }
+
+  function buildPageIntentConfidenceFamily(section, pageProfile) {
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    const type = String(pageProfile && pageProfile.type || "");
+    const reasons = [];
+    let strength = 0;
+    const kind = metrics.sectionKind || bestKindForSection(section);
+    const add = (amount, reason) => {
+      strength += amount;
+      reasons.push(reason);
+    };
+    if (metrics.themeIntent && metrics.themeIntent.intentMatch) add(36 + Math.min(24, Number(metrics.themeIntent.boost) || 0), "Matches the page intent.");
+    if (type === "article" && (matched.mainArgument || matched.summary || matched.conclusion || matched.keyEvidence)) add(62, "Matches article intent.");
+    if (type === "docs" && (matched.quickStart || matched.usage || matched.installation || matched.parameters || matched.troubleshooting)) add(62, "Matches documentation intent.");
+    if (type === "tutorial" && (matched.setup || matched.prerequisites || matched.procedure || matched.finalResult || matched.codeExplanation)) add(62, "Matches tutorial intent.");
+    if (type === "research" && (matched.abstract || matched.results || matched.discussion || matched.conclusion || matched.methods)) add(66, "Matches research-page intent.");
+    if (type === "recipe" && (matched.ingredients || matched.instructions || matched.timing || matched.tips)) add(66, "Matches recipe intent.");
+    if (type === "chat" && (matched.latestCompleteAssistantAnswer || matched.correctedAnswer || matched.answersLatestUser || matched.completeAssistantAnswer)) add(68, "Matches chat intent.");
+    if (type === "pdf" && (/^(abstract|results|discussion|conclusion|methods|ocr_letter_body)$/.test(kind) || normalizePdfOcrRole(metrics.ocrRole || "") === "body")) add(64, "Matches PDF intent.");
+    if (type === "search_results" && section.unitMeta && ["ai_overview", "answer", "top_results"].includes(section.unitMeta.searchBlockType)) add(70, "Matches search-result intent.");
+    return confidenceFamily(Math.min(100, strength), reasons);
+  }
+
+  function buildDocumentSpecificConfidenceFamily(section) {
+    const metrics = section.metrics || {};
+    const contribution = Number(metrics.documentSalienceContribution) || 0;
+    const titleTerms = Array.isArray(metrics.titleOverlapTerms) ? metrics.titleOverlapTerms.length : 0;
+    const terms = Array.isArray(metrics.documentSalienceTerms) ? metrics.documentSalienceTerms.length : 0;
+    const strength = contribution * 5.5 + titleTerms * 10 + Math.min(terms, 5) * 5;
+    const reasons = [];
+    if (contribution > 0 && metrics.salienceReason) reasons.push(metrics.salienceReason);
+    if (titleTerms > 0) reasons.push("Overlaps the document title or main heading.");
+    if (terms >= 3) reasons.push("Uses distinctive document terms.");
+    return confidenceFamily(strength, reasons);
+  }
+
+  function buildAdapterConfidenceFamily(section, pageProfile) {
+    const metrics = section.metrics || {};
+    const unitMeta = section.unitMeta || {};
+    const reasons = [];
+    let strength = 0;
+    const add = (amount, reason) => {
+      strength += amount;
+      if (reason) reasons.push(reason);
+    };
+    const adapterScore = Number(metrics.adapterScore || unitMeta.adapterScore || 0);
+    if (adapterScore > 0) add(Math.min(70, adapterScore * 0.58), "Adapter score supports this section.");
+    if (unitMeta.searchBlockType === "ai_overview") add(92, "Search adapter selected AI Overview.");
+    else if (unitMeta.searchBlockType === "answer") add(84, "Search adapter selected an answer block.");
+    else if (unitMeta.searchBlockType === "top_results") add(66, "Search adapter selected top results.");
+    if (unitMeta.role === "assistant" && (unitMeta.isLatestAssistant || unitMeta.isLatestCompleteAssistant || unitMeta.answersLatestUser)) add(78, "Chat adapter metadata identifies the useful answer.");
+    if (unitMeta.isAfterUserCorrection || unitMeta.hasRevision || unitMeta.replacesFailedAttempt) add(82, "Chat adapter metadata identifies a corrected answer.");
+    if (isGoogleDocsSection(unitMeta, pageProfile) && metrics.googleDocsRole && !["document_title", "heading", "references", "appendix", "unknown"].includes(metrics.googleDocsRole)) add(78, "Google Docs structure supports this section.");
+    const ocrRole = normalizePdfOcrRole(metrics.ocrRole || unitMeta.ocrRole || "");
+    if (ocrRole === "body") add(82, "PDF OCR metadata identifies body text.");
+    if (metrics.pdfSectionType === "form" || unitMeta.pdfSectionType === "form") add(58, "PDF adapter identified a form or notice.");
+    return confidenceFamily(Math.min(100, strength), reasons);
+  }
+
+  function buildNegativeConfidenceFamily(section, second, sections, pageProfile, margin) {
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    const reasons = [];
+    let strength = 0;
+    if (metrics.fluffScore >= 58) {
+      strength += Math.min(52, metrics.fluffScore * 0.5);
+      reasons.push("Boilerplate or fluff likelihood.");
+    }
+    ["boilerplate", "references", "citationOnly", "tableOfContents", "appendix", "pageTypeClutter", "incompleteAssistantAnswer", "loadingOrFailedAnswer", "promptEcho", "supersededDraft"].forEach((key) => {
+      if (matched[key]) {
+        strength += 22;
+        reasons.push(`Negative ${key} signal.`);
+      }
+    });
+    if (pageProfile && (pageProfile.googleDocsPartial || pageProfile.googleDocsMode === "partial")) {
+      strength += 18;
+      reasons.push("Partial Google Docs extraction.");
+    }
+    if (isLowQualityOcrSection(section)) {
+      strength += 24;
+      reasons.push("Low-quality OCR extraction.");
+    }
+    if (second && margin < 8) {
+      strength += margin < 4 ? 34 : 20;
+      reasons.push("Close competing section.");
+    }
+    return confidenceFamily(Math.min(100, strength), reasons);
+  }
+
+  function isLowQualityOcrSection(section) {
+    const metrics = section && section.metrics || {};
+    const unitMeta = section && section.unitMeta || {};
+    const values = [
+      metrics.ocrQuality,
+      metrics.qualityState,
+      unitMeta.ocrQuality,
+      unitMeta.qualityState,
+      unitMeta.pdfOcrQuality
+    ].map((value) => String(value || "").toLowerCase());
+    return values.some((value) => /\b(low|weak|poor|unreadable|noisy)\b/.test(value));
+  }
+
+  function clampNumber(value, min, max) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return min;
+    return Math.max(min, Math.min(max, number));
   }
 
   function emptyRecommendation(confidence) {
@@ -3273,6 +4058,11 @@ function getPageEvidence(details) {
       confidence: confidence || 0,
       confidenceTier: "none",
       confidenceLabel: "No clear standout",
+      confidenceFamilies: buildEmptyConfidenceFamilies(),
+      positiveFamilyCount: 0,
+      ambiguityPenalties: [],
+      confidenceCapReason: "",
+      calibratedConfidence: confidence || 0,
       hasStrongTarget: false,
       bestLabel: "No clear standout",
       bestKind: "",
@@ -3354,6 +4144,7 @@ function getPageEvidence(details) {
 
   function targetConfidenceReason(details) {
     if (!details.hasStrongTarget) {
+      if (details.calibration && details.calibration.capReason) return details.calibration.capReason;
       if (details.ambiguousPage) return "Ambiguous page, waiting for stronger evidence";
       if (details.pageConfidence < 44) return "Page confidence is low";
       if (details.margin < 8) return "Several sections look similarly useful";
@@ -3377,7 +4168,29 @@ function getPageEvidence(details) {
     if (details.bestSection.metrics.matched.finalAnswer) return "Final answer signal with enough confidence";
     if (details.bestSection.metrics.matched.conciseAnswer) return "Concise answer signal with enough confidence";
     if (details.bestSection.metrics.matched.keyExplanation) return "Key explanation signal with enough confidence";
+    const familyReason = getConfidenceFamilyReason(details.calibration);
+    if (familyReason) return familyReason;
     return details.ambiguousPage ? "Strong useful signal on an ambiguous page" : "Strong useful signal";
+  }
+
+  function getConfidenceFamilyReason(calibration) {
+    if (!calibration || !calibration.families) return "";
+    const labels = {
+      structural: "structure",
+      role: "role",
+      pageIntent: "page intent",
+      documentSpecific: "document-specific terms",
+      adapter: "adapter metadata"
+    };
+    const names = Object.keys(labels)
+      .map((name) => ({ name, strength: calibration.families[name] && calibration.families[name].strength || 0 }))
+      .filter((item) => item.strength >= 28)
+      .sort((a, b) => b.strength - a.strength)
+      .slice(0, 3)
+      .map((item) => labels[item.name]);
+    if (names.length < 2) return "";
+    if (names.length === 2) return `Supported by independent ${names[0]} and ${names[1]} evidence.`;
+    return `Supported by independent ${names[0]}, ${names[1]}, and ${names[2]} evidence.`;
   }
 
   function getSignalCount(metrics) {
@@ -3414,23 +4227,1470 @@ function getPageEvidence(details) {
     if (!sections.length) {
       return { nextImportantId: null, skipTargetId: null };
     }
-    if (pageProfile && pageProfile.type === "search_results") {
-      const nextImportant = importantSections.find((section) => section.id !== bestSectionId)
-        || sections.find((section) => section.id !== bestSectionId && section.isImportant)
-        || null;
-      return {
-        nextImportantId: nextImportant ? nextImportant.id : null,
-        skipTargetId: pickSkipTarget(sections, importantSections)
-      };
-    }
     const currentMarker = window.scrollY + Math.min(window.innerHeight * 0.45, 420);
-    const nextImportant = importantSections.find((section) => section.top > currentMarker + 80 && section.id !== bestSectionId)
-      || importantSections.find((section) => section.id !== bestSectionId)
-      || null;
+    const nextSelection = selectNextSection({
+      sections,
+      importantSections,
+      bestSectionId,
+      pageProfile
+    }, {
+      currentTop: currentMarker,
+      excludeSectionIds: bestSectionId ? [bestSectionId] : [],
+      source: "scan-preview"
+    });
     return {
-      nextImportantId: nextImportant ? nextImportant.id : null,
+      nextImportantId: nextSelection.sectionId || null,
       skipTargetId: pickSkipTarget(sections, importantSections)
     };
+  }
+
+  function selectNextSection(model, context = {}) {
+    const sections = Array.isArray(model && model.sections) ? model.sections : [];
+    const importantSections = Array.isArray(model && model.importantSections) ? model.importantSections : [];
+    const pageProfile = model && model.pageProfile || {};
+    const diagnostics = {
+      source: context.source || "next",
+      selectedId: "",
+      selectedReason: "",
+      currentSectionId: context.currentSectionId || "",
+      candidates: [],
+      skipped: []
+    };
+    if (!sections.length || pageProfile.quietMode) {
+      diagnostics.selectedReason = pageProfile.quietMode ? "quiet-page" : "no-sections";
+      return { sectionId: "", reason: "No next useful section", diagnostics };
+    }
+
+    const current = resolveNextCurrentSection(sections, context);
+    const currentIndex = current ? sections.findIndex((section) => section.id === current.id) : -1;
+    const currentTop = Number.isFinite(Number(context.currentTop)) ? Number(context.currentTop) : null;
+    const recentIds = new Set((context.recentSectionIds || []).concat(context.lastSelectedSectionId || []).filter(Boolean).map(String));
+    const excludedIds = new Set((context.excludeSectionIds || []).filter(Boolean).map(String));
+    const importantIds = new Set(importantSections.map((section) => section && section.id).filter(Boolean));
+    const currentRole = context.currentRole || current && getSectionNavigationRole(current, pageProfile) || context.lastSelectedRole || "";
+    const entries = new Map();
+    const duplicateReferenceSections = sections.filter((section) => isDuplicateRoleSection(section, pageProfile));
+    const candidateRows = [];
+
+    sections.forEach((section, index) => {
+      const skipReason = getNextCandidateSkipReason(section, pageProfile, importantIds, excludedIds);
+      if (skipReason) {
+        pushDiagnostic(diagnostics.skipped, { id: section && section.id || "", title: section && section.title || "", reason: skipReason });
+        return;
+      }
+      if (!isNavigableByContext(section, context)) {
+        pushDiagnostic(diagnostics.skipped, { id: section.id, title: section.title || "", reason: "no-navigation-target" });
+        return;
+      }
+      if (!isForwardNextCandidate(section, index, current, currentIndex, currentTop, context)) {
+        pushDiagnostic(diagnostics.skipped, { id: section.id, title: section.title || "", reason: "not-forward" });
+        return;
+      }
+
+      const role = getSectionNavigationRole(section, pageProfile);
+      const usefulness = getNextUsefulness(section, importantIds);
+      const progressionBonus = getNextProgressionBonus(pageProfile, currentRole, role, section);
+      const distanceSuitability = getNextDistanceSuitability(section, index, current, currentIndex, currentTop, pageProfile);
+      const similarityPenalty = getNextSimilarityPenalty(section, {
+        current,
+        sections,
+        recentIds,
+        duplicateReferenceSections,
+        entries,
+        pageProfile
+      });
+      if (similarityPenalty >= NEXT_SIMILARITY_PENALTY_CAP && isDuplicateRoleSection(section, pageProfile)) {
+        pushDiagnostic(diagnostics.skipped, { id: section.id, title: section.title || "", reason: "near-duplicate" });
+        return;
+      }
+      const recentPenalty = recentIds.has(String(section.id)) ? NEXT_RECENT_SECTION_PENALTY_CAP : 0;
+      const nextUtility = usefulness + progressionBonus + distanceSuitability - similarityPenalty - recentPenalty;
+      const row = {
+        section,
+        role,
+        usefulness: roundMetric(usefulness),
+        progressionBonus: roundMetric(progressionBonus),
+        distanceSuitability: roundMetric(distanceSuitability),
+        similarityPenalty: roundMetric(similarityPenalty),
+        recentPenalty: roundMetric(recentPenalty),
+        nextUtility: roundMetric(nextUtility),
+        reason: getNextReason(pageProfile, role, progressionBonus, similarityPenalty)
+      };
+      candidateRows.push(row);
+      pushDiagnostic(diagnostics.candidates, {
+        id: section.id,
+        title: section.title || "",
+        role,
+        usefulness: row.usefulness,
+        progressionBonus: row.progressionBonus,
+        distanceSuitability: row.distanceSuitability,
+        similarityPenalty: row.similarityPenalty,
+        recentPenalty: row.recentPenalty,
+        nextUtility: row.nextUtility,
+        reason: row.reason
+      }, 18);
+    });
+
+    candidateRows.sort((a, b) => b.nextUtility - a.nextUtility || a.section.top - b.section.top || a.section.index - b.section.index);
+    const selected = candidateRows[0] || null;
+    if (!selected || selected.nextUtility < 8) {
+      diagnostics.selectedReason = selected ? "weak-next-utility" : "no-candidates";
+      return { sectionId: "", reason: "No next useful section", diagnostics };
+    }
+    diagnostics.selectedId = selected.section.id;
+    diagnostics.selectedReason = selected.reason;
+    return {
+      sectionId: selected.section.id,
+      reason: selected.reason,
+      diagnostics
+    };
+  }
+
+  function resolveNextCurrentSection(sections, context) {
+    const byId = context.currentSectionId
+      ? sections.find((section) => section.id === context.currentSectionId)
+      : null;
+    if (byId) return byId;
+    const top = Number(context.currentTop);
+    if (!Number.isFinite(top)) return null;
+    let current = null;
+    sections.forEach((section) => {
+      if (Number(section.top) <= top + 24) current = section;
+    });
+    return current;
+  }
+
+  function getNextCandidateSkipReason(section, pageProfile, importantIds, excludedIds) {
+    if (!section || !section.id) return "missing-section";
+    if (excludedIds.has(String(section.id))) return "excluded";
+    if (!isNextCandidateEligible(section, pageProfile, importantIds)) return "not-useful";
+    return "";
+  }
+
+  function isNextCandidateEligible(section, pageProfile, importantIds) {
+    if (!section || !section.metrics) return false;
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    const unitMeta = section.unitMeta || {};
+    if (shouldSkipThemeIntentBoost(section, pageProfile)) return false;
+    if (matched.supersededDraft || matched.promptEcho || matched.loadingOrFailedAnswer || matched.incompleteAssistantAnswer || matched.shortConfirmation) return false;
+    if (pageProfile && pageProfile.type === "chat" && unitMeta.role === "user") return false;
+    const usefulEnough = importantIds.has(section.id)
+      || section.isImportant
+      || section.isBest
+      || Number(section.score) >= 42
+      || Number(section.usefulScore) >= 24
+      || (Number(metrics.codeBlocks) > 0 && Number(section.score) >= 34)
+      || Boolean(matched.finalCode || matched.completeCode || matched.results || matched.conclusion || matched.procedure);
+    const enoughText = Number(section.wordCount) >= 10 || Number(metrics.codeBlocks) > 0 || Number(metrics.tables) > 0;
+    return Boolean(usefulEnough && enoughText);
+  }
+
+  function isForwardNextCandidate(section, index, current, currentIndex, currentTop, context) {
+    if (context.allowWraparound) return true;
+    if (current) {
+      return index > currentIndex || Number(section.top) > Number(current.top) + 48;
+    }
+    if (Number.isFinite(currentTop)) {
+      return Number(section.top) > currentTop + 48;
+    }
+    return true;
+  }
+
+  function isNavigableByContext(section, context) {
+    if (!section) return false;
+    if (typeof context.isNavigable === "function") {
+      try {
+        return Boolean(context.isNavigable(section));
+      } catch (error) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function getNextUsefulness(section, importantIds) {
+    const score = Number(section.score) || 0;
+    const useful = Number(section.usefulScore) || 0;
+    const importance = Number(section.importanceScore) || 0;
+    let value = Math.min(64, score * 0.58) + Math.min(24, useful * 0.22) + Math.min(12, importance * 0.14);
+    if (section.isBest) value += 4;
+    if (section.isImportant || importantIds.has(section.id)) value += 7;
+    if (section.metrics && Number(section.metrics.documentSalienceContribution) > 0) value += Math.min(6, Number(section.metrics.documentSalienceContribution) * 0.45);
+    return Math.max(0, Math.min(100, value));
+  }
+
+  function getNextDistanceSuitability(section, index, current, currentIndex, currentTop, pageProfile) {
+    if (current && currentIndex >= 0) {
+      const gap = Math.max(1, index - currentIndex);
+      if (pageProfile && pageProfile.type === "pdf") return Math.max(3, NEXT_DISTANCE_BONUS_CAP - Math.min(9, gap - 1));
+      if (gap === 1) return NEXT_DISTANCE_BONUS_CAP;
+      if (gap === 2) return 10;
+      if (gap === 3) return 8;
+      if (gap <= 5) return 6;
+      if (gap <= 8) return 4;
+      return 2;
+    }
+    const top = Number(section.top);
+    const marker = Number(currentTop);
+    if (!Number.isFinite(top) || !Number.isFinite(marker)) return 4;
+    const distance = Math.max(0, top - marker);
+    if (distance < 500) return NEXT_DISTANCE_BONUS_CAP;
+    if (distance < 1100) return 10;
+    if (distance < 2200) return 7;
+    if (distance < 4200) return 4;
+    return 2;
+  }
+
+  function getNextProgressionBonus(pageProfile, currentRole, candidateRole, section) {
+    const type = pageProfile && pageProfile.type || "";
+    if (!candidateRole) return 0;
+    if (type === "pdf") {
+      return currentRole && currentRole !== candidateRole ? 6 : 3;
+    }
+    if (type === "search_results") {
+      return Math.min(NEXT_PROGRESSION_BONUS_CAP, getSearchProgressionBonus(currentRole, candidateRole, section));
+    }
+    const order = getProgressionOrder(type);
+    if (!order.length) return 0;
+    const currentIndex = order.indexOf(normalizeProgressionRole(currentRole));
+    const candidateIndex = order.indexOf(normalizeProgressionRole(candidateRole));
+    if (candidateIndex === -1) return 0;
+    if (currentIndex === -1) return Math.min(8, 3 + Math.max(0, order.length - candidateIndex));
+    if (candidateIndex > currentIndex) {
+      const gap = candidateIndex - currentIndex;
+      return Math.min(NEXT_PROGRESSION_BONUS_CAP, gap <= 2 ? 18 - (gap - 1) * 4 : 8);
+    }
+    if (candidateIndex === currentIndex) return 3;
+    return 0;
+  }
+
+  function getProgressionOrder(type) {
+    const maps = {
+      tutorial: ["prerequisites", "setup", "steps", "code_example", "final_result", "troubleshooting"],
+      research: ["abstract", "methods", "results", "discussion", "conclusion"],
+      article: ["main_argument", "key_evidence", "details", "discussion", "conclusion"],
+      chat: ["latest_answer", "final_answer", "complete_code", "steps", "warning", "details"],
+      docs: ["quick_start", "usage", "parameters", "troubleshooting"],
+      recipe: ["ingredients", "instructions", "timing", "tips"]
+    };
+    return maps[type] || [];
+  }
+
+  function normalizeProgressionRole(role) {
+    const value = String(role || "").toLowerCase();
+    const aliases = {
+      installation: "setup",
+      quick_start: "quick_start",
+      code_block: "code_example",
+      complete_code: "complete_code",
+      final_code: "complete_code",
+      example: "code_example",
+      step_by_step: "steps",
+      answer: "latest_answer",
+      corrected_answer: "latest_answer",
+      final_recommendation: "final_answer",
+      key_explanation: "details",
+      summary: "main_argument",
+      conclusion: "conclusion",
+      search_ai_overview: "search_ai_overview",
+      search_answer: "search_answer",
+      search_top_results: "search_top_results",
+      search_sources: "search_sources",
+      search_people_also_ask: "search_people_also_ask"
+    };
+    return aliases[value] || value;
+  }
+
+  function getSearchProgressionBonus(currentRole, candidateRole, section) {
+    const role = normalizeProgressionRole(candidateRole);
+    const current = normalizeProgressionRole(currentRole);
+    const priority = {
+      search_ai_overview: 0,
+      search_answer: 0,
+      search_top_results: 1,
+      search_sources: 2,
+      search_people_also_ask: 2,
+      search_videos: 3,
+      search_maps: 3
+    };
+    if (!current) return role === "search_ai_overview" || role === "search_answer" ? 10 : 4;
+    if (Number.isFinite(priority[role]) && Number.isFinite(priority[current]) && priority[role] > priority[current]) return 14;
+    if (section && section.unitMeta && section.unitMeta.searchBlockType === "top_results") return 10;
+    return 0;
+  }
+
+  function getNextSimilarityPenalty(section, details) {
+    const candidateTokens = getSectionTokenSet(section, details.entries);
+    if (!candidateTokens.size) return 0;
+    let penalty = 0;
+    if (details.current && details.current.id !== section.id) {
+      penalty = Math.max(penalty, tokenSimilarity(candidateTokens, getSectionTokenSet(details.current, details.entries)) * 26);
+    }
+    (details.sections || []).forEach((item) => {
+      if (!item || item.id === section.id || !details.recentIds.has(String(item.id))) return;
+      penalty = Math.max(penalty, tokenSimilarity(candidateTokens, getSectionTokenSet(item, details.entries)) * 22);
+    });
+    if (isDuplicateRoleSection(section, details.pageProfile)) {
+      (details.duplicateReferenceSections || []).forEach((item) => {
+        if (!item || item.id === section.id) return;
+        const similarity = tokenSimilarity(candidateTokens, getSectionTokenSet(item, details.entries));
+        if (similarity >= 0.72) penalty = Math.max(penalty, NEXT_SIMILARITY_PENALTY_CAP);
+        else if (similarity >= 0.46) penalty = Math.max(penalty, 20);
+      });
+    }
+    return Math.min(NEXT_SIMILARITY_PENALTY_CAP, penalty);
+  }
+
+  function isDuplicateRoleSection(section, pageProfile) {
+    const role = normalizeProgressionRole(getSectionNavigationRole(section, pageProfile));
+    return ["summary", "final_answer", "latest_answer", "main_argument", "conclusion"].includes(role)
+      || Boolean(section && section.metrics && section.metrics.matched && (section.metrics.matched.summary || section.metrics.matched.finalAnswer || section.metrics.matched.finalRecommendation));
+  }
+
+  function getSectionTokenSet(section, cache) {
+    const key = section && section.id || "";
+    if (cache && key && cache.has(key)) return cache.get(key);
+    const tokens = tokenizeDocumentSalienceText(`${section && section.title || ""} ${section && section.text || ""}`)
+      .slice(0, 180)
+      .map((token) => token.term);
+    const set = new Set(tokens);
+    if (cache && key) cache.set(key, set);
+    return set;
+  }
+
+  function tokenSimilarity(a, b) {
+    if (!a || !b || !a.size || !b.size) return 0;
+    let overlap = 0;
+    a.forEach((term) => {
+      if (b.has(term)) overlap += 1;
+    });
+    const union = a.size + b.size - overlap;
+    return union ? overlap / union : 0;
+  }
+
+  function getSectionNavigationRole(section, pageProfile) {
+    if (section && section.intelligence && section.intelligence.role) return String(section.intelligence.role);
+    return getSectionIntelligenceRole(section, pageProfile);
+  }
+
+  function getNextReason(pageProfile, role, progressionBonus, similarityPenalty) {
+    const type = pageProfile && pageProfile.type || "";
+    if (similarityPenalty >= 18) return "Next distinct result";
+    if (progressionBonus >= 10) {
+      if (type === "tutorial" || role === "steps") return "Next useful step";
+      if (type === "research" && /results|conclusion|discussion/.test(role)) return "Next supporting section";
+      if (type === "search_results") return "Next distinct result";
+    }
+    if (/key_evidence|results|sources|details|discussion/.test(role)) return "Next supporting section";
+    return "Next useful section";
+  }
+
+  function pushDiagnostic(list, item, limit = 14) {
+    if (!Array.isArray(list) || list.length >= limit) return;
+    list.push(item);
+  }
+
+  function searchSections(model, rawQuery, context = {}) {
+    const query = cleanText(String(rawQuery || "").slice(0, SECTION_QUERY_MAX_CHARS));
+    const diagnostics = {
+      queryLength: query.length,
+      tokenCount: 0,
+      candidateCount: 0,
+      selectedId: "",
+      candidates: []
+    };
+    if (!query) {
+      return { status: "idle", result: null, diagnostics };
+    }
+    const sections = Array.isArray(model && model.sections) ? model.sections : [];
+    const pageProfile = model && model.pageProfile || {};
+    const queryTokens = uniqueQueryTokens(query);
+    diagnostics.tokenCount = queryTokens.length;
+    if (!sections.length || !queryTokens.length) {
+      return { status: "none", result: null, diagnostics };
+    }
+
+    const candidates = sections.filter((section) => isSectionQueryEligible(section, pageProfile) || hasSectionQueryPassageRecords(section, context, model));
+    diagnostics.candidateCount = candidates.length;
+    if (!candidates.length) return { status: "none", result: null, diagnostics };
+
+    const entries = candidates.flatMap((section) => buildSectionQueryEntriesForSection(section, context, model));
+    if (!entries.length) return { status: "none", result: null, diagnostics };
+    diagnostics.recordCount = entries.length;
+    const queryExpansion = buildSectionQueryExpansion(queryTokens, entries);
+    const avgLength = entries.reduce((sum, entry) => sum + entry.length, 0) / Math.max(1, entries.length);
+    const documentFrequency = new Map();
+    entries.forEach((entry) => {
+      entry.termWeights.forEach((weight, term) => {
+        if (weight) documentFrequency.set(term, (documentFrequency.get(term) || 0) + 1);
+      });
+    });
+    diagnostics.expansion = summarizeSectionQueryExpansion(queryExpansion);
+
+    const scored = entries.map((entry) => scoreSectionQueryEntry(entry, {
+      query,
+      queryTokens,
+      queryExpansion,
+      avgLength,
+      sectionCount: entries.length,
+      documentFrequency,
+      pageProfile,
+      context
+    })).filter(Boolean).sort((a, b) => b.score - a.score
+      || b.directMatchCount - a.directMatchCount
+      || b.directScore - a.directScore
+      || a.section.top - b.section.top
+      || a.recordIndex - b.recordIndex);
+
+    applySectionQueryMargin(scored);
+
+    scored.slice(0, 10).forEach((item) => diagnostics.candidates.push({
+      id: item.section.id,
+      passageId: item.passage && item.passage.id || "",
+      surface: item.passage && item.passage.surface || item.surface || "",
+      pageNumber: item.passage && item.passage.pageNumber || item.section.pageNumber || item.section.unitMeta && item.section.unitMeta.pageNumber || 0,
+      title: item.section.title || "",
+      score: item.score,
+      matchedTerms: item.matchedTerms,
+      headingMatches: item.headingMatches,
+      wordFormMatches: item.wordFormMatchCount,
+      synonymMatches: item.synonymMatchCount,
+      typoMatches: item.typoMatchCount,
+      ocrExactMatches: item.ocrExactMatches || 0,
+      ocrFuzzyMatches: item.ocrFuzzyMatches || 0,
+      ocrFuzzyTerms: item.ocrFuzzyTerms || [],
+      ocrPhraseAcrossLines: Boolean(item.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: item.ocrConfidenceAdjustment || 0,
+      phraseMatch: item.phraseMatch,
+      margin: item.margin,
+      marginDowngraded: Boolean(item.marginDowngraded),
+      status: item.status
+    }));
+    diagnostics.ocrNoMatch = buildOcrSectionQueryNoMatchDiagnostics(entries, scored, queryTokens, context);
+
+    const selected = scored[0] || null;
+    if (!selected || selected.score < SECTION_QUERY_WEAK_SCORE || selected.status === "none") {
+      return { status: "none", result: null, diagnostics };
+    }
+    diagnostics.selectedId = selected.section.id;
+    diagnostics.runnerUpId = scored[1] && scored[1].section && scored[1].section.id || "";
+    diagnostics.margin = Number.isFinite(selected.margin) ? selected.margin : null;
+    diagnostics.marginDowngraded = Boolean(selected.marginDowngraded);
+    const result = buildSectionQueryResult(selected, queryTokens, context);
+    diagnostics.alternatives = Array.isArray(result.alternatives) ? result.alternatives.map((item) => ({
+      sectionId: item.sectionId,
+      passageId: item.passageId || "",
+      title: item.title || "",
+      score: item.score,
+      status: item.status
+    })) : [];
+    return {
+      status: selected.status,
+      result,
+      diagnostics
+    };
+  }
+
+  function uniqueQueryTokens(query) {
+    const seen = new Set();
+    return tokenizeDocumentSalienceText(query)
+      .map((token) => token.term)
+      .filter((term) => {
+        if (!term || seen.has(term)) return false;
+        seen.add(term);
+        return true;
+      })
+      .slice(0, SECTION_QUERY_MAX_TOKENS);
+  }
+
+  function buildOcrSectionQueryNoMatchDiagnostics(entries, scored, queryTokens, context = {}) {
+    const ocrEntries = (entries || []).filter(isOcrSectionQueryEntry);
+    if (!ocrEntries.length) return null;
+    const ocrScored = (scored || []).filter((item) => isOcrSectionQueryEntry(item));
+    const topCandidates = ocrScored.slice(0, 5).map((item) => ({
+      sectionId: item.section && item.section.id || "",
+      passageId: item.passage && item.passage.id || "",
+      pageNumber: item.passage && item.passage.pageNumber || item.section && item.section.unitMeta && item.section.unitMeta.pageNumber || 0,
+      score: item.score,
+      status: item.status,
+      rawScore: item.rawScore,
+      scoreBeforeCaps: item.scoreBeforeCaps,
+      scoreCapApplied: item.scoreCapApplied || "",
+      finalStatus: item.status,
+      exactMatches: item.ocrExactMatches || item.directMatchCount || 0,
+      fuzzyMatches: item.ocrFuzzyMatches || 0,
+      fuzzyTerms: item.ocrFuzzyTerms || [],
+      confidencePenalty: item.ocrConfidenceAdjustment || 0,
+      ocrConfidence: item.ocrConfidence || 0,
+      rejectionRule: item.rejectionRule || "",
+      sample: cleanText(item.passage && (item.passage.normalizedText || item.passage.text) || item.section && item.section.text || "").slice(0, 160)
+    }));
+    const exactMatchCount = ocrScored.reduce((sum, item) => sum + Number(item.ocrExactMatches || item.directMatchCount || 0), 0);
+    const fuzzyMatchCount = ocrScored.reduce((sum, item) => sum + Number(item.ocrFuzzyMatches || 0), 0);
+    const confidencePenalties = ocrScored.reduce((sum, item) => sum + Number(item.ocrConfidenceAdjustment || 0), 0);
+    return {
+      modelSource: String(context.source || context.surface || "pdf").slice(0, 80),
+      ocrSectionCount: new Set(ocrEntries.map((entry) => entry.section && entry.section.id || "")).size,
+      ocrPassageCount: ocrEntries.length,
+      queryTokenCount: queryTokens.length,
+      topCandidates,
+      exactMatchCount,
+      fuzzyMatchCount,
+      confidencePenalties,
+      samples: ocrEntries.slice(0, 5).map((entry) => cleanText(entry.passage && (entry.passage.normalizedText || entry.passage.text) || entry.bodyText || "").slice(0, 160)),
+      rejectionReason: topCandidates.length ? "below-threshold-or-close-margin" : "no-ocr-evidence"
+    };
+  }
+
+  function buildSectionQueryExpansion(queryTokens, entries) {
+    const universe = [];
+    const universeSet = new Set();
+    const stemBuckets = new Map();
+    entries.forEach((entry) => {
+      entry.termWeights.forEach((weight, term) => {
+        if (!weight || universeSet.has(term)) return;
+        universeSet.add(term);
+        universe.push(term);
+        const stem = getConservativeWordFormStem(term);
+        if (!stem) return;
+        if (!stemBuckets.has(stem)) stemBuckets.set(stem, []);
+        stemBuckets.get(stem).push(term);
+      });
+    });
+    const plans = new Map();
+    queryTokens.forEach((term) => {
+      const stem = getConservativeWordFormStem(term);
+      const synonymTerms = getSectionQuerySynonyms(term).filter((item) => universeSet.has(item) && item !== term).slice(0, 4);
+      const wordFormTerms = (stemBuckets.get(stem) || [])
+        .filter((item) => item !== term && !synonymTerms.includes(item))
+        .slice(0, 4);
+      const typoTerms = term.length >= 7
+        ? universe.filter((item) => item !== term
+          && !synonymTerms.includes(item)
+          && !wordFormTerms.includes(item)
+          && isMinorSectionQueryTypo(term, item)).slice(0, 3)
+        : [];
+      plans.set(term, {
+        term,
+        stem,
+        wordFormTerms,
+        synonymTerms,
+        typoTerms
+      });
+    });
+    return plans;
+  }
+
+  function summarizeSectionQueryExpansion(queryExpansion) {
+    const summary = {
+      wordFormTerms: 0,
+      synonymTerms: 0,
+      typoTerms: 0
+    };
+    queryExpansion.forEach((plan) => {
+      summary.wordFormTerms += plan.wordFormTerms.length;
+      summary.synonymTerms += plan.synonymTerms.length;
+      summary.typoTerms += plan.typoTerms.length;
+    });
+    return summary;
+  }
+
+  function buildSectionQuerySynonymMap(groups) {
+    const map = new Map();
+    groups.forEach((group) => {
+      const normalized = uniqueStrings(group.map((term) => normalizeDocumentSalienceToken(term, false)).filter(Boolean));
+      normalized.forEach((term) => {
+        map.set(term, normalized.filter((item) => item !== term));
+      });
+    });
+    return map;
+  }
+
+  function getSectionQuerySynonyms(term) {
+    const normalized = normalizeDocumentSalienceToken(term, false);
+    return normalized && SECTION_QUERY_SYNONYM_MAP.has(normalized)
+      ? SECTION_QUERY_SYNONYM_MAP.get(normalized)
+      : [];
+  }
+
+  function getConservativeWordFormStem(term) {
+    const value = String(term || "").toLowerCase();
+    if (!value || value.length < 4 || isDocumentSalienceTechnicalTerm(value)) return value;
+    const irregular = {
+      applied: "apply",
+      applies: "apply",
+      applying: "apply",
+      apply: "apply",
+      fees: "fee",
+      fee: "fee",
+      findings: "finding",
+      finding: "finding",
+      outcomes: "outcome",
+      outcome: "outcome",
+      requirements: "requirement",
+      requirement: "requirement",
+      qualifications: "qualification",
+      qualification: "qualification",
+      instructions: "instruction",
+      instruction: "instruction",
+      procedures: "procedure",
+      procedure: "procedure",
+      warnings: "warning",
+      warning: "warning",
+      issues: "issue",
+      issue: "issue",
+      errors: "error",
+      error: "error",
+      risks: "risk",
+      risk: "risk",
+      steps: "step",
+      step: "step",
+      results: "result",
+      result: "result"
+    };
+    if (irregular[value]) return irregular[value];
+    if (value.length > 5 && value.endsWith("ies")) return `${value.slice(0, -3)}y`;
+    if (value.length > 6 && value.endsWith("ing")) {
+      const base = value.slice(0, -3);
+      return undoubleTrailingConsonant(base);
+    }
+    if (value.length > 5 && value.endsWith("ed")) {
+      const base = value.slice(0, -2);
+      return undoubleTrailingConsonant(base);
+    }
+    if (value.length > 5 && value.endsWith("es")) return value.slice(0, -2);
+    if (value.length > 4 && value.endsWith("s")) return value.slice(0, -1);
+    return value;
+  }
+
+  function undoubleTrailingConsonant(value) {
+    if (!value || value.length < 4) return value;
+    const last = value[value.length - 1];
+    const previous = value[value.length - 2];
+    if (last === previous && !/[aeiou]/.test(last)) return value.slice(0, -1);
+    return value;
+  }
+
+  function isMinorSectionQueryTypo(queryTerm, candidateTerm) {
+    const query = String(queryTerm || "").toLowerCase();
+    const candidate = String(candidateTerm || "").toLowerCase();
+    if (query.length < 7 || candidate.length < 7 || query === candidate) return false;
+    if (Math.abs(query.length - candidate.length) > 1) return false;
+    if (query[0] !== candidate[0]) return false;
+    if (getConservativeWordFormStem(query) === getConservativeWordFormStem(candidate)) return false;
+    if (SECTION_QUERY_SYNONYM_MAP.get(query)?.includes(candidate)) return false;
+    if (query.length === candidate.length) {
+      let firstDiff = -1;
+      let diffs = 0;
+      for (let index = 0; index < query.length; index += 1) {
+        if (query[index] === candidate[index]) continue;
+        if (firstDiff < 0) firstDiff = index;
+        diffs += 1;
+        if (diffs > 2) return false;
+      }
+      if (diffs <= 1) return true;
+      return diffs === 2
+        && firstDiff + 1 < query.length
+        && query[firstDiff] === candidate[firstDiff + 1]
+        && query[firstDiff + 1] === candidate[firstDiff];
+    }
+    return isOneInsertionOrDeletionApart(query, candidate);
+  }
+
+  function isOneInsertionOrDeletionApart(left, right) {
+    const shorter = left.length < right.length ? left : right;
+    const longer = left.length < right.length ? right : left;
+    let skipped = false;
+    let shortIndex = 0;
+    let longIndex = 0;
+    while (shortIndex < shorter.length && longIndex < longer.length) {
+      if (shorter[shortIndex] === longer[longIndex]) {
+        shortIndex += 1;
+        longIndex += 1;
+        continue;
+      }
+      if (skipped) return false;
+      skipped = true;
+      longIndex += 1;
+    }
+    return true;
+  }
+
+  function isSectionQueryEligible(section, pageProfile) {
+    if (!section || !section.metrics) return false;
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    const strongContentSignal = hasStrongSectionQueryContentSignal(section, pageProfile);
+    if (isLowValueSectionKind(section)) return false;
+    if ((matched.boilerplate || matched.references || matched.citationOnly) && !strongContentSignal) return false;
+    if (matched.tableOfContents || matched.promptEcho || matched.loadingOrFailedAnswer || matched.incompleteAssistantAnswer) return false;
+    if ((metrics.fluffScore >= 88 || metrics.negativePatternHit || matched.pageTypeClutter) && !strongContentSignal) return false;
+    if (pageProfile && pageProfile.type === "chat" && section.unitMeta && section.unitMeta.role === "user") return false;
+    if (Number(section.wordCount) < 6 && !(metrics.codeBlocks || 0) && !(section.title || "").trim()) return false;
+    return true;
+  }
+
+  function hasStrongSectionQueryContentSignal(section, pageProfile) {
+    if (!section || !section.metrics) return false;
+    const metrics = section.metrics || {};
+    const matched = metrics.matched || {};
+    if (matched.mainArgument || matched.keyEvidence || matched.summary || matched.conclusion || matched.results || matched.recommendation || matched.useful) return true;
+    if (matched.answer || matched.conciseAnswer || matched.keyExplanation || matched.stepByStepAnswer || matched.procedure || matched.directAction) return true;
+    if (matched.completeAssistantAnswer || matched.latestCompleteAssistantAnswer || matched.correctedAnswer || matched.finalAnswer || matched.finalResult) return true;
+    if (matched.googleDocsMainClaim || matched.googleDocsSummary || matched.googleDocsSteps || matched.googleDocsEvidence || matched.googleDocsResults || matched.googleDocsConclusion) return true;
+    const role = normalizeProgressionRole(getSectionNavigationRole(section, pageProfile));
+    return [
+      "abstract", "claim", "main_argument", "summary", "evidence", "key_evidence",
+      "methods", "results", "discussion", "conclusion", "steps", "code",
+      "example", "result", "troubleshooting", "quick_start", "usage",
+      "configuration", "latest_answer", "final_answer", "direct_answer",
+      "top_result", "supporting_result", "ingredients", "instructions"
+    ].includes(role) || (Number(section.score) >= 18 && Number(section.wordCount) >= 40);
+  }
+
+  function scoreSectionQueryEntry(entry, details) {
+    const section = entry.section;
+    const passage = entry.passage || null;
+    const titleText = cleanText(entry.titleText || section.title || "").toLowerCase();
+    const bodyText = cleanText(entry.bodyText || section.text || "").toLowerCase();
+    const queryLower = details.query.toLowerCase();
+    const queryTokens = details.queryTokens || [];
+    let rawBm25 = 0;
+    let headingMatches = 0;
+    let bodyMatches = 0;
+    const matchedTerms = [];
+    const matchedOriginalTokens = new Set();
+    const expansionOriginalTokens = new Set();
+    const wordFormTerms = [];
+    const synonymTerms = [];
+    const typoTerms = [];
+    const ocrFuzzyTerms = [];
+    let wordFormRaw = 0;
+    let synonymRaw = 0;
+    let typoRaw = 0;
+    let wordFormHeadingMatches = 0;
+    let synonymHeadingMatches = 0;
+    let typoHeadingMatches = 0;
+
+    queryTokens.forEach((term) => {
+      const weight = entry.termWeights.get(term) || 0;
+      if (weight) {
+        const df = details.documentFrequency.get(term) || 0;
+        const idf = getDocumentSalienceIdf(details.sectionCount, df);
+        const titleHit = entry.titleTerms.has(term);
+        const bm25 = getDocumentSalienceBm25(weight, entry.length, details.avgLength);
+        rawBm25 += bm25 * Math.max(0.4, idf) * (titleHit ? 1.55 : 1);
+        if (titleHit) headingMatches += 1;
+        if (bodyText.includes(term)) bodyMatches += 1;
+        matchedTerms.push(term);
+        matchedOriginalTokens.add(term);
+        return;
+      }
+      const expansion = details.queryExpansion && details.queryExpansion.get(term);
+      const wordForm = scoreBestSectionQueryExpansionTerm(entry, details, expansion && expansion.wordFormTerms, 0.62);
+      if (wordForm) {
+        wordFormRaw += wordForm.raw;
+        if (wordForm.titleHit) wordFormHeadingMatches += 1;
+        wordFormTerms.push(wordForm.term);
+        expansionOriginalTokens.add(term);
+        return;
+      }
+      const synonym = scoreBestSectionQueryExpansionTerm(entry, details, expansion && expansion.synonymTerms, 0.46);
+      if (synonym) {
+        synonymRaw += synonym.raw;
+        if (synonym.titleHit) synonymHeadingMatches += 1;
+        synonymTerms.push(synonym.term);
+        expansionOriginalTokens.add(term);
+        return;
+      }
+      const typo = scoreBestSectionQueryExpansionTerm(entry, details, expansion && expansion.typoTerms, 0.38);
+      if (typo) {
+        typoRaw += typo.raw;
+        if (typo.titleHit) typoHeadingMatches += 1;
+        typoTerms.push(typo.term);
+        expansionOriginalTokens.add(term);
+      }
+    });
+
+    const phraseInHeading = queryLower.length >= 4 && titleText.includes(queryLower);
+    const phraseInBody = queryLower.length >= 4 && bodyText.includes(queryLower);
+    const ocrEvidence = scoreOcrSectionQueryFuzzyEvidence(entry, details, {
+      matchedOriginalTokens,
+      expansionOriginalTokens,
+      bodyText,
+      titleText
+    });
+    if (ocrEvidence && ocrEvidence.terms.length) {
+      ocrFuzzyTerms.push(...ocrEvidence.terms);
+    }
+    const distinctMatches = uniqueStrings(matchedTerms).length;
+    const expansionDistinctMatches = expansionOriginalTokens.size;
+    const ocrFuzzyDistinctMatches = ocrEvidence ? ocrEvidence.originalTokens.size : 0;
+    const ocrPhraseAcrossLines = Boolean(ocrEvidence && ocrEvidence.phraseAcrossLines);
+    if (!distinctMatches && !expansionDistinctMatches && !ocrFuzzyDistinctMatches && !phraseInHeading && !phraseInBody && !ocrPhraseAcrossLines) return null;
+    const coverage = distinctMatches / Math.max(1, queryTokens.length);
+    const expansionCoverage = expansionDistinctMatches / Math.max(1, queryTokens.length);
+    const ocrFuzzyCoverage = ocrFuzzyDistinctMatches / Math.max(1, queryTokens.length);
+    const bm25Score = rawBm25 * 18;
+    const headingBoost = Math.min(24, headingMatches * 7 + (phraseInHeading ? 18 : 0));
+    const phraseBoost = phraseInBody ? 12 : 0;
+    const coverageBoost = Math.min(18, coverage * 16 + (distinctMatches >= 3 ? 4 : 0));
+    const roleBoost = getSectionQueryRoleBoost(section, details.pageProfile, queryTokens);
+    const wordFormBoost = Math.min(SECTION_QUERY_WORD_FORM_SCORE_CAP, wordFormRaw * 10 + wordFormHeadingMatches * 4);
+    const synonymBoost = Math.min(SECTION_QUERY_SYNONYM_SCORE_CAP, synonymRaw * 8 + synonymHeadingMatches * 3);
+    const typoBoost = Math.min(SECTION_QUERY_TYPO_SCORE_CAP, typoRaw * 7 + typoHeadingMatches * 2);
+    const expansionCoverageBoost = Math.min(SECTION_QUERY_EXPANSION_COVERAGE_CAP, expansionCoverage * 8);
+    const ocrFuzzyBoost = Math.min(
+      SECTION_QUERY_OCR_FUZZY_SCORE_CAP,
+      (ocrEvidence ? ocrEvidence.rawScore : 0) + Math.min(4, ocrFuzzyCoverage * 8) + (ocrPhraseAcrossLines ? 3 : 0)
+    );
+    const surfaceAdjustment = getSectionQuerySurfaceAdjustment(entry, {
+      queryLower,
+      queryTokens,
+      distinctMatches,
+      semanticMatches: distinctMatches + expansionDistinctMatches + ocrFuzzyDistinctMatches,
+      phraseInHeading,
+      phraseInBody: phraseInBody || ocrPhraseAcrossLines,
+      headingMatches,
+      bodyMatches,
+      ocrFuzzyDistinctMatches
+    }, details);
+    const ocrPolicy = getOcrSectionQueryPolicy(entry, {
+      queryTokens,
+      distinctMatches,
+      expansionDistinctMatches,
+      ocrFuzzyDistinctMatches,
+      phraseInHeading,
+      phraseInBody,
+      headingMatches,
+      bodyMatches,
+      surfaceAdjustment,
+      bodyText,
+      titleText,
+      ocrEvidence
+    }, details);
+    let score = bm25Score + headingBoost + phraseBoost + coverageBoost + roleBoost + wordFormBoost + synonymBoost + typoBoost + expansionCoverageBoost + ocrFuzzyBoost + surfaceAdjustment.score;
+    let scoreCapApplied = "";
+    if (Number.isFinite(surfaceAdjustment.maxScore)) {
+      score = Math.min(score, surfaceAdjustment.maxScore);
+      scoreCapApplied = "surface-max-score";
+    }
+    const ocrOnlyFuzzy = Boolean(!distinctMatches && !expansionDistinctMatches && !phraseInHeading && !phraseInBody && (ocrFuzzyDistinctMatches || ocrPhraseAcrossLines));
+    if (ocrOnlyFuzzy && ocrFuzzyDistinctMatches < 2 && !ocrPhraseAcrossLines) {
+      score = Math.min(score, SECTION_QUERY_WEAK_SCORE + 6);
+      scoreCapApplied = scoreCapApplied || "single-ocr-fuzzy-weak-cap";
+      if ((ocrPolicy.credibleSingleFuzzy || ocrPolicy.visibleSingleFuzzy) && score < SECTION_QUERY_WEAK_SCORE + 1) {
+        score = SECTION_QUERY_WEAK_SCORE + 1;
+        scoreCapApplied = "single-ocr-fuzzy-weak-floor";
+      }
+    }
+    const scoreBeforeCaps = score;
+    if (queryTokens.length === 1 && !phraseInHeading && headingMatches === 0 && !ocrPolicy.directSingleEligible) {
+      score = Math.min(score, expansionDistinctMatches || ocrFuzzyDistinctMatches ? 28 : 32);
+      scoreCapApplied = scoreCapApplied || "single-token-generic-cap";
+    }
+    if (!passage && section.metrics && section.metrics.fluffScore >= 70) score -= 10;
+    const rawScore = bm25Score + headingBoost + phraseBoost + coverageBoost + roleBoost + wordFormBoost + synonymBoost + typoBoost + expansionCoverageBoost + ocrFuzzyBoost + surfaceAdjustment.score;
+    score = roundMetric(Math.max(0, score));
+    const status = getSectionQueryStatus(score, {
+      distinctMatches,
+      expansionDistinctMatches,
+      ocrFuzzyDistinctMatches,
+      ocrOnlyFuzzy,
+      queryTokenCount: queryTokens.length,
+      ocrDirectSingleEligible: ocrPolicy.directSingleEligible,
+      ocrCredibleSingleFuzzy: ocrPolicy.credibleSingleFuzzy,
+      ocrRejectedByPolicy: ocrPolicy.rejectionRule,
+      phraseInHeading,
+      phraseInBody: phraseInBody || ocrPhraseAcrossLines,
+      headingMatches,
+      expansionHeadingMatches: wordFormHeadingMatches + synonymHeadingMatches + typoHeadingMatches,
+      ocrPhraseAcrossLines,
+      ocrConfidenceAdjustment: surfaceAdjustment.ocrConfidenceAdjustment || 0
+    });
+    return {
+      section,
+      passage,
+      surface: entry.surface,
+      recordIndex: entry.recordIndex || 0,
+      score,
+      status,
+      rawScore: roundMetric(rawScore),
+      scoreBeforeCaps: roundMetric(scoreBeforeCaps),
+      scoreCapApplied,
+      rejectionRule: ocrPolicy.rejectionRule || "",
+      matchedTerms: uniqueStrings(matchedTerms.concat(wordFormTerms, synonymTerms, typoTerms, ocrFuzzyTerms)).slice(0, 8),
+      directMatchCount: distinctMatches,
+      semanticMatchCount: distinctMatches + expansionDistinctMatches + ocrFuzzyDistinctMatches,
+      wordFormMatchCount: wordFormTerms.length,
+      synonymMatchCount: synonymTerms.length,
+      typoMatchCount: typoTerms.length,
+      ocrExactMatches: distinctMatches,
+      ocrFuzzyMatches: ocrFuzzyDistinctMatches,
+      ocrFuzzyTerms: uniqueStrings(ocrFuzzyTerms).slice(0, SECTION_QUERY_OCR_FUZZY_TERM_CAP),
+      ocrFuzzyMatchDetails: ocrEvidence && ocrEvidence.matches || [],
+      ocrPhraseAcrossLines,
+      ocrConfidenceAdjustment: surfaceAdjustment.ocrConfidenceAdjustment || 0,
+      ocrConfidence: ocrPolicy.confidence || 0,
+      ocrDirectSingleEligible: Boolean(ocrPolicy.directSingleEligible),
+      ocrCredibleSingleFuzzy: Boolean(ocrPolicy.credibleSingleFuzzy),
+      ocrVisibleSingleFuzzy: Boolean(ocrPolicy.visibleSingleFuzzy),
+      headingMatches,
+      bodyMatches,
+      phraseMatch: phraseInHeading || phraseInBody || ocrPhraseAcrossLines,
+      directScore: roundMetric(bm25Score + headingBoost + phraseBoost + coverageBoost + roleBoost + Math.max(0, surfaceAdjustment.score)),
+      components: {
+        bm25: roundMetric(bm25Score),
+        heading: roundMetric(headingBoost),
+        phrase: roundMetric(phraseBoost),
+        coverage: roundMetric(coverageBoost),
+        role: roundMetric(roleBoost),
+        wordForm: roundMetric(wordFormBoost),
+        synonym: roundMetric(synonymBoost),
+        typo: roundMetric(typoBoost),
+        ocrFuzzy: roundMetric(ocrFuzzyBoost),
+        expansionCoverage: roundMetric(expansionCoverageBoost),
+        surface: roundMetric(surfaceAdjustment.score)
+      },
+      surfaceReasons: surfaceAdjustment.reasons
+    };
+  }
+
+  function getOcrSectionQueryPolicy(entry, evidence, details) {
+    if (!isOcrSectionQueryEntry(entry)) {
+      return { isOcr: false, confidence: 0, directSingleEligible: false, credibleSingleFuzzy: false, rejectionRule: "" };
+    }
+    const queryTokens = evidence.queryTokens || [];
+    const singleToken = queryTokens.length === 1;
+    const term = singleToken ? String(queryTokens[0] || "") : "";
+    const confidence = getOcrSectionQueryConfidence(entry);
+    const text = cleanText([
+      entry.titleText || "",
+      entry.bodyText || "",
+      entry.passage && (entry.passage.normalizedText || entry.passage.text) || ""
+    ].join(" ")).toLowerCase();
+    const furniture = isLikelyQueryFurniture(text)
+      || (evidence.surfaceAdjustment && Array.isArray(evidence.surfaceAdjustment.reasons)
+        && evidence.surfaceAdjustment.reasons.some((reason) => /furniture|recurring/.test(String(reason || ""))));
+    const repeated = singleToken && isOcrQueryTermRepeatedAcrossRecords(term, details);
+    const coherentPassage = countWords(text) >= 4 && !furniture;
+    const directSingleEligible = Boolean(
+      singleToken
+      && term.length >= SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH
+      && evidence.distinctMatches === 1
+      && !evidence.expansionDistinctMatches
+      && !evidence.ocrFuzzyDistinctMatches
+      && confidence >= 72
+      && coherentPassage
+      && !repeated
+    );
+    const fuzzyMatches = evidence.ocrEvidence && Array.isArray(evidence.ocrEvidence.matches) ? evidence.ocrEvidence.matches : [];
+    const firstFuzzy = fuzzyMatches[0] || null;
+    const fuzzyMatch = firstFuzzy || {};
+    const shortConservativeFuzzy = Boolean(
+      term.length === SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH
+      && fuzzyMatch.method === "edit-distance"
+      && Number(fuzzyMatch.editDistance) === 1
+    );
+    const strongFuzzy = Boolean(
+      fuzzyMatch.method === "ocr-glyph-normalized"
+      || fuzzyMatch.method === "edit-distance" && Number(fuzzyMatch.editDistance) <= 1
+      || fuzzyMatch.method === "trigram" && Number(fuzzyMatch.similarity || 0) >= SECTION_QUERY_OCR_SHORT_TRIGRAM_MIN_SIMILARITY
+    );
+    const credibleSingleFuzzy = Boolean(
+      singleToken
+      && !evidence.distinctMatches
+      && !evidence.expansionDistinctMatches
+      && evidence.ocrFuzzyDistinctMatches === 1
+      && confidence >= 72
+      && coherentPassage
+      && !repeated
+      && (term.length >= SECTION_QUERY_OCR_MIN_FUZZY_TERM_LENGTH || shortConservativeFuzzy)
+      && strongFuzzy
+    );
+    const visibleSingleFuzzy = Boolean(
+      singleToken
+      && !evidence.distinctMatches
+      && !evidence.expansionDistinctMatches
+      && evidence.ocrFuzzyDistinctMatches === 1
+      && !(evidence.surfaceAdjustment && evidence.surfaceAdjustment.ocrConfidenceAdjustment)
+      && coherentPassage
+      && !repeated
+      && term.length >= SECTION_QUERY_OCR_MIN_FUZZY_TERM_LENGTH
+    );
+    let rejectionRule = "";
+    if (furniture) rejectionRule = "ocr-furniture";
+    else if (repeated) rejectionRule = "ocr-repeated-single-term";
+    else if (confidence && confidence < 55 && evidence.ocrFuzzyDistinctMatches && !evidence.distinctMatches) rejectionRule = "low-confidence-ocr-fuzzy";
+    else if (singleToken && evidence.ocrFuzzyDistinctMatches === 1 && !credibleSingleFuzzy && !evidence.distinctMatches) rejectionRule = "weak-ocr-fuzzy-not-credible";
+    return {
+      isOcr: true,
+      confidence,
+      directSingleEligible,
+      credibleSingleFuzzy,
+      visibleSingleFuzzy,
+      rejectionRule
+    };
+  }
+
+  function getOcrSectionQueryConfidence(entry) {
+    const section = entry && entry.section || {};
+    const passage = entry && entry.passage || null;
+    const meta = section.unitMeta || {};
+    const passageMeta = passage && passage.metadata || {};
+    return Number(passage && passage.ocrConfidence || passageMeta.ocrConfidence || meta.ocrConfidence || 0) || 0;
+  }
+
+  function isOcrQueryTermRepeatedAcrossRecords(term, details) {
+    const value = String(term || "");
+    if (!value) return false;
+    const count = Number(details && details.documentFrequency && details.documentFrequency.get(value) || 0);
+    const total = Number(details && details.sectionCount || 0);
+    return Boolean(total >= 4 && count >= Math.max(3, Math.ceil(total * 0.72)));
+  }
+
+  function getSectionQuerySurfaceAdjustment(entry, evidence, details) {
+    const section = entry.section || {};
+    const passage = entry.passage || null;
+    const meta = section.unitMeta || {};
+    const passageMeta = passage && passage.metadata || {};
+    const surface = passage && passage.surface || entry.surface || inferSectionQuerySurface(section);
+    const reasons = [];
+    let score = 0;
+    let maxScore = Number.NaN;
+    let ocrConfidenceAdjustment = 0;
+    const text = cleanText(passage
+      ? [passage.title || "", passage.text || ""].join(" ")
+      : [section.title || "", section.text || ""].join(" ")).toLowerCase();
+
+    if (surface === "pdf") {
+      const sectionType = String(passage
+        ? passageMeta.pdfSectionType || ""
+        : passageMeta.pdfSectionType || meta.pdfSectionType || section.metrics && section.metrics.pdfSectionType || "").toLowerCase();
+      const sourceType = String(passage && passage.sourceType || passageMeta.sourceType || meta.kind || "").toLowerCase();
+      const coherent = evidence.phraseInBody || evidence.phraseInHeading || evidence.semanticMatches >= 2;
+      if (coherent && /paragraph|heading|line|ocr|pdfjs|selectable/.test(`${passage && passage.passageType || ""} ${sourceType}`)) {
+        score += 5;
+        reasons.push("pdf-coherent-passage");
+      }
+      if (/heading|title/.test(String(passage && passage.passageType || "")) && evidence.headingMatches) {
+        score += 4;
+        reasons.push("pdf-heading");
+      }
+      if (/works_cited|references|appendix|toc|boilerplate|footer|header/.test(sectionType) || isLikelyQueryFurniture(text)) {
+        score -= 34;
+        maxScore = Math.min(Number.isFinite(maxScore) ? maxScore : SECTION_QUERY_WEAK_SCORE - 1, SECTION_QUERY_WEAK_SCORE - 1);
+        reasons.push("pdf-furniture-penalty");
+      }
+      const confidence = Number(passage && passage.ocrConfidence || passageMeta.ocrConfidence || meta.ocrConfidence || 0) || 0;
+      if (/ocr/.test(sourceType) || meta.ocr || meta.kind === "pdf-ocr") {
+        if (confidence && confidence < 55) {
+          score -= SECTION_QUERY_OCR_VERY_LOW_CONFIDENCE_PENALTY;
+          ocrConfidenceAdjustment = SECTION_QUERY_OCR_VERY_LOW_CONFIDENCE_PENALTY;
+          reasons.push("low-ocr-confidence");
+        } else if (confidence && confidence < 72) {
+          score -= SECTION_QUERY_OCR_LOW_CONFIDENCE_PENALTY;
+          ocrConfidenceAdjustment = SECTION_QUERY_OCR_LOW_CONFIDENCE_PENALTY;
+          reasons.push("medium-ocr-confidence");
+        }
+      }
+      if (/\b(doi|issn|isbn|copyright|all rights reserved|journal homepage|downloaded from|page\s+\d+\s+of\s+\d+)\b/i.test(text)) {
+        score -= 16;
+        maxScore = Math.min(Number.isFinite(maxScore) ? maxScore : SECTION_QUERY_WEAK_SCORE - 1, SECTION_QUERY_WEAK_SCORE - 1);
+        reasons.push("pdf-recurring-furniture");
+      }
+    }
+
+    if (surface === "chat") {
+      const role = String(passageMeta.role || meta.role || "").toLowerCase();
+      const passageType = String(passage && passage.passageType || passageMeta.passageType || "").toLowerCase();
+      if (role === "assistant") {
+        score += 5;
+        reasons.push("assistant-answer");
+      }
+      if (role === "user") {
+        score -= 24;
+        reasons.push("user-prompt-penalty");
+      }
+      if (meta.hasFinalAnswer || meta.hasRevision || meta.isCompleteAssistantAnswer || meta.correctedAnswer || meta.isLatestCompleteAssistant || passageMeta.finalAnswer) {
+        score += 8;
+        reasons.push("final-or-corrected-answer");
+      }
+      if (meta.isSuperseded || meta.hasFailedAnswer || meta.loadingOrFailedAnswer || meta.isLoading || passageMeta.superseded) {
+        score -= 32;
+        reasons.push("superseded-or-failed-answer");
+      }
+      if (meta.isShortConfirmation || meta.citationOnly || /\b(thanks|sure|ok|okay)\b/i.test(text) && countWords(text) < 14) {
+        score -= 12;
+        reasons.push("short-chat-penalty");
+      }
+      const codeQuery = (details.queryTokens || []).some((term) => /\b(code|function|class|script|json|css|html|api|error)\b/i.test(term));
+      if (codeQuery && /code|pre/.test(passageType)) {
+        score += 9;
+        reasons.push("code-passage-match");
+      }
+      if (evidence.semanticMatches >= 2 && /paragraph|list|code|table/.test(passageType)) {
+        score += 4;
+        reasons.push("same-passage-multi-term");
+      }
+    }
+
+    return {
+      score: Math.max(-42, Math.min(18, score)),
+      maxScore,
+      ocrConfidenceAdjustment,
+      reasons
+    };
+  }
+
+  function isLikelyQueryFurniture(text) {
+    const value = cleanText(text).toLowerCase();
+    if (!value) return false;
+    if (/^(copyright|all rights reserved|references|bibliography|works cited)\b/.test(value)) return true;
+    if (/^page\s+\d+\s*(?:of\s+\d+)?$/i.test(value)) return true;
+    const words = value.split(/\s+/).filter(Boolean);
+    if (words.length <= 10 && /\b(page|doi|issn|copyright|downloaded|journal|homepage|confidential)\b/.test(value)) return true;
+    return false;
+  }
+
+  function getSectionQueryRoleBoost(section, pageProfile, queryTokens) {
+    const role = getSectionNavigationRole(section, pageProfile);
+    const label = cleanText([
+      role,
+      section.label || "",
+      section.metrics && section.metrics.sectionKindLabel || "",
+      section.intelligence && section.intelligence.roleLabel || ""
+    ].join(" ")).toLowerCase();
+    if (!label) return 0;
+    let hits = 0;
+    queryTokens.forEach((term) => {
+      if (label.includes(term)) hits += 1;
+    });
+    return Math.min(8, hits * 4);
+  }
+
+  function scoreBestSectionQueryExpansionTerm(entry, details, terms, factor) {
+    if (!Array.isArray(terms) || !terms.length) return null;
+    let best = null;
+    terms.forEach((term) => {
+      const weight = entry.termWeights.get(term) || 0;
+      if (!weight) return;
+      const df = details.documentFrequency.get(term) || 0;
+      const idf = getDocumentSalienceIdf(details.sectionCount, df);
+      const titleHit = entry.titleTerms.has(term);
+      const bm25 = getDocumentSalienceBm25(weight, entry.length, details.avgLength);
+      const raw = bm25 * Math.max(0.4, idf) * (titleHit ? 1.25 : 1) * factor;
+      if (!best || raw > best.raw) {
+        best = {
+          term,
+          raw,
+          titleHit
+        };
+      }
+    });
+    return best;
+  }
+
+  function isOcrSectionQueryEntry(entry) {
+    const section = entry && entry.section || {};
+    const passage = entry && entry.passage || null;
+    const meta = section.unitMeta || {};
+    const passageMeta = passage && passage.metadata || {};
+    const source = String(passage && passage.sourceType || passageMeta.sourceType || meta.kind || meta.source || "").toLowerCase();
+    return Boolean(passage && /ocr/.test(source) || meta.ocr || meta.kind === "pdf-ocr");
+  }
+
+  function scoreOcrSectionQueryFuzzyEvidence(entry, details, state = {}) {
+    if (!isOcrSectionQueryEntry(entry)) return null;
+    const queryTokens = details.queryTokens || [];
+    const matched = state.matchedOriginalTokens || new Set();
+    const expanded = state.expansionOriginalTokens || new Set();
+    const candidateTerms = Array.from(entry.termWeights.keys())
+      .filter((term) => term && term.length >= SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH)
+      .slice(0, 240);
+    if (!candidateTerms.length) return null;
+    const originalTokens = new Set();
+    const terms = [];
+    const matches = [];
+    let rawScore = 0;
+    queryTokens.forEach((queryTerm) => {
+      if (!queryTerm || queryTerm.length < SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH) return;
+      if (matched.has(queryTerm) || expanded.has(queryTerm)) return;
+      let best = null;
+      candidateTerms.forEach((candidate) => {
+        if (!candidate || candidate === queryTerm) return;
+        const match = getOcrFuzzyTermMatch(queryTerm, candidate);
+        if (!match.matched) return;
+        const weight = entry.termWeights.get(candidate) || 0;
+        const df = details.documentFrequency.get(candidate) || 0;
+        const idf = getDocumentSalienceIdf(details.sectionCount, df);
+        const bm25 = getDocumentSalienceBm25(weight, entry.length, details.avgLength);
+        const titleHit = entry.titleTerms.has(candidate);
+        const score = bm25 * Math.max(0.4, idf) * match.strength * (titleHit ? 1.1 : 1) * 6;
+        if (!best || score > best.score) {
+          best = { term: candidate, score, titleHit, match };
+        }
+      });
+      if (!best) return;
+      originalTokens.add(queryTerm);
+      terms.push(best.term);
+      matches.push({
+        queryTerm,
+        term: best.term,
+        method: best.match && best.match.method || "",
+        editDistance: Number(best.match && best.match.editDistance || 0) || 0,
+        similarity: Number(best.match && best.match.similarity || 0) || 0,
+        score: roundMetric(best.score)
+      });
+      rawScore += best.score;
+    });
+    const comparableBody = normalizeOcrFuzzyComparable(
+      entry.passage && (entry.passage.rawText || entry.passage.normalizedText || entry.passage.text)
+        || state.bodyText
+        || entry.bodyText
+        || ""
+    );
+    const comparableQuery = normalizeOcrFuzzyComparable(details.query || "");
+    const phraseAcrossLines = Boolean(comparableQuery.length >= 8 && comparableBody.includes(comparableQuery));
+    return {
+      originalTokens,
+      terms: uniqueStrings(terms).slice(0, SECTION_QUERY_OCR_FUZZY_TERM_CAP),
+      matches: matches.slice(0, SECTION_QUERY_OCR_FUZZY_TERM_CAP),
+      rawScore: Math.min(SECTION_QUERY_OCR_FUZZY_SCORE_CAP, rawScore),
+      phraseAcrossLines
+    };
+  }
+
+  function getOcrFuzzyTermMatch(queryTerm, candidateTerm) {
+    const query = normalizeOcrFuzzyTerm(queryTerm);
+    const candidate = normalizeOcrFuzzyTerm(candidateTerm);
+    if (!query || !candidate) return { matched: false, strength: 0 };
+    if (query === candidate) {
+      return String(queryTerm || "").toLowerCase() === String(candidateTerm || "").toLowerCase()
+        ? { matched: false, strength: 0 }
+        : { matched: true, strength: 0.66, method: "ocr-glyph-normalized", editDistance: 0 };
+    }
+    if (Math.abs(query.length - candidate.length) > 2) return { matched: false, strength: 0 };
+    const limit = query.length >= 10 || candidate.length >= 10 ? SECTION_QUERY_OCR_LONG_TERM_EDIT_DISTANCE : 1;
+    const editDistance = boundedEditDistance(query, candidate, limit);
+    if (editDistance <= limit) {
+      if ((query.length === SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH || candidate.length === SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH) && editDistance !== 1) {
+        return { matched: false, strength: 0 };
+      }
+      return { matched: true, strength: Math.max(0.42, 0.74 - editDistance * 0.14), method: "edit-distance", editDistance };
+    }
+    if (query.length <= SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH || candidate.length <= SECTION_QUERY_OCR_SHORT_DIRECT_TERM_LENGTH) {
+      return { matched: false, strength: 0 };
+    }
+    const similarity = getTrigramSimilarity(query, candidate);
+    if (similarity >= SECTION_QUERY_OCR_TRIGRAM_MIN_SIMILARITY) {
+      return { matched: true, strength: Math.max(0.36, similarity * 0.58), method: "trigram", similarity };
+    }
+    return { matched: false, strength: 0 };
+  }
+
+  function normalizeOcrFuzzyComparable(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/-\s+/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/[^a-z0-9\s]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function normalizeOcrFuzzyTerm(term) {
+    return String(term || "")
+      .toLowerCase()
+      .replace(/0/g, "o")
+      .replace(/[i1]/g, "l")
+      .replace(/rn/g, "m")
+      .replace(/[^a-z0-9]+/g, "");
+  }
+
+  function boundedEditDistance(left, right, maxDistance) {
+    const a = String(left || "");
+    const b = String(right || "");
+    const limit = Math.max(0, Number(maxDistance) || 0);
+    if (Math.abs(a.length - b.length) > limit) return limit + 1;
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= a.length; i += 1) {
+      const current = [i];
+      let rowMin = current[0];
+      for (let j = 1; j <= b.length; j += 1) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        const value = Math.min(
+          previous[j] + 1,
+          current[j - 1] + 1,
+          previous[j - 1] + cost
+        );
+        current[j] = value;
+        if (value < rowMin) rowMin = value;
+      }
+      if (rowMin > limit) return limit + 1;
+      previous = current;
+    }
+    return previous[b.length];
+  }
+
+  function getTrigramSimilarity(left, right) {
+    const a = getCharacterTrigrams(left);
+    const b = getCharacterTrigrams(right);
+    if (!a.size || !b.size) return 0;
+    let overlap = 0;
+    a.forEach((gram) => {
+      if (b.has(gram)) overlap += 1;
+    });
+    return overlap / Math.max(a.size, b.size);
+  }
+
+  function getCharacterTrigrams(term) {
+    const value = `  ${String(term || "")}  `;
+    const grams = new Set();
+    for (let index = 0; index <= value.length - 3; index += 1) {
+      grams.add(value.slice(index, index + 3));
+    }
+    return grams;
+  }
+
+  function getSectionQueryStatus(score, details) {
+    const semanticMatches = Number(details.distinctMatches || 0) + Number(details.expansionDistinctMatches || 0) + Number(details.ocrFuzzyDistinctMatches || 0);
+    const expansionOnly = !details.distinctMatches && details.expansionDistinctMatches > 0;
+    const ocrOnlyFuzzy = Boolean(details.ocrOnlyFuzzy);
+    const strongEvidence = details.phraseInHeading || details.headingMatches >= 1 || details.distinctMatches >= 2;
+    const possibleEvidence = details.phraseInBody
+      || details.distinctMatches >= 2
+      || details.headingMatches >= 1
+      || details.ocrDirectSingleEligible && details.distinctMatches >= 1
+      || (details.distinctMatches >= 1 && semanticMatches >= 2)
+      || (details.distinctMatches >= 1 && details.expansionHeadingMatches >= 1)
+      || (details.ocrFuzzyDistinctMatches >= 2 && !details.ocrConfidenceAdjustment);
+    if (details.ocrRejectedByPolicy === "low-confidence-ocr-fuzzy") return "none";
+    if (details.ocrRejectedByPolicy === "ocr-furniture" && score < SECTION_QUERY_POSSIBLE_SCORE) return "none";
+    if (expansionOnly && score >= SECTION_QUERY_WEAK_SCORE) return "weak";
+    if (ocrOnlyFuzzy && !details.ocrPhraseAcrossLines && Number(details.ocrFuzzyDistinctMatches || 0) < 2) return score >= SECTION_QUERY_WEAK_SCORE ? "weak" : "none";
+    if (ocrOnlyFuzzy && Number(details.ocrConfidenceAdjustment || 0) >= SECTION_QUERY_OCR_VERY_LOW_CONFIDENCE_PENALTY) return "none";
+    if (score >= SECTION_QUERY_STRONG_SCORE && strongEvidence) return "strong";
+    if (score >= SECTION_QUERY_POSSIBLE_SCORE && possibleEvidence) return "possible";
+    if (score >= SECTION_QUERY_WEAK_SCORE) return "weak";
+    return "none";
+  }
+
+  function applySectionQueryMargin(scored) {
+    if (!Array.isArray(scored) || !scored.length) return;
+    scored.forEach((item, index) => {
+      const next = scored[index + 1] || null;
+      item.margin = next ? roundMetric(item.score - next.score) : null;
+    });
+    const selected = scored[0];
+    const runnerUp = scored[1] || null;
+    if (!runnerUp || runnerUp.score < SECTION_QUERY_WEAK_SCORE) return;
+    const margin = selected.score - runnerUp.score;
+    if ((selected.status === "strong" || selected.status === "possible") && margin < SECTION_QUERY_MIN_AUTO_MARGIN) {
+      selected.status = "weak";
+      selected.marginDowngraded = true;
+      selected.alternativeScores = [selected, runnerUp].filter(Boolean);
+    }
+  }
+
+  function buildSectionQueryResult(scored, queryTokens, context) {
+    const section = scored.section;
+    const passage = scored.passage || null;
+    const status = scored.status;
+    const confidenceLabel = status === "strong" ? "Strong" : status === "possible" ? "Possible" : "Weak";
+    return {
+      sectionId: section.id,
+      passageId: passage && passage.id || "",
+      surface: passage && passage.surface || scored.surface || inferSectionQuerySurface(section),
+      pageNumber: passage && passage.pageNumber || section.pageNumber || section.unitMeta && section.unitMeta.pageNumber || 0,
+      navigation: normalizeSectionQueryNavigationMetadata(passage && passage.navigation),
+      alternatives: Array.isArray(scored.alternativeScores)
+        ? scored.alternativeScores.slice(0, 2).map((item) => buildSectionQueryAlternative(item, queryTokens, context))
+        : [],
+      title: passage && (passage.title || passage.label) || section.title || "Matched section",
+      label: section.label || "",
+      roleLabel: passage && passage.roleLabel || section.intelligence && section.intelligence.roleLabel || section.metrics && section.metrics.sectionKindLabel || "",
+      snippet: buildSectionQuerySnippet(section, queryTokens, passage),
+      confidenceLabel,
+      score: scored.score,
+      status,
+      ocrExactMatches: scored.ocrExactMatches || 0,
+      ocrFuzzyMatches: scored.ocrFuzzyMatches || 0,
+      ocrFuzzyTerms: scored.ocrFuzzyTerms || [],
+      ocrPhraseAcrossLines: Boolean(scored.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: scored.ocrConfidenceAdjustment || 0,
+      reason: buildSectionQueryReason(scored),
+      canNavigate: isNavigableByContext(section, context),
+      weakRequiresConfirm: status === "weak"
+    };
+  }
+
+  function buildSectionQueryAlternative(scored, queryTokens, context) {
+    const section = scored.section;
+    const passage = scored.passage || null;
+    return {
+      sectionId: section && section.id || "",
+      passageId: passage && passage.id || "",
+      surface: passage && passage.surface || scored.surface || inferSectionQuerySurface(section),
+      pageNumber: passage && passage.pageNumber || section && (section.pageNumber || section.unitMeta && section.unitMeta.pageNumber) || 0,
+      navigation: normalizeSectionQueryNavigationMetadata(passage && passage.navigation),
+      title: passage && (passage.title || passage.label) || section && section.title || "Matched section",
+      label: section && section.label || "",
+      roleLabel: passage && passage.roleLabel || section && section.intelligence && section.intelligence.roleLabel || section && section.metrics && section.metrics.sectionKindLabel || "",
+      snippet: buildSectionQuerySnippet(section, queryTokens, passage),
+      confidenceLabel: "Weak",
+      score: scored.score,
+      status: "weak",
+      ocrExactMatches: scored.ocrExactMatches || 0,
+      ocrFuzzyMatches: scored.ocrFuzzyMatches || 0,
+      ocrFuzzyTerms: scored.ocrFuzzyTerms || [],
+      ocrPhraseAcrossLines: Boolean(scored.ocrPhraseAcrossLines),
+      ocrConfidenceAdjustment: scored.ocrConfidenceAdjustment || 0,
+      reason: buildSectionQueryReason(scored),
+      canNavigate: isNavigableByContext(section, context),
+      weakRequiresConfirm: true
+    };
+  }
+
+  function normalizeSectionQueryNavigationMetadata(navigation) {
+    if (!navigation || typeof navigation !== "object") return null;
+    return {
+      strategy: String(navigation.strategy || "").slice(0, 60),
+      target: String(navigation.target || "").slice(0, 160),
+      exact: Boolean(navigation.exact)
+    };
+  }
+
+  function buildSectionQueryReason(scored) {
+    const count = scored.matchedTerms.length;
+    if (scored.marginDowngraded) return "Several mapped sections are close; confirm before jumping.";
+    if (scored.phraseMatch && scored.headingMatches) return "Matches the phrase in the heading.";
+    if (scored.phraseMatch) return "Matches the phrase in this section.";
+    if (scored.headingMatches && count) return `Matches ${count} query ${count === 1 ? "term" : "terms"} in the heading and body.`;
+    if (scored.wordFormMatchCount) return "Matches a word form in this section.";
+    if (scored.synonymMatchCount) return "Matches a related term in this section.";
+    if (scored.typoMatchCount) return "Matches a close spelling in this section.";
+    if (scored.ocrFuzzyMatches) return "Matches OCR text with a close recognition match.";
+    if (count) return `Matches ${count} query ${count === 1 ? "term" : "terms"} in the section body.`;
+    return "Local section text is the closest match.";
+  }
+
+  function buildSectionQuerySnippet(section, queryTokens, passage = null) {
+    const title = passage && passage.title || section && section.title || "";
+    const text = cleanText(String(passage && passage.text || section && section.text || "").replace(title || "", " "));
+    if (!text) return cleanText(title || "").slice(0, SECTION_QUERY_SNIPPET_CHARS);
+    const lower = text.toLowerCase();
+    let index = -1;
+    queryTokens.some((term) => {
+      index = lower.indexOf(term);
+      return index >= 0;
+    });
+    if (index < 0) index = 0;
+    const start = Math.max(0, index - 58);
+    const end = Math.min(text.length, start + SECTION_QUERY_SNIPPET_CHARS);
+    const snippet = `${start > 0 ? "... " : ""}${text.slice(start, end).trim()}${end < text.length ? " ..." : ""}`;
+    return snippet;
   }
 
   function pickSkipTarget(sections, importantSections) {
@@ -3605,7 +5865,7 @@ function getPageEvidence(details) {
         hasNumbers: /\b\d+([.,]\d+)?%?\b/.test(text),
         hasReadableParagraphs: true
       };
-      const metrics = scoreTextSignals({
+      const metrics = Object.assign({}, blockStats, scoreTextSignals({
         title: section.title || "",
         text,
         index,
@@ -3614,7 +5874,8 @@ function getPageEvidence(details) {
         blockStats,
         classTrail: section.classTrail || "",
         isElementLowValue: Boolean(section.lowValue)
-      });
+      }));
+      metrics.adapterScore = section.adapterScore || 0;
       return {
         id: `fixture-${index}`,
         title: section.title || `Section ${index + 1}`,
@@ -3696,28 +5957,62 @@ function getPageEvidence(details) {
         url: fixture.url || ""
       })
     );
+    const salienceResult = applyDocumentSalienceBoosts(
+      ranked,
+      pageProfile,
+      buildDocumentSalienceContext(ranked, pageProfile, {
+        title: fixture.title || fixture.label || "",
+        primaryTitle: fixture.primaryTitle || "",
+        url: fixture.url || ""
+      })
+    );
+    ranked = salienceResult.sections;
     ranked = rankSections(ranked, pageProfile);
 
     const importantSections = pickImportantSections(ranked, pageProfile);
     const recommendation = buildRecommendation(ranked, importantSections, pageProfile);
     attachSectionIntelligence(ranked, pageProfile, recommendation);
+    const targets = pickNavigationTargets(ranked, importantSections, recommendation.bestSectionId, pageProfile);
+    recommendation.nextImportantId = targets.nextImportantId;
     return {
       pageProfile,
       sections: ranked,
       importantSections,
-      recommendation
+      nextImportantId: targets.nextImportantId,
+      skipTargetId: targets.skipTargetId,
+      recommendation,
+      diagnostics: {
+        documentSalience: salienceResult.diagnostics,
+        nextSelection: selectNextSection({
+          sections: ranked,
+          importantSections,
+          bestSectionId: recommendation.bestSectionId,
+          pageProfile
+        }, {
+          currentTop: 0,
+          excludeSectionIds: recommendation.bestSectionId ? [recommendation.bestSectionId] : [],
+          source: "fixture"
+        }).diagnostics
+      }
     };
   }
 
   window.PagePilotEngine = {
     createEngine,
     analyzeTextFixture,
+    navigation: {
+      selectNextSection,
+      searchSections
+    },
     constants: {
       MIN_USEFUL_WORDS,
       READING_SPEED_WPM,
       STRONG_TARGET_CONFIDENCE,
       HIGH_CONFIDENCE,
-      LOW_CONFIDENCE
+      LOW_CONFIDENCE,
+      SECTION_QUERY_STRONG_SCORE,
+      SECTION_QUERY_POSSIBLE_SCORE,
+      SECTION_QUERY_WEAK_SCORE
     }
   };
 })();

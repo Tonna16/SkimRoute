@@ -72,6 +72,12 @@ function assertCompleteIntelligence(section, expectation, requireSignals) {
   assert(Number.isFinite(Number(intelligence.scoreDetails.importanceScore)), `${expectation.name}: ${section.title} missing scoreDetails.importanceScore`);
   assert(Number.isFinite(Number(intelligence.scoreDetails.fluffScore)), `${expectation.name}: ${section.title} missing scoreDetails.fluffScore`);
   assert(Array.isArray(intelligence.scoreDetails.signals), `${expectation.name}: ${section.title} missing scoreDetails.signals`);
+  assert(section.metrics && Number.isFinite(Number(section.metrics.documentSalienceScore)), `${expectation.name}: ${section.title} missing documentSalienceScore`);
+  assert(Number.isFinite(Number(section.metrics.documentSalienceRawScore)), `${expectation.name}: ${section.title} missing documentSalienceRawScore`);
+  assert(Number.isFinite(Number(section.metrics.documentSalienceContribution)), `${expectation.name}: ${section.title} missing documentSalienceContribution`);
+  assert(Array.isArray(section.metrics.documentSalienceTerms), `${expectation.name}: ${section.title} missing documentSalienceTerms`);
+  assert(Array.isArray(section.metrics.titleOverlapTerms), `${expectation.name}: ${section.title} missing titleOverlapTerms`);
+  assert(typeof section.metrics.salienceReason === "string", `${expectation.name}: ${section.title} missing salienceReason`);
   if (requireSignals) {
     assert(intelligence.scoreDetails.signals.length > 0, `${expectation.name}: ${section.title} expected scoreDetails signals`);
     intelligence.scoreDetails.signals.forEach((signal) => {
@@ -114,9 +120,14 @@ function assertValidTargets(result, expectation) {
 
   assert(!result.pageProfile.quietMode, `${expectation.name}: expected active map`);
   assert(bestSection, `${expectation.name}: expected a valid Jump target`);
+  if (expectation.allowWeakTarget) {
+    assert(result.sections.some((section) => section.id === result.recommendation.bestSectionId), `${expectation.name}: bestSectionId should resolve`);
+    return;
+  }
   assert(result.recommendation.hasStrongTarget, `${expectation.name}: expected a strong Jump target`);
   assert(result.sections.some((section) => section.id === result.recommendation.bestSectionId), `${expectation.name}: bestSectionId should resolve`);
   const nextTarget = result.importantSections.find((section) => section.id !== result.recommendation.bestSectionId);
+  if (!nextTarget && expectation.allowSingleImportant) return;
   assert(nextTarget, `${expectation.name}: expected a valid Next target; best=${result.recommendation.bestSectionId}; important=${result.importantSections.map((section) => `${section.id}:${section.title}`).join(", ")}`);
 }
 
@@ -142,6 +153,16 @@ function assertExpectedResult(result, expectation) {
   expectation.name = expectation.name || "fixture";
   assert(result.pageProfile.type === expectation.pageType, `${expectation.name}: expected page type ${expectation.pageType}, got ${result.pageProfile.type}`);
   assert(result.pageProfile.quietMode === Boolean(expectation.quiet), `${expectation.name}: quiet mode mismatch`);
+  assert(result.recommendation && result.recommendation.confidenceFamilies, `${expectation.name}: missing confidenceFamilies`);
+  ["structural", "role", "pageIntent", "documentSpecific", "adapter", "negative"].forEach((family) => {
+    const value = result.recommendation.confidenceFamilies[family];
+    assert(value && Number.isFinite(Number(value.strength)), `${expectation.name}: missing confidence family ${family}`);
+    assert(Array.isArray(value.reasons), `${expectation.name}: confidence family ${family} missing reasons`);
+  });
+  assert(Number.isFinite(Number(result.recommendation.positiveFamilyCount)), `${expectation.name}: missing positiveFamilyCount`);
+  assert(Array.isArray(result.recommendation.ambiguityPenalties), `${expectation.name}: missing ambiguityPenalties`);
+  assert(typeof result.recommendation.confidenceCapReason === "string", `${expectation.name}: missing confidenceCapReason`);
+  assert(Number.isFinite(Number(result.recommendation.calibratedConfidence)), `${expectation.name}: missing calibratedConfidence`);
   assertValidTargets(result, expectation);
   assertIntelligenceMetadata(result, expectation);
 
@@ -178,6 +199,12 @@ function assertExpectedResult(result, expectation) {
     if (expectation.expectThemeIntent) {
       assertThemeIntentBoost(bestSection, expectation);
     }
+    if (expectation.expectDocumentSalience) {
+      assertDocumentSalienceBoost(bestSection, expectation);
+    }
+    if (expectation.confidence) {
+      assertConfidenceExpectation(result, expectation);
+    }
   } else if (expectation.expectNoThemeIntent) {
     result.sections.forEach((section) => {
       const boost = section.metrics && section.metrics.themeIntent && section.metrics.themeIntent.boost || 0;
@@ -186,6 +213,70 @@ function assertExpectedResult(result, expectation) {
   }
 
   assertJunkDownranked(result, expectation);
+  assertSectionSalience(result, expectation);
+}
+
+function assertDocumentSalienceBoost(section, expectation) {
+  const metrics = section && section.metrics || {};
+  assert(metrics.documentSalienceContribution > 0, `${expectation.name}: expected document salience contribution on ${section && section.title}`);
+  assert(metrics.documentSalienceTerms.length > 0 || metrics.titleOverlapTerms.length > 0, `${expectation.name}: expected salience terms`);
+  const signals = section.intelligence && section.intelligence.scoreDetails && section.intelligence.scoreDetails.signals || [];
+  assert(signals.some((signal) => /^documentSalience\./.test(signal.signal)), `${expectation.name}: expected document salience scoreDetails signal`);
+  const why = section.intelligence && section.intelligence.whyReasons && section.intelligence.whyReasons.join(" ") || "";
+  assert(/distinctive|document|topic|heading/i.test(why), `${expectation.name}: expected salience why reason, got ${why}`);
+  if (expectation.salienceTerm) {
+    const terms = metrics.documentSalienceTerms.concat(metrics.titleOverlapTerms);
+    assert(terms.some((term) => expectation.salienceTerm.test(term)), `${expectation.name}: expected salience term ${expectation.salienceTerm}, got ${terms.join(", ")}`);
+  }
+}
+
+function assertSectionSalience(result, expectation) {
+  if (!expectation.sectionSalience) return;
+  expectation.sectionSalience.forEach((rule) => {
+    const section = sectionByTitle(result, rule.title);
+    assert(section, `${expectation.name}: expected section ${rule.title}`);
+    const metrics = section.metrics || {};
+    const contribution = Number(metrics.documentSalienceContribution) || 0;
+    if (rule.min != null) {
+      assert(contribution >= rule.min, `${expectation.name}: expected salience >= ${rule.min} on ${section.title}, got ${contribution}`);
+    }
+    if (rule.max != null) {
+      assert(contribution <= rule.max, `${expectation.name}: expected salience <= ${rule.max} on ${section.title}, got ${contribution}`);
+    }
+    if (rule.term) {
+      const terms = (metrics.documentSalienceTerms || []).concat(metrics.titleOverlapTerms || []);
+      assert(terms.some((term) => rule.term.test(term)), `${expectation.name}: expected salience term ${rule.term} on ${section.title}, got ${terms.join(", ")}`);
+    }
+  });
+}
+
+function assertConfidenceExpectation(result, expectation) {
+  const confidence = expectation.confidence || {};
+  const recommendation = result.recommendation;
+  if (confidence.max != null) {
+    assert(recommendation.confidence <= confidence.max, `${expectation.name}: expected confidence <= ${confidence.max}, got ${recommendation.confidence}`);
+  }
+  if (confidence.min != null) {
+    assert(recommendation.confidence >= confidence.min, `${expectation.name}: expected confidence >= ${confidence.min}, got ${recommendation.confidence}`);
+  }
+  if (confidence.tier) {
+    assert(recommendation.confidenceTier === confidence.tier, `${expectation.name}: expected tier ${confidence.tier}, got ${recommendation.confidenceTier}`);
+  }
+  if (confidence.positiveFamilies != null) {
+    assert(recommendation.positiveFamilyCount === confidence.positiveFamilies, `${expectation.name}: expected ${confidence.positiveFamilies} positive families, got ${recommendation.positiveFamilyCount}`);
+  }
+  if (confidence.minPositiveFamilies != null) {
+    assert(recommendation.positiveFamilyCount >= confidence.minPositiveFamilies, `${expectation.name}: expected at least ${confidence.minPositiveFamilies} positive families, got ${recommendation.positiveFamilyCount}`);
+  }
+  if (confidence.familyMin) {
+    Object.entries(confidence.familyMin).forEach(([family, min]) => {
+      const strength = recommendation.confidenceFamilies[family] && recommendation.confidenceFamilies[family].strength || 0;
+      assert(strength >= min, `${expectation.name}: expected ${family} family >= ${min}, got ${strength}`);
+    });
+  }
+  if (confidence.capReason) {
+    assert(confidence.capReason.test(recommendation.confidenceCapReason || ""), `${expectation.name}: unexpected confidence cap reason ${recommendation.confidenceCapReason}`);
+  }
 }
 
 function runFixture(name, fixture, expectation) {
@@ -252,7 +343,7 @@ const cases = [
       quiet: false,
       bestTitle: /AI Overview/i,
       bestMeta: { path: ["unitMeta", "searchBlockType"], match: /ai_overview/ },
-      nextMeta: { path: ["unitMeta", "searchBlockType"], match: /sources/ },
+      nextMeta: { path: ["unitMeta", "searchBlockType"], match: /top_results/ },
       label: /AI Overview/i,
       why: /AI Overview|highest-value/i,
       junkTitle: /Related searches/i
@@ -538,7 +629,13 @@ const cases = [
       bestKind: /corrected_answer/,
       label: /corrected|final answer/i,
       why: /correction|latest user|corrected/i,
-      junkTitle: /Draft answer|Original question/i
+      junkTitle: /Draft answer|Original question/i,
+      confidence: {
+        tier: "high",
+        min: 90,
+        minPositiveFamilies: 4,
+        familyMin: { structural: 50, role: 90, pageIntent: 90, adapter: 90 }
+      }
     }
   ),
   runFixture(
@@ -1146,6 +1243,387 @@ const cases = [
     }
   ),
   runFixture(
+    "Generic summary loses to page-specific conclusion",
+    {
+      type: "article",
+      label: "Article",
+      title: "Boreal peatland methane flux after wildfire",
+      primaryTitle: "Boreal peatland methane flux after wildfire",
+      quietMode: false,
+      readingConfidence: 80,
+      words: 780,
+      pageEvidence: { articleEvidence: 6, quietEvidence: 1, paragraphs: 7 },
+      sections: [
+        {
+          title: "Overview",
+          text: "The introduction gives field context, monitoring schedule, wetland recovery measurements, sampling sites, seasonal limits, reasons for the field work across several seasons, and the equipment used for repeated field sampling.",
+          adapterScore: 18
+        },
+        {
+          title: "Summary",
+          text: "This short recap gives general context, broad reader guidance, project orientation, skimming notes, and a plain-language takeaway for anyone reviewing the article quickly.",
+          adapterScore: -44
+        },
+        {
+          title: "Main conclusion: methane flux persisted after wildfire",
+          text: "Conclusion: boreal peatland methane flux remained elevated after wildfire because thawed moss layers changed water flow and microbial oxidation. The measured flux pattern explains why peatland recovery requires monitoring wildfire severity and wetland hydrology over several seasons.",
+          adapterScore: 18
+        },
+        { title: "Related links", text: repeated("Related links newsletter popular posts author profile comments privacy settings recommended stories.", 10), adapterScore: -28, lowValue: true }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      bestTitle: /Main conclusion/i,
+      bestKind: /conclusion/,
+      label: /Conclusion/i,
+      why: /main topic|central subject|Conclusion/i,
+      junkTitle: /Related links/i,
+      expectDocumentSalience: true,
+      salienceTerm: /methane|flux|wildfire/,
+      sectionSalience: [
+        { title: /Summary/i, max: 0 },
+        { title: /Related links/i, max: 0 }
+      ]
+    }
+  ),
+  runFixture(
+    "Unfamiliar article topic favors distinctive central terms",
+    {
+      type: "article",
+      label: "Article",
+      title: "Velarium rope shading protects amphitheater acoustics",
+      primaryTitle: "Velarium rope shading protects amphitheater acoustics",
+      quietMode: false,
+      readingConfidence: 82,
+      words: 760,
+      pageEvidence: { articleEvidence: 6, quietEvidence: 1, paragraphs: 7 },
+      sections: [
+        {
+          title: "Background",
+          text: "The opening section gives historical context for the amphitheater, explains who used the seating tiers, describes why shade mattered for visitors during public events, and names the survey areas used for comparison.",
+          adapterScore: 48
+        },
+        {
+          title: "Central finding: velarium rope shading changed acoustics",
+          text: "The velarium rope grid and linen shading changed amphitheater acoustics by damping reflected noise near the upper arcade. Measurements show the rope anchoring pattern protected speech clarity during afternoon heat while preserving airflow through the seating bowl.",
+          adapterScore: 24
+        },
+        { title: "Newsletter", text: repeated("Subscribe for rare amphitheater souvenirs newsletter links offers and sponsor updates.", 12), adapterScore: -24, classTrail: "newsletter related" }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      bestTitle: /Central finding/i,
+      bestKind: /results|useful_section/,
+      label: /Results|Best place|useful/i,
+      why: /document|topic|distinctive|central subject/i,
+      junkTitle: /Newsletter/i,
+      expectDocumentSalience: true,
+      salienceTerm: /velarium|acoustics|rope/
+    }
+  ),
+  runFixture(
+    "Related links with rare terms stay down-ranked",
+    {
+      type: "article",
+      label: "Article",
+      title: "Mycelium composite insulation reduces thermal bridging",
+      primaryTitle: "Mycelium composite insulation reduces thermal bridging",
+      quietMode: false,
+      readingConfidence: 80,
+      words: 840,
+      pageEvidence: { articleEvidence: 6, quietEvidence: 2, paragraphs: 7 },
+      sections: [
+        {
+          title: "Main finding",
+          text: repeated("The main finding is that mycelium composite insulation reduced thermal bridging while preserving vapor permeability and compressive stability in the test wall.", 10),
+          adapterScore: 44
+        },
+        {
+          title: "Conclusion",
+          text: repeated("Conclusion: builders should use mycelium panels where thermal bridging appears around studs and fasteners, then verify moisture movement after installation.", 8),
+          adapterScore: 38
+        },
+        {
+          title: "Related links",
+          text: repeated("Related links include zeolite aerogel quasicrystal mycelium composite thermal bridging sponsored newsletter archive partner story.", 10),
+          adapterScore: -30,
+          lowValue: true,
+          classTrail: "related newsletter"
+        }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      bestTitle: /Conclusion|Main finding/i,
+      bestKind: /conclusion|results|installation/,
+      label: /Conclusion|Results|Installation|Best place/i,
+      why: /document|topic|Conclusion|main finding/i,
+      junkTitle: /Related links/i,
+      sectionSalience: [
+        { title: /Related links/i, max: 0 }
+      ]
+    }
+  ),
+  runFixture(
+    "Repeated navigation terms do not gain salience",
+    {
+      type: "article",
+      label: "Article",
+      title: "Reservoir sediment monitoring guide",
+      primaryTitle: "Reservoir sediment monitoring guide",
+      quietMode: false,
+      readingConfidence: 76,
+      words: 700,
+      pageEvidence: { articleEvidence: 5, quietEvidence: 2, paragraphs: 5 },
+      sections: [
+        { title: "Navigation", text: repeated("Guide guide guide monitoring monitoring reservoir reservoir menu previous next contents section related links.", 14), adapterScore: -22, classTrail: "nav menu related" },
+        {
+          title: "Monitoring procedure",
+          text: repeated("Procedure: sample reservoir sediment at fixed transects, record turbidity, compare seasonal deposition, and flag changed inflow patterns.", 9),
+          adapterScore: 42,
+          numberedItems: 4
+        },
+        {
+          title: "Field measurements",
+          text: "Field measurements show turbidity values, deposition depth, inflow temperature, shoreline markers, survey dates, and sediment core labels from the reservoir stations used during spring and late summer inspections.",
+          adapterScore: 12
+        }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      bestTitle: /Monitoring procedure/i,
+      bestKind: /troubleshooting|steps|instructions/,
+      label: /Troubleshooting|Steps|Instructions|Best place/i,
+      why: /procedure|Actionable|Strong useful signal/i,
+      junkTitle: /Navigation/i,
+      sectionSalience: [
+        { title: /Navigation/i, max: 0 }
+      ]
+    }
+  ),
+  runFixture(
+    "Technical identifiers are preserved in salience terms",
+    {
+      type: "docs",
+      label: "Docs",
+      title: "Configure SR-472 batchImportMode with vectorHash64",
+      primaryTitle: "Configure SR-472 batchImportMode with vectorHash64",
+      quietMode: false,
+      readingConfidence: 84,
+      words: 760,
+      pageEvidence: { articleEvidence: 3, quietEvidence: 2, paragraphs: 6 },
+      sections: [
+        {
+          title: "Design background",
+          text: "Design background surveys import service boundaries, replay safety goals, storage lifecycle, audit events, compatibility concerns, rollout constraints, staged import rehearsals, and rollback planning for the configuration area.",
+          adapterScore: 8
+        },
+        {
+          title: "Parameters for SR-472 batchImportMode",
+          text: "Set SR-472 batchImportMode to incremental, pass vectorHash64 for dedupe keys, and keep retryCount below four during replay. The response includes importId, skippedRows, replayWindowMs, and statusCode for audit logging.",
+          adapterScore: 50,
+          listItems: 4
+        },
+        {
+          title: "Operational notes",
+          text: "Operational notes describe how the service records audit events, preserves storage lifecycle details, confirms replay safety, and tracks duplicate records during the import window.",
+          adapterScore: 8
+        },
+        { title: "Release notes", text: repeated("Release notes changelog maintenance patch deprecation timeline.", 10), adapterScore: -16, lowValue: true }
+      ]
+    },
+    {
+      pageType: "docs",
+      quiet: false,
+      bestTitle: /Parameters for SR-472/i,
+      bestKind: /parameters/,
+      label: /Parameters/i,
+      why: /document|topic|documentation intent|parameters/i,
+      junkTitle: /Release notes/i,
+      sectionSalience: [
+        { title: /Parameters for SR-472/i, min: 1, term: /sr-472|batchimportmode|vectorhash64/ }
+      ],
+      confidence: {
+        tier: "high",
+        min: 78,
+        minPositiveFamilies: 4,
+        familyMin: { structural: 50, pageIntent: 90, documentSpecific: 60 }
+      }
+    }
+  ),
+  runFixture(
+    "Repeated role phrases alone do not reach high confidence",
+    {
+      type: "article",
+      label: "Article",
+      title: "Generic memo",
+      quietMode: false,
+      readingConfidence: 72,
+      words: 420,
+      pageEvidence: { articleEvidence: 3, quietEvidence: 2, paragraphs: 3 },
+      sections: [
+        { title: "Summary conclusion final answer", text: repeated("Summary conclusion final answer recommendation key takeaway results conclusion summary final answer.", 6), adapterScore: 0 },
+        {
+          title: "Background",
+          text: "Background material describes the team, timeline, stakeholders, constraints, review meetings, deployment window, and implementation notes without adding an independent conclusion or recommendation.",
+          adapterScore: 70
+        }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      allowSingleImportant: true,
+      bestTitle: /Summary conclusion/i,
+      bestKind: /results|summary|conclusion/,
+      label: /Results|Summary|Conclusion|Best place/i,
+      why: /Summary|result|confidence/i,
+      confidence: {
+        max: 76,
+        tier: "medium",
+        positiveFamilies: 2,
+        familyMin: { role: 70 }
+      }
+    }
+  ),
+  runFixture(
+    "Structural role and page intent can reach high confidence",
+    {
+      type: "article",
+      label: "Article",
+      title: "Clinic scheduling wait time study",
+      primaryTitle: "Clinic scheduling wait time study",
+      quietMode: false,
+      readingConfidence: 88,
+      words: 880,
+      pageEvidence: { articleEvidence: 7, quietEvidence: 1, paragraphs: 8 },
+      sections: [
+        { title: "Background", text: "Background explains the scheduling process, patient intake constraints, and previous operational limits before the pilot started.", adapterScore: 12 },
+        {
+          title: "Results and conclusion",
+          text: "Results show wait time fell by 18 percent after the scheduling change. The evidence compares morning visits, afternoon overflow, and staff interruption counts. Conclusion: the clinic should keep the new triage slot because patients completed visits faster and the operations team could handle urgent requests with fewer delays.",
+          adapterScore: 34
+        },
+        { title: "References", text: repeated("References bibliography citation appendix.", 12), adapterScore: -26, lowValue: true }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      allowSingleImportant: true,
+      bestTitle: /Results and conclusion/i,
+      bestKind: /results|conclusion/,
+      label: /Results|Conclusion/i,
+      why: /Results|Conclusion|article intent/i,
+      junkTitle: /References/i,
+      confidence: {
+        tier: "high",
+        min: 78,
+        minPositiveFamilies: 3,
+        familyMin: { structural: 50, role: 90, pageIntent: 90 }
+      }
+    }
+  ),
+  runFixture(
+    "Adapter structural and document-specific evidence can reach high confidence",
+    {
+      type: "article",
+      label: "Article",
+      quietMode: false,
+      readingConfidence: 90,
+      words: 920,
+      pageEvidence: { articleEvidence: 6, quietEvidence: 1, paragraphs: 8 },
+      sections: [
+        {
+          title: "Pressure vessel context",
+          text: "The plant has three pressure vessels, two condensate drains, a bypass header, an alarm rack, and a field crew that rotates between north and south rooms during each shift.",
+          adapterScore: 24
+        },
+        {
+          title: "Adapter-selected relief valve protocol",
+          text: "The adapter selected section explains the quenchline relief valve protocol, burstDisk audit, nitrogen sweep window, and valve-lockout verification. Operators use the quenchline checklist before opening the bypass, record every burstDisk reading, compare pressure alarms, and document supervisor acknowledgement after the maintenance window.",
+          adapterScore: 130,
+          listItems: 4,
+          unitMeta: { diagnosticReason: "Adapter metadata selected the protocol details" }
+        },
+        {
+          title: "Instrumentation context",
+          text: "The instrumentation panel stores sensor baselines, calibration dates, flow readings, alarm identifiers, and shift initials so operators can compare the room state during each inspection.",
+          adapterScore: 24
+        },
+        { title: "Related archive", text: repeated("Related archive sponsor links newsletter account author profile recommended story.", 10), adapterScore: -30, lowValue: true }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      bestTitle: /relief valve protocol/i,
+      bestKind: /steps|useful_section/,
+      label: /Steps|Best place|useful/i,
+      why: /Adapter metadata|document|distinctive/i,
+      junkTitle: /Related archive/i,
+      expectDocumentSalience: true,
+      salienceTerm: /protocol|valve|burstdisk|quenchline/,
+      confidence: {
+        tier: "high",
+        min: 80,
+        minPositiveFamilies: 3,
+        familyMin: { structural: 60, documentSpecific: 75, adapter: 70 }
+      }
+    }
+  ),
+  runFixture(
+    "Two close candidates reduce confidence",
+    {
+      type: "article",
+      label: "Article",
+      title: "Heat pump maintenance guide",
+      primaryTitle: "Heat pump maintenance guide",
+      quietMode: false,
+      readingConfidence: 82,
+      words: 780,
+      pageEvidence: { articleEvidence: 6, quietEvidence: 1, paragraphs: 6 },
+      sections: [
+        {
+          title: "Maintenance steps",
+          text: repeated("Steps: clean the filter, inspect the coil, check airflow, record temperature split, and schedule service if readings drift.", 9),
+          adapterScore: 36,
+          numberedItems: 5
+        },
+        {
+          title: "Maintenance checklist",
+          text: repeated("Checklist: clean filter, inspect coil, check airflow, record temperature split, and schedule service when readings drift.", 9),
+          adapterScore: 35,
+          numberedItems: 5
+        },
+        { title: "Background", text: repeated("Background explains why seasonal maintenance matters.", 10), adapterScore: 10 }
+      ]
+    },
+    {
+      pageType: "article",
+      quiet: false,
+      allowWeakTarget: true,
+      bestTitle: /Maintenance steps|Maintenance checklist/i,
+      bestKind: /instructions|steps/,
+      label: /Instructions|Steps/i,
+      expectDocumentSalience: true,
+      salienceTerm: /maintenance|steps/,
+      confidence: {
+        max: 58,
+        tier: "low",
+        minPositiveFamilies: 3,
+        familyMin: { negative: 30 }
+      }
+    }
+  ),
+  runFixture(
     "Selectable-text PDF abstract beats footer and references",
     {
       type: "pdf",
@@ -1260,6 +1738,43 @@ const cases = [
       label: /Form|notice/i,
       why: /Form or notice|Strong useful signal/i,
       junkTitle: /Scan fragments|Routing barcode/i
+    }
+  ),
+  runFixture(
+    "Low-quality OCR caps confidence",
+    {
+      type: "pdf",
+      label: "PDF",
+      title: "Scanned lease notice",
+      quietMode: false,
+      readingConfidence: 76,
+      words: 420,
+      pageEvidence: { articleEvidence: 2, quietEvidence: 0, paragraphs: 0 },
+      sections: [
+        {
+          title: "Notice body",
+          text: repeated("Notice body explains the lease renewal deadline, required signature, mailing address, and final response date.", 10),
+          adapterScore: 72,
+          unitMeta: { pageNumber: 1, ocrRole: "body", ocrQuality: "low" }
+        },
+        { title: "Footer", text: repeated("Page footer scan copy noisy.", 10), adapterScore: -22, unitMeta: { ocrRole: "footer" }, lowValue: true }
+      ]
+    },
+    {
+      pageType: "pdf",
+      quiet: false,
+      allowSingleImportant: true,
+      bestTitle: /Notice body/i,
+      bestKind: /body|ocr_letter_body/,
+      label: /Main body|Best place/i,
+      why: /main body|Low-quality OCR|OCR/i,
+      junkTitle: /Footer/i,
+      confidence: {
+        max: 66,
+        tier: "medium",
+        minPositiveFamilies: 4,
+        capReason: /Low-quality OCR/i
+      }
     }
   ),
   runFixture(
@@ -1785,6 +2300,9 @@ const cases = [
       assert(!result.pageProfile.quietMode, "expected partial Google Docs map to be active");
       assert(/currently available in the editor/i.test(result.pageProfile.reason), `unexpected partial reason ${result.pageProfile.reason}`);
       assert(result.recommendation.hasStrongTarget, "expected partial readable Google Docs map to have a target");
+      assert(result.recommendation.confidence <= 68, `expected partial Google Docs confidence cap, got ${result.recommendation.confidence}`);
+      assert(/Partial Google Docs/i.test(result.recommendation.confidenceCapReason), `unexpected partial Google Docs cap reason ${result.recommendation.confidenceCapReason}`);
+      assert(result.recommendation.confidenceFamilies.negative.strength >= 18, "expected negative family to record partial Google Docs extraction");
     }
   },
   runFixture(
@@ -1823,7 +2341,10 @@ const cases = [
     },
     {
       pageType: "low_structure",
-      quiet: true
+      quiet: true,
+      sectionSalience: [
+        { title: /Tiny page/i, max: 0 }
+      ]
     }
   ),
   runFixture(
@@ -1861,7 +2382,389 @@ const cases = [
       pageType: "shopping_product",
       quiet: true
     }
-  )
+  ),
+  {
+    name: "Next avoids duplicate summaries",
+    run() {
+      const result = analyze({
+        type: "article",
+        label: "Article",
+        title: "Local scholarship renewal requirements",
+        words: 760,
+        sections: [
+          { title: "Summary", text: repeated("Scholarship renewal requirements include enrollment credits grade average and filing the yearly affidavit.", 8) },
+          { title: "Summary recap", text: repeated("Scholarship renewal requirements include enrollment credits grade average and filing the yearly affidavit.", 8) },
+          { title: "Evidence and details", text: repeated("Evidence explains the credit threshold income documentation deadlines and appeal process for scholarship renewal.", 9) }
+        ]
+      });
+      const current = sectionByTitle(result, /Summary$/i);
+      const selection = engine.navigation.selectNextSection(result, {
+        currentSectionId: current.id,
+        recentSectionIds: [current.id],
+        source: "test"
+      });
+      const selected = sectionById(result, selection.sectionId);
+      assert(selected && /Evidence/i.test(selected.title), `expected duplicate summary to be skipped, got ${selected && selected.title}`);
+      assert(selection.diagnostics.candidates.some((item) => item.similarityPenalty > 0), "expected similarity penalty diagnostics");
+    }
+  },
+  {
+    name: "Tutorial Next prefers steps after setup",
+    run() {
+      const result = analyze({
+        type: "tutorial",
+        label: "Tutorial",
+        title: "Build a local extension harness",
+        words: 900,
+        sections: [
+          { title: "Setup", text: repeated("Setup creates the local fixture server persistent browser profile and extension loading configuration.", 8) },
+          { title: "Step-by-step implementation", text: repeated("Step one serve fixtures. Step two load the extension. Step three send status messages and verify highlights.", 8), numberedItems: 4 },
+          { title: "Troubleshooting", text: repeated("Troubleshooting explains browser launch issues fixture failures and retry steps.", 8) }
+        ]
+      });
+      const setup = sectionByTitle(result, /Setup/i);
+      const selection = engine.navigation.selectNextSection(result, {
+        currentSectionId: setup.id,
+        lastSelectedRole: "setup",
+        source: "test"
+      });
+      const selected = sectionById(result, selection.sectionId);
+      assert(selected && /Step-by-step/i.test(selected.title), `expected tutorial steps, got ${selected && selected.title}`);
+      assert(selection.diagnostics.candidates.some((item) => item.progressionBonus > 0), "expected progression diagnostics");
+    }
+  },
+  {
+    name: "Research Next reaches results and conclusion",
+    run() {
+      const result = analyze({
+        type: "research",
+        label: "Research",
+        title: "Local OCR navigation latency study",
+        words: 1100,
+        sections: [
+          { title: "Abstract", text: repeated("Abstract summarizes local OCR navigation latency privacy and section extraction findings.", 8) },
+          { title: "Methods", text: repeated("Methods describe sampled documents controlled device class measurements and extraction methodology.", 8) },
+          { title: "Results", text: repeated("Results show selectable documents map quickly while scanned documents need explicit OCR startup and progress states.", 8) },
+          { title: "Conclusion", text: repeated("Conclusion supports split runtimes local-only OCR diagnostics and browser regression coverage.", 8) }
+        ]
+      });
+      const methods = sectionByTitle(result, /Methods/i);
+      const first = engine.navigation.selectNextSection(result, {
+        currentSectionId: methods.id,
+        lastSelectedRole: "methods",
+        source: "test"
+      });
+      const resultSection = sectionById(result, first.sectionId);
+      assert(resultSection && /Results/i.test(resultSection.title), `expected results, got ${resultSection && resultSection.title}`);
+      const second = engine.navigation.selectNextSection(result, {
+        currentSectionId: resultSection.id,
+        lastSelectedRole: "results",
+        recentSectionIds: [methods.id, resultSection.id],
+        source: "test"
+      });
+      const conclusion = sectionById(result, second.sectionId);
+      assert(conclusion && /Conclusion/i.test(conclusion.title), `expected conclusion, got ${conclusion && conclusion.title}`);
+    }
+  },
+  {
+    name: "Section query exact heading, body, weak, and boilerplate behavior",
+    run() {
+      const result = analyze({
+        type: "article",
+        label: "Article",
+        title: "Scholarship renewal guide",
+        words: 1000,
+        sections: [
+          { title: "Opening", text: repeated("Opening background explains why scholarship renewal matters for students and families.", 8) },
+          { title: "Scholarship requirements", text: repeated("Scholarship requirements include full time enrollment credit completion residency paperwork and a minimum grade average.", 8) },
+          { title: "Appeal process", text: repeated("The body-only match explains income documentation special circumstances deadlines and appeal evidence.", 8) },
+          { title: "Related links", text: repeated("Related links newsletter subscribe comments sponsored recommended articles scholarship requirements.", 6), links: 20, linkDensity: 0.7 }
+        ]
+      });
+      let search = engine.navigation.searchSections(result, "scholarship requirements");
+      assert(search.status === "strong", `expected strong heading match, got ${search.status}`);
+      assert(/Scholarship requirements/i.test(search.result.title), `unexpected heading result ${search.result && search.result.title}`);
+      search = engine.navigation.searchSections(result, "income documentation deadlines");
+      assert(search.status === "strong" || search.status === "possible", `expected body match, got ${search.status}`);
+      assert(/Appeal process/i.test(search.result.title), `unexpected body result ${search.result && search.result.title}`);
+      search = engine.navigation.searchSections(result, "subscribe comments");
+      assert(search.status === "none" || search.status === "weak", `expected boilerplate to be rejected or weak, got ${search.status}`);
+      if (search.result) assert(!/Related links/i.test(search.result.title) || search.status === "weak", "boilerplate should not be an automatic result");
+      search = engine.navigation.searchSections(result, "quantum banana");
+      assert(search.status === "none", `expected no match, got ${search.status}`);
+    }
+  },
+  {
+    name: "Section query word forms typos synonyms and close-result margins",
+    run() {
+      const result = analyze({
+        type: "article",
+        label: "Article",
+        title: "Scholarship application guide",
+        words: 1200,
+        sections: [
+          { title: "Opening", text: repeated("Opening background explains the program and timeline without giving application details.", 8) },
+          { title: "Apply deadline", text: repeated("Students apply by the March deadline. Students who applied last year still need updated paperwork before renewal.", 8) },
+          { title: "Scholarship requirements", text: repeated("Scholarship requirements include enrollment status residency documents grade average and advisor confirmation.", 8) },
+          { title: "Fee schedule", text: repeated("The program fee covers materials, processing, and administrative review for each renewal cycle.", 8) },
+          { title: "Cost summary", text: repeated("Cost summary lists direct cost estimates, payment timing, and the expected total price for families.", 8) },
+          { title: "Caution note", text: repeated("Caution note explains what to review before changing enrollment status or submitting documents late.", 8) }
+        ]
+      });
+
+      let search = engine.navigation.searchSections(result, "deadline applying");
+      assert(search.status === "strong" || search.status === "possible", `expected word-form match, got ${search.status}`);
+      assert(/Apply deadline/i.test(search.result.title), `unexpected word-form result ${search.result && search.result.title}`);
+      assert(search.diagnostics.candidates[0].wordFormMatches >= 1, "expected word-form diagnostics");
+
+      search = engine.navigation.searchSections(result, "documents residency enrollment");
+      assert(search.status === "strong" || search.status === "possible", `expected reordered wording match, got ${search.status}`);
+      assert(/Scholarship requirements/i.test(search.result.title), `unexpected reordered result ${search.result && search.result.title}`);
+
+      const direct = engine.navigation.searchSections(result, "scholarship requirements");
+      const typo = engine.navigation.searchSections(result, "scholrship requirements");
+      assert(typo.status === "strong" || typo.status === "possible", `expected typo-assisted match, got ${typo.status}`);
+      assert(/Scholarship requirements/i.test(typo.result.title), `unexpected typo result ${typo.result && typo.result.title}`);
+      assert(typo.result.score < direct.result.score, "typo match should score below direct match");
+      assert(typo.diagnostics.candidates[0].typoMatches >= 1, "expected typo diagnostics");
+
+      search = engine.navigation.searchSections(result, "scholarship eligibility");
+      assert(search.status === "strong" || search.status === "possible", `expected synonym-assisted match, got ${search.status}`);
+      assert(/Scholarship requirements/i.test(search.result.title), `unexpected synonym result ${search.result && search.result.title}`);
+      assert(search.diagnostics.candidates[0].synonymMatches >= 1, "expected synonym diagnostics");
+
+      search = engine.navigation.searchSections(result, "cost");
+      assert(/Cost summary/i.test(search.result.title), `direct cost match should beat synonym fee match, got ${search.result && search.result.title}`);
+
+      search = engine.navigation.searchSections(result, "risk");
+      assert(search.status === "none" || search.status === "weak", `vague synonym query should not auto-navigate, got ${search.status}`);
+      if (search.result) assert(search.result.weakRequiresConfirm, "vague result should require confirmation");
+
+      search = engine.navigation.searchSections(result, "xylophone");
+      assert(search.status === "none", `expected unrelated rare word rejection, got ${search.status}`);
+
+      const close = analyze({
+        type: "article",
+        label: "Article",
+        title: "Renewal guide",
+        words: 900,
+        sections: [
+          { title: "Renewal requirements", text: repeated("Renewal requirements include enrollment deadline paperwork advisor approval and proof of residency.", 8) },
+          { title: "Application requirements", text: repeated("Application requirements include enrollment deadline paperwork advisor approval and proof of residency.", 8) }
+        ]
+      });
+      search = engine.navigation.searchSections(close, "requirements enrollment deadline");
+      assert(search.status === "weak", `close competitors should downgrade to weak, got ${search.status}`);
+      assert(search.result && search.result.weakRequiresConfirm, "close competitor result should require confirmation");
+      assert(search.diagnostics.margin !== null && search.diagnostics.margin < 7, `expected close margin, got ${search.diagnostics.margin}`);
+    }
+  },
+  {
+    name: "PDF passage-aware query scoring returns passage metadata and alternatives",
+    run() {
+      const result = analyze({
+        type: "pdf",
+        label: "PDF",
+        title: "Selectable research PDF",
+        words: 900,
+        sections: [
+          {
+            title: "Page 1",
+            text: repeated("Abstract. This page introduces the measurement plan and document context.", 8),
+            adapterScore: 50,
+            unitMeta: {
+              pageNumber: 1,
+              pdfSectionType: "abstract",
+              queryPassages: [
+                { id: "pdf-p1-body", surface: "pdf", pageNumber: 1, passageType: "paragraph", title: "Page 1: Abstract", text: "The abstract describes the measurement plan and setup context.", relativeYStart: 0.16, relativeYEnd: 0.24, sourceType: "selectable" },
+                { id: "pdf-p1-footer", surface: "pdf", pageNumber: 1, passageType: "footer", title: "Page 1 footer", text: "Downloaded from journal homepage copyright page 1 of 8", relativeYStart: 0.94, relativeYEnd: 0.98, sourceType: "selectable", metadata: { pdfSectionType: "boilerplate" } }
+              ]
+            }
+          },
+          {
+            title: "Page 4 results",
+            text: repeated("Results. The outcome shows latency reduction and benchmark findings.", 8),
+            adapterScore: 56,
+            unitMeta: {
+              pageNumber: 4,
+              pdfSectionType: "results",
+              queryPassages: [
+                { id: "pdf-p4-results", surface: "pdf", pageNumber: 4, passageType: "paragraph", title: "Page 4: Results", text: "The split line phrase is repaired in the passage and the benchmark findings show latency reduction.", relativeYStart: 0.34, relativeYEnd: 0.48, sourceType: "selectable" },
+                { id: "pdf-p4-close", surface: "pdf", pageNumber: 4, passageType: "paragraph", title: "Page 4: Secondary results", text: "The benchmark findings show latency reduction with a similar outcome statement.", relativeYStart: 0.52, relativeYEnd: 0.61, sourceType: "selectable" }
+              ]
+            }
+          }
+        ]
+      });
+
+      let search = engine.navigation.searchSections(result, "split line phrase benchmark findings");
+      assert(search.status === "strong" || search.status === "possible", `expected PDF passage match, got ${search.status}`);
+      assert(search.result.passageId === "pdf-p4-results", `expected passage id pdf-p4-results, got ${search.result.passageId}`);
+      assert(search.result.pageNumber === 4, `expected page 4, got ${search.result.pageNumber}`);
+      assert(search.result.surface === "pdf", `expected pdf surface, got ${search.result.surface}`);
+
+      search = engine.navigation.searchSections(result, "downloaded journal homepage");
+      assert(search.status === "none" || search.status === "weak", `footer-only query should not auto-navigate, got ${search.status}`);
+
+      search = engine.navigation.searchSections(result, "benchmark findings latency reduction");
+      assert(search.status === "weak", `close PDF passages should require confirmation, got ${search.status}`);
+      assert(search.result.alternatives && search.result.alternatives.length === 2, "expected two PDF alternatives");
+    }
+  },
+  {
+    name: "OCR and chat passage-aware query scoring prefer authoritative passages",
+    run() {
+      const ocr = analyze({
+        type: "pdf",
+        label: "PDF",
+        title: "OCR fixture",
+        words: 700,
+        sections: [
+          {
+            title: "OCR page",
+            text: repeated("Recovered OCR text discusses eligibility documents and application deadline.", 8),
+            adapterScore: 50,
+            unitMeta: {
+              pageNumber: 2,
+              kind: "pdf-ocr",
+              ocr: true,
+              pdfSectionType: "form",
+              queryPassages: [
+                { id: "ocr-low", surface: "pdf", pageNumber: 2, passageType: "ocr-lines", title: "Low confidence OCR", text: "Approva1 notice", sourceType: "ocr", ocrConfidence: 41, relativeYStart: 0.18, relativeYEnd: 0.24 },
+                {
+                  id: "ocr-high",
+                  surface: "pdf",
+                  pageNumber: 2,
+                  passageType: "ocr-lines",
+                  title: "High confidence OCR",
+                  text: "Farnily eligibility documents application deadline mailing address",
+                  rawText: "Farnily eligibility documents application dead-\nline mailing ad-\ndress",
+                  normalizedText: "Farnily eligibility documents application deadline mailing address",
+                  sourceType: "ocr",
+                  ocrConfidence: 88,
+                  relativeYStart: 0.42,
+                  relativeYEnd: 0.50,
+                  sourceLineIds: ["line-a"]
+                },
+                {
+                  id: "ocr-code",
+                  surface: "pdf",
+                  pageNumber: 2,
+                  passageType: "ocr-lines",
+                  title: "High confidence OCR code",
+                  text: "Case code A1B2 appeal form",
+                  rawText: "Case code A1B2 appeal form",
+                  normalizedText: "Case code A1B2 appeal form",
+                  sourceType: "ocr",
+                  ocrConfidence: 90,
+                  relativeYStart: 0.56,
+                  relativeYEnd: 0.61,
+                  sourceLineIds: ["line-b"]
+                },
+                {
+                  id: "ocr-footer",
+                  surface: "pdf",
+                  pageNumber: 2,
+                  passageType: "ocr-lines",
+                  title: "Footer OCR",
+                  text: "Page 2 confidential",
+                  rawText: "Page 2 confidential",
+                  normalizedText: "Page 2 confidential",
+                  sourceType: "ocr",
+                  ocrConfidence: 93,
+                  relativeYStart: 0.94,
+                  relativeYEnd: 0.97,
+                  sourceLineIds: ["line-footer"]
+                }
+              ]
+            }
+          }
+        ]
+      });
+      let search = engine.navigation.searchSections(ocr, "eligibility documents deadline");
+      assert(search.result && search.result.passageId === "ocr-high", `expected high-confidence OCR passage, got ${search.result && search.result.passageId}`);
+      assert(search.status === "strong" || search.status === "possible", `expected exact OCR query to be automatic, got ${search.status}`);
+
+      search = engine.navigation.searchSections(ocr, "family eligibility");
+      assert(search.status === "possible" || search.status === "weak", `expected conservative OCR fuzzy match, got ${search.status}`);
+      assert(search.result && search.result.passageId === "ocr-high", `expected fuzzy OCR passage, got ${search.result && search.result.passageId}`);
+      assert(search.result.ocrFuzzyMatches >= 1, "expected OCR fuzzy metadata");
+
+      search = engine.navigation.searchSections(ocr, "deadline mailing address");
+      assert(search.status === "strong" || search.status === "possible", `expected split-line OCR phrase match, got ${search.status}`);
+      assert(search.result && search.result.ocrPhraseAcrossLines, "expected OCR phrase-across-lines metadata");
+
+      search = engine.navigation.searchSections(ocr, "eligibility");
+      assert(search.status === "possible" || search.status === "strong", `single exact OCR token should become visible, got ${search.status}`);
+      assert(search.result && search.result.passageId === "ocr-high", `expected single exact OCR passage, got ${search.result && search.result.passageId}`);
+      assert(search.result.ocrExactMatches >= 1, "expected direct OCR metadata");
+
+      search = engine.navigation.searchSections(ocr, "family");
+      assert(search.status === "weak", `single fuzzy OCR token should require confirmation, got ${search.status}`);
+      assert(search.result && search.result.passageId === "ocr-high", `expected single fuzzy OCR passage, got ${search.result && search.result.passageId}`);
+      assert(search.result.weakRequiresConfirm, "single fuzzy OCR result should require confirmation");
+      assert(search.result.ocrFuzzyMatches >= 1, "expected single fuzzy OCR metadata");
+
+      search = engine.navigation.searchSections(ocr, "case");
+      assert(search.status === "possible" || search.status === "strong", `four-character exact OCR token should match conservatively, got ${search.status}`);
+      assert(search.result && search.result.passageId === "ocr-code", `expected four-character OCR passage, got ${search.result && search.result.passageId}`);
+
+      search = engine.navigation.searchSections(ocr, "case code");
+      assert(search.status === "possible" || search.status === "strong", `two coherent OCR terms should auto-navigate, got ${search.status}`);
+      assert(search.result && search.result.passageId === "ocr-code", `expected coherent OCR passage, got ${search.result && search.result.passageId}`);
+
+      search = engine.navigation.searchSections(ocr, "approval");
+      assert(search.status === "none", `low-confidence isolated OCR fuzzy match should be rejected, got ${search.status}`);
+
+      search = engine.navigation.searchSections(ocr, "confidential");
+      assert(search.status === "none", `repeated/furniture OCR match should be rejected, got ${search.status}`);
+
+      search = engine.navigation.searchSections(ocr, "xylophone zeppelin");
+      assert(search.status === "none", `unrelated OCR fuzzy query should be rejected, got ${search.status}`);
+      assert(search.diagnostics.ocrNoMatch && search.diagnostics.ocrNoMatch.ocrPassageCount >= 1, "expected OCR no-match diagnostics");
+      assert(search.diagnostics.ocrNoMatch.topCandidates.every((item) => typeof item.sample === "string" && !/xylophone zeppelin/i.test(item.sample)), "diagnostics should not echo the full raw query");
+
+      const chat = analyze({
+        type: "chat",
+        label: "Chat",
+        title: "Chat fixture",
+        words: 900,
+        sections: [
+          {
+            title: "Older assistant draft",
+            text: repeated("Initial draft incomplete browser tests", 8),
+            adapterScore: 30,
+            unitMeta: {
+              role: "assistant",
+              isSuperseded: true,
+              queryPassages: [
+                { id: "chat-old", surface: "chat", passageType: "paragraph", title: "Initial draft", text: "Initial draft is incomplete and mentions browser tests without the corrected final answer.", metadata: { role: "assistant", superseded: true } }
+              ]
+            }
+          },
+          {
+            title: "Corrected final answer",
+            text: repeated("Corrected final answer includes browser regression fixtures and stable message contracts.", 8),
+            adapterScore: 70,
+            unitMeta: {
+              role: "assistant",
+              hasFinalAnswer: true,
+              hasRevision: true,
+              isCompleteAssistantAnswer: true,
+              queryPassages: [
+                { id: "chat-final", surface: "chat", passageType: "paragraph", title: "Corrected final answer", text: "Corrected final answer includes deterministic browser regression fixtures, stable message contracts, and PDF query navigation.", metadata: { role: "assistant", finalAnswer: true } },
+                { id: "chat-code", surface: "chat", passageType: "code", title: "Implementation code", text: "function handleQueryAction(message) { return navigateQueryResult(message); }", metadata: { role: "assistant", finalAnswer: true } }
+              ]
+            }
+          }
+        ]
+      });
+      search = engine.navigation.searchSections(chat, "browser regression fixtures stable contracts");
+      assert(search.result && search.result.passageId === "chat-final", `expected corrected final answer passage, got ${search.result && search.result.passageId}`);
+      search = engine.navigation.searchSections(chat, "handleQueryAction function code");
+      assert(search.result && search.result.passageId === "chat-code", `expected code passage, got ${search.result && search.result.passageId}`);
+    }
+  }
 ];
 
 for (const testCase of cases) {

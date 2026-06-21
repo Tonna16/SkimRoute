@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Selectable PDF fixture</title>
+    <link rel="stylesheet" href="./fixture.css">
+    <style>
+      #viewerContainer .page:first-child { min-height: 1280px; }
+      #viewerContainer .page + .page { margin-top: 120px; }
+    </style>
+  </head>
+  <body>
+    <main id="viewerContainer">
+      <div class="page" data-page-number="1">
+        <div class="textLayer">
+          <p>Abstract. This selectable PDF states the main claim, key evidence, measured results, and conclusion. Selectable text should let SkimRoute map the PDF without starting OCR.</p>
+        </div>
+      </div>
+      <div class="page" data-page-number="2">
+        <div class="textLayer">
+          <p>Background. This page explains the dataset, input assumptions, and why the baseline needed a controlled comparison.</p>
+          <p>Downloaded from journal homepage copyright page 2 of 8</p>
+        </div>
+      </div>
+      <div class="page" data-page-number="3">
+        <div class="textLayer">
+          <p>Methods. The method page explains sampling, section extraction, and local-only browser instrumentation.</p>
+          <p>Downloaded from journal homepage copyright page 3 of 8</p>
+        </div>
+      </div>
+      <div class="page" data-page-number="4">
+        <div class="textLayer">
+          <p>Implementation. This page describes adapter boundaries, runtime loading, and deterministic browser fixtures.</p>
+          <p>Downloaded from journal homepage copyright page 4 of 8</p>
+        </div>
+      </div>
+      <div class="page" data-page-number="5">
+        <div class="textLayer">
+          <p>Discussion. This page summarizes privacy constraints, local navigation behavior, and limitations in native viewers.</p>
+          <p>Downloaded from journal homepage copyright page 5 of 8</p>
+        </div>
+      </div>
+      <div class="page" data-page-number="6">
+        <div class="textLayer">
+          <p>Results. The experiment reports measured improvement, error analysis, comparison against the baseline method, and a useful conclusion.</p>
+          <p>The split-
+          line phrase appears in this selectable PDF passage, and the benchmark findings show latency reduction for the final implementation path.</p>
+          <p>Downloaded from journal homepage copyright page 6 of 8</p>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

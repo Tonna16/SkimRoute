@@ -2,12 +2,26 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
+const checkOnly = process.argv.includes("--check");
 
 const assetCopies = [
-  ["content/adapters.js", "assets/adapters.js-BxVfMoxi.js"],
-  ["content/engine.js", "assets/engine.js-BJkAhsDZ.js"],
-  ["content/ui.js", "assets/ui.js-DPUnGKsp.js"],
-  ["content.js", "assets/content.js-BzKMfaWY.js"]
+  ["content/adapters.js", "assets/adapters.js"],
+  ["content/engine.js", "assets/engine.js"],
+  ["content/ui.js", "assets/ui.js"],
+  ["content-core.js", "assets/content-core.js"],
+  ["pdf-runtime.js", "assets/pdf-runtime.js"],
+  ["ocr-runtime.js", "assets/ocr-runtime.js"],
+  ["popup.js", "assets/popup.js"],
+  ["background.js", "assets/background.js"]
+];
+
+const staleAssets = [
+  "assets/adapters.js-BxVfMoxi.js",
+  "assets/engine.js-BJkAhsDZ.js",
+  "assets/ui.js-DPUnGKsp.js",
+  "assets/content.js-BzKMfaWY.js",
+  "assets/popup.html-C-AIiryS.js",
+  "assets/background.js-DHppkjD5.js"
 ];
 
 function readJson(relativePath) {
@@ -22,12 +36,16 @@ function writeText(relativePath, text) {
   fs.writeFileSync(path.join(root, relativePath), text);
 }
 
+function fileExists(relativePath) {
+  return fs.existsSync(path.join(root, relativePath));
+}
+
 function normalizeList(values) {
   return values.map((value) => String(value || "").replace(/\\/g, "/"));
 }
 
 function parsePopupContentFiles() {
-  const popupScript = readText("assets/popup.html-C-AIiryS.js");
+  const popupScript = readText("popup.js");
   const match = popupScript.match(/const\s+CONTENT_FILES\s*=\s*\[([\s\S]*?)\];/);
   if (!match) {
     throw new Error("Could not find popup CONTENT_FILES list.");
@@ -50,27 +68,82 @@ function assertSameContentFiles() {
   }
 }
 
-function assertNoUndefinedPdfHelper() {
-  for (const relativePath of ["content.js", "assets/content.js-BzKMfaWY.js"]) {
-    if (readText(relativePath).includes("isCurrentDocumentPdf")) {
-      throw new Error(`${relativePath} still references isCurrentDocumentPdf.`);
+function assertTopFrameOnly() {
+  const manifest = readJson("manifest.json");
+  const contentScript = manifest.content_scripts && manifest.content_scripts[0] || {};
+  if (contentScript.all_frames === true) {
+    throw new Error("Manifest content script must not use all_frames: true.");
+  }
+  if (contentScript.match_about_blank === true) {
+    throw new Error("Manifest content script must not use match_about_blank without a scoped frame script.");
+  }
+}
+
+function assertOptionalRuntimesNotContentScripts() {
+  const manifest = readJson("manifest.json");
+  const manifestFiles = normalizeList(
+    manifest.content_scripts && manifest.content_scripts[0] && manifest.content_scripts[0].js || []
+  );
+  const forbidden = ["assets/pdf-runtime.js", "assets/ocr-runtime.js"];
+  const loaded = forbidden.filter((file) => manifestFiles.includes(file));
+  if (loaded.length) {
+    throw new Error(`Optional runtimes must not be manifest content scripts: ${loaded.join(", ")}`);
+  }
+}
+
+function assertNoHeavyRuntimeInCore() {
+  const corePaths = ["content-core.js", "content.js", "assets/content-core.js"].filter(fileExists);
+  const forbiddenPatterns = [
+    /pdfjs-dist\/build\/pdf\.min\.mjs/i,
+    /tesseract\.esm\.min\.js/i,
+    /createWorker\(/,
+    /loadTesseractModule/,
+    /extractPdfTextWithAdaptiveOcr/,
+    /getDocument\(\{/
+  ];
+  for (const relativePath of corePaths) {
+    const text = readText(relativePath);
+    const hit = forbiddenPatterns.find((pattern) => pattern.test(text));
+    if (hit) {
+      throw new Error(`${relativePath} still contains heavy PDF/OCR implementation token: ${hit}`);
     }
   }
 }
 
-function assertNoAutoHeavyOcr() {
-  const content = readText("content.js");
-  if (!/function\s+shouldAutoRunPdfOcr\s*\([^)]*\)\s*\{\s*void\s+routeKey;\s*return\s+false;\s*\}/.test(content)) {
-    throw new Error("shouldAutoRunPdfOcr must stay disabled for image-based PDFs.");
+function assertNoStaleAssetsPresent() {
+  const present = staleAssets.filter(fileExists);
+  if (present.length) {
+    throw new Error(`Stale generated JS assets are still present: ${present.join(", ")}`);
   }
 }
 
-for (const [source, destination] of assetCopies) {
-  writeText(destination, readText(source));
-  console.log(`${source} -> ${destination}`);
+function assertAssetSynced(source, destination) {
+  const sourceText = readText(source);
+  if (!fileExists(destination)) {
+    throw new Error(`${destination} is missing.`);
+  }
+  const destinationText = readText(destination);
+  if (sourceText !== destinationText) {
+    throw new Error(`${destination} is out of sync with ${source}. Run npm run build.`);
+  }
 }
 
+function syncAssets() {
+  for (const [source, destination] of assetCopies) {
+    if (checkOnly) {
+      assertAssetSynced(source, destination);
+      console.log(`checked ${source} -> ${destination}`);
+    } else {
+      writeText(destination, readText(source));
+      console.log(`${source} -> ${destination}`);
+    }
+  }
+}
+
+syncAssets();
 assertSameContentFiles();
-assertNoUndefinedPdfHelper();
-assertNoAutoHeavyOcr();
-console.log("Asset sync complete.");
+assertTopFrameOnly();
+assertOptionalRuntimesNotContentScripts();
+assertNoHeavyRuntimeInCore();
+assertNoStaleAssetsPresent();
+console.log(checkOnly ? "Asset check complete." : "Asset sync complete.");

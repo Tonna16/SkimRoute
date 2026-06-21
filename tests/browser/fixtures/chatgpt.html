@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>ChatGPT fixture</title><link rel="stylesheet" href="./fixture.css"></head>
+  <body>
+    <main data-testid="conversation">
+      <article data-testid="conversation-turn" data-message-author-role="user"><p>Can you draft a plan for splitting PDF and OCR runtime code?</p></article>
+      <article data-testid="conversation-turn" data-message-author-role="assistant"><p>Initial draft: incomplete.</p></article>
+      <article data-testid="conversation-turn" data-message-author-role="user"><p>Correction: preserve existing behavior and include browser regression fixtures.</p></article>
+      <article data-testid="conversation-turn" data-message-author-role="assistant">
+        <h2>Corrected final answer</h2>
+        <p>Corrected answer: use a core runtime for ordinary pages, load the PDF runtime only for supported PDF surfaces or PDF actions, and load OCR only after the user starts OCR.</p>
+        <p>Keep stable message contracts, update generated asset mappings, preserve popup and sidebar synchronization, and add deterministic browser regression fixtures for articles, chats, search results, Google Docs, selectable PDFs, scanned PDF OCR startup, quiet pages, SPA routing, scrolling, and highlights.</p>
+        <pre><code>function handleQueryAction(message) {
+  return navigateQueryResult(message);
+}</code></pre>
+      </article>
+    </main>
+  </body>
+</html>
