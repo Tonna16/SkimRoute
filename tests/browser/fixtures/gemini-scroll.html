@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Gemini nested scroll fixture</title>
+    <link rel="stylesheet" href="./fixture.css">
+    <style>
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+      }
+
+      .gemini-shell {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        height: 100vh;
+      }
+
+      .gemini-top,
+      .gemini-input {
+        background: #ffffff;
+        border: 1px solid #d9e2ef;
+        padding: 14px 24px;
+      }
+
+      main {
+        height: 100%;
+        margin: 0 auto;
+        max-width: 860px;
+        overflow-y: auto;
+        padding: 24px 24px 520px;
+      }
+
+      model-response,
+      user-query {
+        background: #ffffff;
+        border: 1px solid #d8e1eb;
+        border-radius: 10px;
+        margin: 42px 0;
+        min-height: 320px;
+        padding: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="gemini-shell">
+      <div class="gemini-top">Gemini sanitized fixture</div>
+      <main aria-label="Gemini conversation">
+        <user-query><p>How should a Chrome extension test runtime splitting?</p></user-query>
+        <user-query><p>Correct that. Keep optional runtimes lazy and verify navigation. Add enough detail that the final model response appears later inside the nested scroll container.</p></user-query>
+        <user-query><p>Also include the exact behavior for Jump and Next without changing the existing ranking decisions.</p></user-query>
+        <model-response data-chat-target="gemini-final">
+          <h2>Final response</h2>
+          <p>The final answer is to run local browser tests with a persistent Chromium context, load the unpacked extension, serve sanitized fixtures, assert runtime loading boundaries, and verify Jump and Next with semantic scroll and highlight checks.</p>
+          <p>Gemini-style conversations use a nested scroll shell, so the selected response must be scrolled inside the conversation container rather than by changing the top-level window position.</p>
+        </model-response>
+        <model-response data-chat-target="gemini-next">
+          <h2>Supporting response</h2>
+          <p>The next useful Gemini response covers stale-node handling and a bounded retry after the app rerenders a model response.</p>
+        </model-response>
+      </main>
+      <div class="gemini-input">Ask Gemini</div>
+    </div>
+  </body>
+</html>

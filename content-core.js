@@ -2,7 +2,7 @@
   "use strict";
 
   const ROOT_ID = "pagepilot-root";
-  const SKIMROUTE_CONTENT_VERSION = "1.3.9-core";
+  const SKIMROUTE_CONTENT_VERSION = "1.4.2-core";
   const MUTATION_SCAN_DELAY_MS = 520;
   const FAST_RESCAN_INTERVAL_MS = 360;
   const URL_WATCH_INTERVAL_MS = 1200;
@@ -288,14 +288,14 @@
         onSnooze: () => setMode("snoozed", { focusTab: true, persist: true }),
         onJump: () => {
           const section = getSectionForAction("jump");
-          const ok = jumpToUsefulPart();
+          const ok = jumpToUsefulPart({ source: "sidebar" });
           setActionResult("jump", ok, { section });
           return ok;
         },
         onNext: () => {
           const selection = selectNextTarget("sidebar-next");
           const section = selection.section || null;
-          const ok = jumpToNextImportant(selection);
+          const ok = jumpToNextImportant(selection, { source: "sidebar" });
           setActionResult("next", ok, { section });
           return ok;
         },
@@ -537,7 +537,7 @@
     if (message.type === "PAGEPILOT_JUMP_USEFUL") {
       setMode("open", { focus: true, persist: true });
       const section = getSectionForAction("jump");
-      const ok = jumpToUsefulPart();
+      const ok = jumpToUsefulPart({ source: "popup" });
       setActionResult("jump", ok, { section });
       sendResponse(getPublicStats());
       return true;
@@ -547,7 +547,7 @@
       setMode("open", { focus: true, persist: true });
       const selection = selectNextTarget("message-next");
       const section = selection.section || null;
-      const ok = jumpToNextImportant(selection);
+      const ok = jumpToNextImportant(selection, { source: "popup" });
       setActionResult("next", ok, { section });
       sendResponse(getPublicStats());
       return true;
@@ -1270,6 +1270,445 @@
     return "Moved to the matching passage.";
   }
 
+  function isChatSection(section) {
+    if (!section) return false;
+    const profile = runtime.model && runtime.model.pageProfile || {};
+    const meta = section.unitMeta || {};
+    const metrics = section.metrics || {};
+    if (profile.type === "chat") return true;
+    const source = `${profile.adapterName || ""} ${meta.adapterName || ""} ${meta.source || ""} ${meta.platform || ""} ${meta.kind || ""}`.toLowerCase();
+    return Boolean(
+      meta.role === "assistant"
+      || meta.role === "user"
+      || metrics.chatRole
+      || /\b(chat|generic-chat|chatgpt|gemini|claude|copilot|perplexity|grok)\b/.test(source)
+    );
+  }
+
+  function navigateChatSection(section, options = {}) {
+    const actionType = options.actionType || "section";
+    const source = options.source || actionType;
+    const meta = section && section.unitMeta || {};
+    emitDebug("chat-navigation:requested", {
+      actionType,
+      actionSource: source,
+      sectionId: section && section.id || "",
+      role: meta.role || "",
+      turnIndex: Number.isFinite(Number(meta.turnIndex)) ? Number(meta.turnIndex) : null,
+      platform: meta.platform || "",
+      adapter: runtime.model && runtime.model.pageProfile && runtime.model.pageProfile.adapterName || ""
+    });
+
+    expandAncestors(section.id);
+    let resolved = resolveChatSectionTarget(section);
+    if (!resolved || !resolved.element) {
+      emitDebug("chat-navigation:failed", {
+        actionType,
+        actionSource: source,
+        sectionId: section.id,
+        role: meta.role || "",
+        turnIndex: Number.isFinite(Number(meta.turnIndex)) ? Number(meta.turnIndex) : null,
+        reason: "target-not-resolved"
+      });
+      return false;
+    }
+
+    emitDebug("chat-navigation:target-resolved", {
+      actionType,
+      actionSource: source,
+      sectionId: section.id,
+      role: resolved.role || meta.role || "",
+      turnIndex: resolved.turnIndex,
+      platform: resolved.platform || meta.platform || "",
+      anchorStale: Boolean(resolved.anchorStale),
+      target: describeElement(resolved.element),
+      matchScore: resolved.matchScore
+    });
+
+    let container = findChatScrollContainer(resolved.element);
+    let before = captureScrollPosition(container);
+    let beforeRect = rectSummary(resolved.element.getBoundingClientRect());
+    emitDebug("chat-navigation:scroll-container-resolved", {
+      actionType,
+      actionSource: source,
+      sectionId: section.id,
+      scrollContainer: container === window ? "window" : describeElement(container),
+      before,
+      targetRect: beforeRect
+    });
+
+    let visible = isElementVisibleInScrollContainer(resolved.element, container);
+    let scrollInfo = { requested: false, calculatedTop: before.top, actualTop: before.top };
+    if (!visible) {
+      scrollInfo = scrollChatTargetIntoView(resolved.element, container);
+      emitDebug("chat-navigation:scroll-requested", {
+        actionType,
+        actionSource: source,
+        sectionId: section.id,
+        scrollContainer: container === window ? "window" : describeElement(container),
+        before,
+        calculatedScrollTop: scrollInfo.calculatedTop,
+        actualScrollTop: scrollInfo.actualTop,
+        targetRect: beforeRect
+      });
+      visible = isElementVisibleInScrollContainer(resolved.element, container);
+    }
+
+    if (!visible) {
+      emitDebug("chat-navigation:retry", {
+        actionType,
+        actionSource: source,
+        sectionId: section.id,
+        reason: "post-scroll-target-not-visible",
+        scrollContainer: container === window ? "window" : describeElement(container),
+        scrollTop: captureScrollPosition(container).top
+      });
+      const retry = resolveChatSectionTarget(section, { preferFresh: true });
+      if (retry && retry.element) {
+        resolved = retry;
+        container = findChatScrollContainer(resolved.element);
+        before = captureScrollPosition(container);
+        beforeRect = rectSummary(resolved.element.getBoundingClientRect());
+        scrollInfo = scrollChatTargetIntoView(resolved.element, container);
+        visible = isElementVisibleInScrollContainer(resolved.element, container);
+      }
+    }
+
+    const after = captureScrollPosition(container);
+    const afterRect = rectSummary(resolved.element.getBoundingClientRect());
+    if (!visible) {
+      emitDebug("chat-navigation:failed", {
+        actionType,
+        actionSource: source,
+        sectionId: section.id,
+        role: resolved.role || meta.role || "",
+        turnIndex: resolved.turnIndex,
+        scrollContainer: container === window ? "window" : describeElement(container),
+        before,
+        after,
+        targetRectBefore: beforeRect,
+        targetRectAfter: afterRect,
+        reason: "target-not-visible-after-scroll"
+      });
+      return false;
+    }
+
+    runtime.view.activeId = section.id;
+    recordNavigationSelection(section, source);
+    if (runtime.ui) runtime.ui.updateActiveClasses(runtime.view.activeId);
+    if (options.highlight) {
+      activateJumpEffect({ ...section, anchor: resolved.element, blocks: [resolved.element] });
+    }
+    emitDebug("chat-navigation:verified", {
+      actionType,
+      actionSource: source,
+      sectionId: section.id,
+      role: resolved.role || meta.role || "",
+      turnIndex: resolved.turnIndex,
+      platform: resolved.platform || meta.platform || "",
+      anchorStale: Boolean(resolved.anchorStale),
+      scrollContainer: container === window ? "window" : describeElement(container),
+      before,
+      after,
+      targetRectBefore: beforeRect,
+      targetRectAfter: afterRect,
+      calculatedScrollTop: scrollInfo.calculatedTop,
+      actualScrollTop: after.top,
+      verification: "visible"
+    });
+    emitDebug("jump", {
+      type: actionType,
+      sectionId: section.id,
+      title: section.title,
+      exactIssue: "none",
+      strategy: "chat-section-scroll"
+    });
+    return true;
+  }
+
+  function resolveChatSectionTarget(section, options = {}) {
+    if (!section) return null;
+    const meta = section.unitMeta || {};
+    const anchor = section.anchor || null;
+    if (!options.preferFresh && isValidChatSectionAnchor(anchor, section)) {
+      return {
+        element: chooseChatTargetElement(anchor, section),
+        role: getChatElementRole(anchor) || meta.role || "",
+        turnIndex: Number.isFinite(Number(meta.turnIndex)) ? Number(meta.turnIndex) : null,
+        platform: meta.platform || "",
+        anchorStale: false,
+        matchScore: 100
+      };
+    }
+
+    const candidates = getLiveChatTurnCandidates();
+    const expectedRole = String(meta.role || "").toLowerCase();
+    const expectedTurnIndex = Number.isFinite(Number(meta.turnIndex)) ? Number(meta.turnIndex) : null;
+    const reference = getChatSectionReferenceText(section);
+    const rows = candidates.map((candidate, index) => {
+      const role = getChatElementRole(candidate);
+      if (expectedRole && role && role !== expectedRole) {
+        return null;
+      }
+      const text = normalizeText(candidate.innerText || candidate.textContent || "");
+      const score = scoreChatCandidate(section, candidate, {
+        index,
+        role,
+        expectedRole,
+        expectedTurnIndex,
+        reference,
+        text
+      });
+      return { candidate, index, role, score, text };
+    }).filter(Boolean).sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const best = rows[0] || null;
+    if (!best || best.score < 34) return null;
+    return {
+      element: chooseChatTargetElement(best.candidate, section),
+      role: best.role || expectedRole || "",
+      turnIndex: best.index,
+      platform: meta.platform || "",
+      anchorStale: true,
+      matchScore: best.score
+    };
+  }
+
+  function isValidChatSectionAnchor(anchor, section) {
+    if (!anchor || typeof anchor.getBoundingClientRect !== "function") return false;
+    if (!document.documentElement.contains(anchor)) return false;
+    if (anchor.closest && anchor.closest(`#${ROOT_ID}`)) return false;
+    const meta = section && section.unitMeta || {};
+    const expectedRole = String(meta.role || "").toLowerCase();
+    const role = getChatElementRole(anchor);
+    if (expectedRole && role && role !== expectedRole) return false;
+    const text = normalizeText(anchor.innerText || anchor.textContent || "");
+    const reference = getChatSectionReferenceText(section);
+    if (reference && text && getTokenOverlapScore(reference, text) < 0.08 && !text.includes(normalizeText(section.title || "").slice(0, 48))) {
+      return false;
+    }
+    return true;
+  }
+
+  function getLiveChatTurnCandidates() {
+    const selectors = [
+      "[data-testid='conversation-turn']",
+      "[data-message-author-role]",
+      "model-response",
+      "user-query",
+      "[role='article']",
+      "article",
+      "[class*='message' i]",
+      "[class*='turn' i]",
+      "[class*='response' i]"
+    ];
+    const nodes = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((node) => node && node instanceof Element)
+      .filter((node) => !(node.closest && node.closest(`#${ROOT_ID}`)))
+      .filter((node) => !isComposerLikeElement(node))
+      .filter((node) => {
+        const text = normalizeText(node.innerText || node.textContent || "");
+        return text && countWordsLocal(text) >= 3;
+      });
+    const unique = [];
+    nodes.forEach((node) => {
+      if (unique.includes(node)) return;
+      if (unique.some((existing) => existing.contains(node) && getChatElementRole(existing))) return;
+      for (let index = unique.length - 1; index >= 0; index -= 1) {
+        if (node.contains(unique[index]) && getChatElementRole(node)) unique.splice(index, 1);
+      }
+      unique.push(node);
+    });
+    return unique.filter((node) => {
+      try {
+        const style = window.getComputedStyle(node);
+        return style.display !== "none" && style.visibility !== "hidden";
+      } catch (error) {
+        return true;
+      }
+    });
+  }
+
+  function scoreChatCandidate(section, candidate, details) {
+    const meta = section && section.unitMeta || {};
+    let score = 0;
+    if (details.expectedRole && details.role === details.expectedRole) score += 46;
+    if (!details.expectedRole && details.role) score += 10;
+    if (details.expectedTurnIndex !== null) {
+      if (details.index === details.expectedTurnIndex) score += 72;
+      else {
+        const distance = Math.abs(details.index - details.expectedTurnIndex);
+        if (distance === 1) score += 24;
+        else if (distance === 2) score += 10;
+      }
+    }
+    if (meta.platform && hasAttributeText(candidate, meta.platform)) score += 8;
+    const title = normalizeText(section && section.title || "");
+    if (title && details.text.includes(title)) score += 28;
+    if (details.reference && details.text) score += Math.round(getTokenOverlapScore(details.reference, details.text) * 80);
+    if (section && section.anchor && section.anchor !== candidate) {
+      const staleText = normalizeText(section.anchor.innerText || section.anchor.textContent || "");
+      if (staleText && details.text.includes(staleText.slice(0, 80))) score += 18;
+    }
+    return score;
+  }
+
+  function getChatSectionReferenceText(section) {
+    if (!section) return "";
+    const parts = [
+      section.title,
+      section.text,
+      section.summary,
+      section.label,
+      section.anchor && (section.anchor.innerText || section.anchor.textContent)
+    ];
+    return normalizeText(parts.filter(Boolean).join(" ").slice(0, 1400));
+  }
+
+  function getTokenOverlapScore(left, right) {
+    const leftTokens = new Set(String(left || "").split(/\s+/).filter((token) => token.length > 2));
+    const rightTokens = new Set(String(right || "").split(/\s+/).filter((token) => token.length > 2));
+    if (!leftTokens.size || !rightTokens.size) return 0;
+    let overlap = 0;
+    leftTokens.forEach((token) => {
+      if (rightTokens.has(token)) overlap += 1;
+    });
+    return overlap / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+  }
+
+  function hasAttributeText(element, value) {
+    if (!element || !value) return false;
+    const expected = String(value).toLowerCase();
+    return Array.from(element.attributes || []).some((attribute) => String(attribute.value || "").toLowerCase().includes(expected));
+  }
+
+  function chooseChatTargetElement(element, section) {
+    if (!element || !(element instanceof Element)) return element;
+    const meta = section && section.unitMeta || {};
+    const root = findChatTurnRoot(element) || element;
+    const expectedRole = String(meta.role || "").toLowerCase();
+    if (expectedRole) {
+      const rootRole = getChatElementRole(root);
+      if (rootRole && rootRole !== expectedRole) return element;
+    }
+    return root;
+  }
+
+  function findChatTurnRoot(element) {
+    if (!element || !(element instanceof Element)) return null;
+    return element.closest("[data-testid='conversation-turn'], [data-message-author-role], model-response, user-query, [role='article'], article, [class*='message' i], [class*='turn' i], [class*='response' i]");
+  }
+
+  function getChatElementRole(element) {
+    if (!element || !(element instanceof Element)) return "";
+    const roleNode = element.closest("[data-message-author-role]");
+    const attrRole = roleNode && roleNode.getAttribute("data-message-author-role") || element.getAttribute("data-message-author-role") || "";
+    const tag = element.tagName ? element.tagName.toLowerCase() : "";
+    const aria = `${element.getAttribute("aria-label") || ""} ${element.getAttribute("data-testid") || ""} ${element.className || ""}`.toLowerCase();
+    if (/assistant|model|bot|response|answer/.test(String(attrRole || "").toLowerCase()) || tag === "model-response" || /\b(assistant|model|bot|response)\b/.test(aria)) return "assistant";
+    if (/user|human|prompt|query/.test(String(attrRole || "").toLowerCase()) || tag === "user-query" || /\b(user|human|prompt|query)\b/.test(aria)) return "user";
+    return "";
+  }
+
+  function isComposerLikeElement(element) {
+    if (!element || !(element instanceof Element)) return false;
+    if (element.matches("textarea, input, [contenteditable='true'], form")) return true;
+    const label = `${element.getAttribute("aria-label") || ""} ${element.getAttribute("data-testid") || ""} ${element.className || ""}`.toLowerCase();
+    return /\b(composer|prompt-textarea|chat-input|message-input|send-button|editor)\b/.test(label);
+  }
+
+  function findChatScrollContainer(element) {
+    const direct = findScrollContainer(element);
+    if (direct !== window) return direct;
+    const candidates = Array.from(document.querySelectorAll([
+      "[data-testid='conversation']",
+      "[data-testid*='conversation' i]",
+      "[role='main']",
+      "main",
+      "[class*='conversation' i]",
+      "[class*='chat' i]",
+      "[class*='thread' i]",
+      "[class*='messages' i]"
+    ].join(","))).filter((node) => node && node instanceof Element && node.contains(element));
+    const scrollable = candidates.find((node) => {
+      try {
+        const style = window.getComputedStyle(node);
+        const overflow = `${style.overflowY || ""} ${style.overflow || ""}`;
+        return /(auto|scroll|overlay)/i.test(overflow) && node.scrollHeight > node.clientHeight + 24;
+      } catch (error) {
+        return false;
+      }
+    });
+    return scrollable || window;
+  }
+
+  function scrollChatTargetIntoView(element, container) {
+    const before = captureScrollPosition(container);
+    const rect = element.getBoundingClientRect();
+    let calculatedTop = before.top;
+    if (container === window) {
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const maxScroll = Math.max(0, document.documentElement.scrollHeight - viewportHeight);
+      calculatedTop = Math.max(0, Math.min(maxScroll, window.scrollY + rect.top - Math.max(24, (viewportHeight - Math.min(rect.height, viewportHeight * 0.75)) / 2)));
+      window.scrollTo({ top: calculatedTop, behavior: "auto" });
+    } else {
+      const containerRect = container.getBoundingClientRect();
+      const visibleHeight = container.clientHeight || containerRect.height || 0;
+      const maxScroll = Math.max(0, container.scrollHeight - visibleHeight);
+      calculatedTop = Math.max(0, Math.min(maxScroll, container.scrollTop + (rect.top - containerRect.top) - Math.max(20, (visibleHeight - Math.min(rect.height, visibleHeight * 0.75)) / 2)));
+      if (typeof container.scrollTo === "function") {
+        container.scrollTo({ top: calculatedTop, behavior: "auto" });
+      } else {
+        container.scrollTop = calculatedTop;
+      }
+    }
+    const after = captureScrollPosition(container);
+    return {
+      requested: true,
+      calculatedTop: Math.round(calculatedTop),
+      actualTop: after.top
+    };
+  }
+
+  function isElementVisibleInScrollContainer(element, container) {
+    if (!element || !element.getBoundingClientRect) return false;
+    const rect = element.getBoundingClientRect();
+    const viewport = getSafeChatViewportRect(container);
+    const vertical = Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top);
+    const horizontal = Math.min(rect.right, viewport.right) - Math.max(rect.left, viewport.left);
+    const minVisible = Math.max(18, Math.min(rect.height || 0, viewport.height || 0) * 0.25);
+    return vertical >= minVisible && horizontal > 8;
+  }
+
+  function getSafeChatViewportRect(container) {
+    const base = container === window
+      ? { top: 0, left: 0, right: window.innerWidth || document.documentElement.clientWidth || 0, bottom: window.innerHeight || document.documentElement.clientHeight || 0 }
+      : container.getBoundingClientRect();
+    const height = Math.max(0, base.bottom - base.top);
+    const topMargin = Math.min(72, Math.max(16, height * 0.14));
+    const bottomMargin = Math.min(96, Math.max(20, height * 0.18));
+    return {
+      top: base.top + topMargin,
+      left: base.left,
+      right: base.right,
+      bottom: Math.max(base.top + topMargin, base.bottom - bottomMargin),
+      width: Math.max(0, base.right - base.left),
+      height: Math.max(0, height - topMargin - bottomMargin)
+    };
+  }
+
+  function rectSummary(rect) {
+    if (!rect) return null;
+    return {
+      top: Math.round(rect.top),
+      right: Math.round(rect.right),
+      bottom: Math.round(rect.bottom),
+      left: Math.round(rect.left),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }
+
   function getChatQueryPassages(section) {
     if (!section || !section.anchor) return [];
     const helpers = runtime.engine && runtime.engine.helpers || {};
@@ -1429,13 +1868,13 @@
     return Math.abs(hash >>> 0).toString(36);
   }
 
-  function jumpToUsefulPart() {
+  function jumpToUsefulPart(options = {}) {
     if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
     const targetId = runtime.model.bestSectionId || runtime.model.skipTargetId;
-    return scrollToSection(targetId, { highlight: true, actionType: "jump" });
+    return scrollToSection(targetId, { highlight: true, actionType: "jump", source: options.source || "jump" });
   }
 
-  function jumpToNextImportant(existingSelection) {
+  function jumpToNextImportant(existingSelection, options = {}) {
     refreshActiveSection();
     if (!runtime.model || runtime.model.pageProfile.quietMode) return false;
     const selection = existingSelection && existingSelection.sectionId ? existingSelection : selectNextTarget("next");
@@ -1443,7 +1882,7 @@
       || runtime.model.importantSections.find((section) => section.id !== runtime.view.activeId)?.id;
     runtime.model.nextImportantId = targetId || "";
     runtime.model.nextReason = selection.reason || runtime.model.nextReason || "";
-    return scrollToSection(targetId, { highlight: true, actionType: "next" });
+    return scrollToSection(targetId, { highlight: true, actionType: "next", source: options.source || "next" });
   }
 
   function getSectionForAction(type) {
@@ -1460,6 +1899,9 @@
     if (!section) return false;
     if (isGoogleDocsSection(section)) {
       return performGoogleDocsSectionNavigation(section, options);
+    }
+    if (isChatSection(section)) {
+      return navigateChatSection(section, options);
     }
     const anchor = section.anchor;
     if (!anchor || typeof anchor.getBoundingClientRect !== "function") return false;
@@ -1741,12 +2183,12 @@
     if (key === "j") {
       event.preventDefault();
       const section = getSectionForAction("jump");
-      const ok = jumpToUsefulPart();
+      const ok = jumpToUsefulPart({ source: "keyboard" });
       setActionResult("jump", ok, { section });
     } else if (key === "n") {
       event.preventDefault();
       const section = getSectionForAction("next");
-      const ok = jumpToNextImportant();
+      const ok = jumpToNextImportant(null, { source: "keyboard" });
       setActionResult("next", ok, { section });
     }
   }

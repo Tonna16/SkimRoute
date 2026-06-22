@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>ChatGPT nested scroll fixture</title>
+    <link rel="stylesheet" href="./fixture.css">
+    <style>
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        background: #f7fafc;
+      }
+
+      .chat-app {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        height: 100vh;
+      }
+
+      .chat-header,
+      .chat-composer {
+        background: #ffffff;
+        border-color: #d9e2ef;
+        border-style: solid;
+        padding: 14px 24px;
+        z-index: 2;
+      }
+
+      .chat-header {
+        border-width: 0 0 1px;
+      }
+
+      .chat-composer {
+        border-width: 1px 0 0;
+      }
+
+      main[data-testid='conversation'] {
+        height: 100%;
+        margin: 0 auto;
+        max-width: 860px;
+        overflow-y: auto;
+        padding: 24px 24px 520px;
+        scroll-behavior: auto;
+      }
+
+      [data-testid='conversation-turn'] {
+        background: #ffffff;
+        border: 1px solid #d8e1eb;
+        border-radius: 10px;
+        margin: 34px 0;
+        padding: 20px;
+      }
+
+      [data-message-author-role='assistant'] {
+        background: #fbfdff;
+      }
+
+      .spacer-turn {
+        min-height: 210px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="chat-app">
+      <div class="chat-header">ChatGPT sanitized fixture</div>
+      <main data-testid="conversation" aria-label="Conversation">
+        <article data-testid="conversation-turn" data-message-author-role="user"><p>Can you draft a plan for fixing browser extension navigation?</p></article>
+        <article data-testid="conversation-turn" data-message-author-role="assistant" class="spacer-turn"><p>Initial draft: incomplete. This early answer is intentionally short and superseded by the corrected final answer later in the thread.</p></article>
+        <article data-testid="conversation-turn" data-message-author-role="user" class="spacer-turn"><p>Correction: keep the existing ranking and only repair the chatbot scroll container behavior.</p></article>
+        <article data-testid="conversation-turn" data-message-author-role="assistant" class="spacer-turn"><p>Intermediate note: verify the popup and sidebar actions, but this is not the final recommendation.</p></article>
+        <article data-testid="conversation-turn" data-message-author-role="user" class="spacer-turn"><p>Now provide the corrected final answer with exact implementation steps and tests.</p></article>
+        <article data-testid="conversation-turn" data-message-author-role="assistant" data-chat-target="corrected-final">
+          <h2>Corrected final answer</h2>
+          <p>The corrected final answer is to preserve target selection and replace only the chatbot scrolling mechanics. Popup Jump, sidebar Jump, keyboard Jump, popup Next, sidebar Next, and keyboard Next should all route through one shared chatbot navigator.</p>
+          <p>The navigator must resolve the live assistant turn after rerenders, find the nested conversation scroll container, move the selected answer into the visible conversation viewport, and apply the existing jump highlight to this assistant answer.</p>
+          <p>Stable verification should measure the nested scroll position and the selected assistant answer rectangle after the scroll, not only the top-level window scroll position.</p>
+        </article>
+        <article data-testid="conversation-turn" data-message-author-role="assistant" data-chat-target="next-supporting">
+          <h2>Next supporting section</h2>
+          <p>The next useful section explains the fallback and retry behavior. If the live anchor is stale, the navigator should resolve the current assistant turn by role, turn index, and a short text fingerprint before measuring visibility.</p>
+          <p>This supporting detail is distinct from the final answer and remains forward in the conversation order.</p>
+        </article>
+      </main>
+      <div class="chat-composer">Message composer</div>
+    </div>
+  </body>
+</html>

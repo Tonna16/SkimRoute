@@ -178,6 +178,119 @@ test("chat query selects and highlights the matched live passage", async () => {
   await expect(page.locator(".pagepilot-answer-target")).toContainText(/handleQueryAction/i);
 });
 
+test("chatbot Jump uses the nested conversation scroller from popup, sidebar, and keyboard", async () => {
+  resetRuntimeRequests();
+  await gotoHostFixture("chatgpt.com", "/fixtures/chatgpt-scroll.html");
+  const stats = await waitForStats({ pageType: "chat" });
+  expect(stats.ok).toBeTruthy();
+
+  await resetNestedChatScroll("[data-testid='conversation']");
+  const beforePopup = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  expect(beforePopup.visible).toBeFalsy();
+  const popupJump = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+  expect(popupJump.lastActionOk).toBeTruthy();
+  await expect.poll(() => readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']"), { timeout: 2500 }).toMatchObject({ visible: true });
+  let after = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  expect(after.scrollTop).toBeGreaterThan(beforePopup.scrollTop + 100);
+  await expect(page.locator(".pagepilot-answer-target")).toContainText(/Corrected final answer/i);
+
+  await resetNestedChatScroll("[data-testid='conversation']");
+  await messageActiveTab({ type: "PAGEPILOT_TOGGLE", open: true });
+  await page.locator("#pagepilot-root .pp-skip").click();
+  await expect.poll(() => readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']"), { timeout: 2500 }).toMatchObject({ visible: true });
+  after = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  expect(after.scrollTop).toBeGreaterThan(100);
+  await expect(page.locator(".pagepilot-answer-target")).toContainText(/Corrected final answer/i);
+
+  await resetNestedChatScroll("[data-testid='conversation']");
+  await page.keyboard.press("Alt+J");
+  await expect.poll(() => readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']"), { timeout: 2500 }).toMatchObject({ visible: true });
+  after = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  expect(after.scrollTop).toBeGreaterThan(100);
+  await expect(page.locator(".pagepilot-answer-target")).toContainText(/Corrected final answer/i);
+});
+
+test("chatbot Next uses the same nested scroller from popup, sidebar, and keyboard", async () => {
+  for (const source of ["popup", "sidebar", "keyboard"]) {
+    resetRuntimeRequests();
+    await gotoHostFixture("chatgpt.com", "/fixtures/chatgpt-scroll.html");
+    await waitForStats({ pageType: "chat" });
+    await resetNestedChatScroll("[data-testid='conversation']");
+    const jump = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+    expect(jump.lastActionOk).toBeTruthy();
+    await expect.poll(() => readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']"), { timeout: 2500 }).toMatchObject({ visible: true });
+
+    if (source === "popup") {
+      const next = await messageActiveTab({ type: "PAGEPILOT_NEXT_IMPORTANT" });
+      expect(next.lastActionOk).toBeTruthy();
+    } else if (source === "sidebar") {
+      await messageActiveTab({ type: "PAGEPILOT_TOGGLE", open: true });
+      await page.locator("#pagepilot-root .pp-next").click();
+    } else {
+      await page.keyboard.press("Alt+N");
+    }
+
+    await expect.poll(() => readNestedChatState("[data-testid='conversation']", ".pagepilot-answer-target"), { timeout: 2500 }).toMatchObject({ visible: true });
+    const highlighted = await readNestedChatState("[data-testid='conversation']", ".pagepilot-answer-target");
+    expect(highlighted.scrollTop).toBeGreaterThan(0);
+  }
+});
+
+test("chatbot navigation re-resolves stale anchors and fails honestly when unresolved", async () => {
+  resetRuntimeRequests();
+  await gotoHostFixture("chatgpt.com", "/fixtures/chatgpt-scroll.html");
+  await waitForStats({ pageType: "chat" });
+  await page.evaluate(() => {
+    const target = document.querySelector("[data-chat-target='corrected-final']");
+    const clone = target && target.cloneNode(true);
+    if (target && clone) target.replaceWith(clone);
+  });
+  await resetNestedChatScroll("[data-testid='conversation']");
+  const staleJump = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+  expect(staleJump.lastActionOk).toBeTruthy();
+  await expect.poll(() => readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']"), { timeout: 2500 }).toMatchObject({ visible: true });
+  await expect(page.locator("[data-chat-target='corrected-final'].pagepilot-answer-target")).toHaveCount(1);
+
+  const visibleBefore = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  const alreadyVisible = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+  expect(alreadyVisible.lastActionOk).toBeTruthy();
+  const visibleAfter = await readNestedChatState("[data-testid='conversation']", "[data-chat-target='corrected-final']");
+  expect(Math.abs(visibleAfter.scrollTop - visibleBefore.scrollTop)).toBeLessThan(80);
+
+  await gotoHostFixture("chatgpt.com", "/fixtures/chatgpt-scroll.html");
+  await waitForStats({ pageType: "chat" });
+  await page.evaluate(() => {
+    document.querySelectorAll("[data-message-author-role='assistant']").forEach((node) => node.remove());
+  });
+  const failed = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+  expect(failed.lastActionOk).toBeFalsy();
+  await expect(page.locator(".pagepilot-answer-target")).toHaveCount(0);
+});
+
+test("Gemini and generic chatbot fixtures keep Jump on the selected live chat target", async () => {
+  for (const fixture of [
+    {
+      host: "gemini.google.com",
+      path: "/fixtures/gemini-scroll.html",
+      container: "main"
+    },
+    {
+      host: "chatgpt.com",
+      path: "/fixtures/generic-chat-scroll.html",
+      container: ".generic-chat-log"
+    }
+  ]) {
+    resetRuntimeRequests();
+    await gotoHostFixture(fixture.host, fixture.path);
+    await waitForStats({ pageType: "chat" });
+    await resetNestedChatScroll(fixture.container);
+    const jumped = await messageActiveTab({ type: "PAGEPILOT_JUMP_USEFUL" });
+    expect(jumped.lastActionOk).toBeTruthy();
+    await expect.poll(() => readNestedChatState(fixture.container, ".pagepilot-answer-target"), { timeout: 2500 }).toMatchObject({ visible: true });
+    await expect(page.locator(".pagepilot-answer-target")).toHaveCount(1);
+  }
+});
+
 test("search, quiet page, and SPA route refresh remain handled by top-frame core", async () => {
   resetRuntimeRequests();
   await gotoHostFixture("www.google.com", "/search?q=runtime-split&fixture=ai");
@@ -633,6 +746,39 @@ async function messageActiveTab(message) {
       });
     });
   }), message);
+}
+
+async function resetNestedChatScroll(containerSelector) {
+  await page.evaluate((selector) => {
+    const container = document.querySelector(selector);
+    if (container) container.scrollTop = 0;
+    document.querySelectorAll(".pagepilot-answer-target").forEach((node) => node.classList.remove("pagepilot-answer-target"));
+  }, containerSelector);
+}
+
+async function readNestedChatState(containerSelector, targetSelector) {
+  return page.evaluate(({ containerSelector: containerSel, targetSelector: targetSel }) => {
+    const container = document.querySelector(containerSel);
+    const target = document.querySelector(targetSel);
+    if (!container || !target) {
+      return { exists: Boolean(target), scrollTop: container ? Math.round(container.scrollTop || 0) : 0, visible: false, highlighted: false };
+    }
+    const containerRect = container.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const top = containerRect.top + Math.min(72, Math.max(16, containerRect.height * 0.14));
+    const bottom = containerRect.bottom - Math.min(96, Math.max(20, containerRect.height * 0.18));
+    const visiblePixels = Math.min(targetRect.bottom, bottom) - Math.max(targetRect.top, top);
+    return {
+      exists: true,
+      scrollTop: Math.round(container.scrollTop || 0),
+      visible: visiblePixels >= Math.max(18, Math.min(targetRect.height, bottom - top) * 0.25),
+      highlighted: target.classList.contains("pagepilot-answer-target"),
+      targetTop: Math.round(targetRect.top),
+      targetBottom: Math.round(targetRect.bottom),
+      containerTop: Math.round(containerRect.top),
+      containerBottom: Math.round(containerRect.bottom)
+    };
+  }, { containerSelector, targetSelector });
 }
 
 async function popupRuntimeMessage(popup, message) {

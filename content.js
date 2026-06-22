@@ -2,7 +2,7 @@
   "use strict";
 
   const ROOT_ID = "pagepilot-root";
-  const SKIMROUTE_CONTENT_VERSION = "1.3.9-core";
+  const SKIMROUTE_CONTENT_VERSION = "1.4.2-core";
   const MUTATION_SCAN_DELAY_MS = 520;
   const FAST_RESCAN_INTERVAL_MS = 360;
   const URL_WATCH_INTERVAL_MS = 1200;

@@ -1,13 +1,24 @@
 {
   "name": "skimroute-extension",
-  "version": "1.3.9",
+  "version": "1.4.2",
   "private": true,
   "description": "SkimRoute Chrome MV3 extension local build and regression tests.",
+  "engines": {
+    "node": ">=22.13.0 || >=24"
+  },
   "scripts": {
-    "build": "node scripts/build-assets.js",
+    "build": "node scripts/build-assets.js && node scripts/verify-production.js",
     "check:assets": "node scripts/build-assets.js --check",
+    "check:package": "node scripts/verify-production.js",
+    "package": "npm run build && node scripts/package-extension.js",
     "test": "node scripts/run-node-tests.js",
-    "test:browser": "playwright test tests/browser/skimroute.browser.test.js --config=tests/browser/playwright.config.js"
+    "test:browser": "npm run check:package && playwright test tests/browser/skimroute.browser.test.js --config=tests/browser/playwright.config.js"
+  },
+  "dependencies": {
+    "@tesseract.js-data/eng": "1.0.0",
+    "pdfjs-dist": "6.0.227",
+    "tesseract.js": "7.0.0",
+    "tesseract.js-core": "7.0.0"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0"
