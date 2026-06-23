@@ -104,32 +104,6 @@ To use SkimRoute with PDFs stored on your computer:
 4. Enable "Allow access to file URLs".
 5. Reopen the local PDF.
 
-## Development
-
-Run the main checks:
-
-```bash
-npm test
-npm run check:assets
-npm run check:package
-npm run test:browser
-npm run build
-```
-
-Create a Chrome Web Store zip:
-
-```bash
-npm run package
-```
-
-The package is written to `dist/skimroute-<version>.zip`.
-
-## Release Status
-
-Current release target: `1.4.2`.
-
-Release checks and Chrome Web Store copy live in `CHROME_WEB_STORE_RELEASE.md`.
-
 ## Limitations
 
 SkimRoute depends on the structure and accessibility of the current page or PDF.
