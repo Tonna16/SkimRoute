@@ -851,19 +851,61 @@ async function installOcrTestResultForActiveTab(options = {}) {
   const entry = options.entry || makeOcrQueryEntry({ ...(options.entryOverrides || {}), delayMs: options.delayMs || 700 });
   const delayMs = options.delayMs || entry.delayMs || 700;
   const installed = await serviceWorker.evaluate(({ id, payload, delayMs }) => new Promise((resolve) => {
+    chrome.storage.local.set({
+      "pagepilot.test.ocrResult": payload,
+      "pagepilot.test.ocrDelayMs": delayMs
+    }, () => {
+      chrome.scripting.executeScript({
+        target: { tabId: id },
+        world: "ISOLATED",
+        args: [payload, delayMs],
+        func: (ocrResult, delay) => {
+          window.__PAGEPILOT_ENABLE_TEST_HOOKS__ = true;
+          window.__PAGEPILOT_TEST_OCR_RESULT__ = ocrResult;
+          window.__PAGEPILOT_TEST_OCR_DELAY_MS__ = delay;
+          document.documentElement.setAttribute("data-pagepilot-test-ocr-result", JSON.stringify(ocrResult));
+          document.documentElement.setAttribute("data-pagepilot-test-ocr-delay-ms", String(delay));
+          window.__PAGEPILOT_PDF_OCR_CACHE__ = Object.create(null);
+          sessionStorage.setItem("pagepilot.test.ocrResult", JSON.stringify(ocrResult));
+          sessionStorage.setItem("pagepilot.test.ocrDelayMs", String(delay));
+          sessionStorage.removeItem("pagepilot.pdfRecoveryCache");
+        }
+      }, () => resolve(!chrome.runtime.lastError));
+    });
+  }), { id: tabId, payload: entry, delayMs });
+  expect(installed).toBeTruthy();
+  const directRuntimeInstall = await serviceWorker.evaluate(({ id, payload, delayMs }) => new Promise((resolve) => {
     chrome.scripting.executeScript({
       target: { tabId: id },
       world: "ISOLATED",
       args: [payload, delayMs],
-      func: (ocrResult, delay) => {
-        window.__PAGEPILOT_TEST_OCR_RESULT__ = ocrResult;
-        window.__PAGEPILOT_TEST_OCR_DELAY_MS__ = delay;
-        window.__PAGEPILOT_PDF_OCR_CACHE__ = Object.create(null);
-        sessionStorage.removeItem("pagepilot.pdfRecoveryCache");
+      func: async (ocrResult, delay) => {
+        if (!window.PagePilotPdfRuntime || typeof window.PagePilotPdfRuntime.handleExternalMessage !== "function") {
+          return false;
+        }
+        await window.PagePilotPdfRuntime.handleExternalMessage({
+          type: "PAGEPILOT_DEBUG_SET_OCR_TEST_RESULT",
+          testHook: true,
+          entry: ocrResult,
+          delayMs: delay
+        }, { source: "browser-test" });
+        return true;
       }
-    }, () => resolve(!chrome.runtime.lastError));
+    }, (results) => resolve({
+      ok: !chrome.runtime.lastError,
+      result: results && results[0] && results[0].result
+    }));
   }), { id: tabId, payload: entry, delayMs });
-  expect(installed).toBeTruthy();
+  try {
+    await messageActiveTab({
+      type: "PAGEPILOT_DEBUG_SET_OCR_TEST_RESULT",
+      testHook: true,
+      entry,
+      delayMs
+    });
+  } catch (error) {
+    // The PDF runtime may not be loaded yet. The injected payload above covers that case.
+  }
 }
 
 function makeOcrQueryEntry(overrides = {}) {

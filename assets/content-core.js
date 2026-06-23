@@ -299,8 +299,8 @@
           setActionResult("next", ok, { section });
           return ok;
         },
-        onRunPdfOcr: () => ensurePdfRuntime("sidebar-ocr-action"),
-        onCancelPdfOcr: () => ensurePdfRuntime("sidebar-cancel-ocr"),
+        onRunPdfOcr: (mode) => runPdfRuntimeAction({ type: "PAGEPILOT_RUN_PDF_OCR", mode: mode || "fast" }, "sidebar-ocr-action"),
+        onCancelPdfOcr: () => runPdfRuntimeAction({ type: "PAGEPILOT_CANCEL_PDF_OCR" }, "sidebar-cancel-ocr"),
         onSection: (id, options) => {
           const section = runtime.model && runtime.model.sections.find((item) => item.id === id) || null;
           const ok = scrollToSection(id, { ...(options || {}), actionType: "section", source: "sidebar-section" });
@@ -309,7 +309,7 @@
         },
         onQuery: (query) => runSectionQuery(query, { source: "sidebar", allowWeakNavigation: false }),
         onClearQuery: () => clearSectionQuery("sidebar-clear"),
-        onRunQueryBetterOcr: () => ensurePdfRuntime("sidebar-query-better-ocr"),
+        onRunQueryBetterOcr: () => runPdfRuntimeAction({ type: "PAGEPILOT_RUN_PDF_OCR", mode: "better" }, "sidebar-query-better-ocr"),
         onNavigateQueryResult: (target) => navigateCurrentQueryResult(target && target.returnToMatch ? "sidebar-return" : "sidebar-weak-confirm", target || {}),
         onToggleCollapse: (id) => toggleSectionCollapse(id),
         onDismissTip: () => dismissOnboarding()
@@ -647,13 +647,40 @@
     return true;
   }
 
+  function runPdfRuntimeAction(message, reason = "sidebar-pdf-action") {
+    return ensurePdfRuntime(reason)
+      .then(() => {
+        const pdfApi = window.PagePilotPdfRuntime;
+        if (!pdfApi || typeof pdfApi.handleExternalMessage !== "function") {
+          return { ok: false, loading: true, pageType: "pdf", error: "PDF runtime is loading." };
+        }
+        return Promise.resolve(pdfApi.handleExternalMessage(message, { source: reason }));
+      })
+      .catch((error) => ({
+        ok: false,
+        pageType: "pdf",
+        error: String(error && error.message ? error.message : error)
+      }));
+  }
+
   function isPdfMessage(message) {
-    return /^PAGEPILOT_(RUN_PDF_OCR|CANCEL_PDF_OCR|DEBUG_PDF_CACHE)$/i.test(String(message && message.type || ""));
+    return /^PAGEPILOT_(RUN_PDF_OCR|CANCEL_PDF_OCR|DEBUG_PDF_CACHE|DEBUG_SET_OCR_TEST_RESULT)$/i.test(String(message && message.type || ""));
   }
 
   function attachGlobalEvents() {
     addWindowListener("scroll", requestScrollUpdate, { passive: true });
     addDocumentListener("scroll", requestScrollUpdate, { passive: true, capture: true });
+    addDocumentListener("click", (event) => {
+      const target = event && event.target && event.target.closest ? event.target.closest(".pp-query-better-ocr") : null;
+      if (target && isPdfLikePage()) {
+        runPdfRuntimeAction({ type: "PAGEPILOT_RUN_PDF_OCR", mode: "better" }, "sidebar-query-better-ocr-capture");
+      }
+    }, true);
+    addDocumentListener("pagepilot:run-query-better-ocr", () => {
+      if (isPdfLikePage()) {
+        runPdfRuntimeAction({ type: "PAGEPILOT_RUN_PDF_OCR", mode: "better" }, "sidebar-query-better-ocr-event");
+      }
+    });
     addWindowListener("resize", requestResizeUpdate, { passive: true });
     addWindowListener("keydown", handleShortcut, true);
     addWindowListener("wheel", clearJumpEffectFromUser, { passive: true });

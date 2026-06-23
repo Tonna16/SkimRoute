@@ -176,6 +176,24 @@
           queryBetterOcr.disabled = true;
           queryBetterOcr.textContent = "Running Better OCR...";
           callbacks.onRunQueryBetterOcr && callbacks.onRunQueryBetterOcr();
+          try {
+            document.dispatchEvent(new CustomEvent("pagepilot:run-query-better-ocr", {
+              detail: { source: "sidebar-query-event" }
+            }));
+          } catch (error) {
+            // The callback path above remains authoritative; this event is only a same-document fallback.
+          }
+          try {
+            const pdfRuntime = window.PagePilotPdfRuntime;
+            if (pdfRuntime && typeof pdfRuntime.handleExternalMessage === "function") {
+              pdfRuntime.handleExternalMessage({
+                type: "PAGEPILOT_RUN_PDF_OCR",
+                mode: "better"
+              }, { source: "sidebar-query-ui-fallback" });
+            }
+          } catch (error) {
+            // Ignore fallback failures; the content-runtime callback still owns visible state.
+          }
           return;
         }
         const queryAlt = event.target.closest(".pp-query-alt");

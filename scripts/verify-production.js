@@ -96,9 +96,36 @@ function assertManifestPackageShape() {
   });
 }
 
+function assertProductionDebugDisabled() {
+  const debugConfig = readText("debug-config.js");
+  assert(!/SKIMROUTE_DEV_MODE\s*=\s*true\b/.test(debugConfig), "debug-config.js must not enable SKIMROUTE_DEV_MODE for production builds.");
+  assert(/SKIMROUTE_DEV_MODE\s*=\s*false\b/.test(debugConfig), "debug-config.js must explicitly set SKIMROUTE_DEV_MODE = false for production builds.");
+}
+
+function assertStoreAssets() {
+  ["16", "32", "48", "128"].forEach((size) => {
+    assert(exists(`assets/icons/icon${size}.png`), `assets/icons/icon${size}.png is missing.`);
+  });
+}
+
+function assertNoStaleArtifacts() {
+  [
+    "assets/content.js-BzKMfaWY.js",
+    "assets/popup.html-C-AIiryS.js",
+    "assets/background.js-DHppkjD5.js",
+    "playwright-report",
+    ".playwright"
+  ].forEach((relativePath) => {
+    assert(!exists(relativePath), `${relativePath} must not be present in a production checkout/package source.`);
+  });
+}
+
 assertVersionConsistency();
 assertDependencies();
 assertRuntimeFiles();
 assertGeneratedAssets();
 assertManifestPackageShape();
+assertProductionDebugDisabled();
+assertStoreAssets();
+assertNoStaleArtifacts();
 console.log("Production package checks passed.");

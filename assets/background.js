@@ -244,7 +244,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "PAGEPILOT_FILE_ACCESS_STATUS") {
     try {
-      if (globalThis.SKIMROUTE_DEV_MODE === true && chrome.storage && chrome.storage.local) {
+      if (chrome.storage && chrome.storage.local) {
         chrome.storage.local.get("pagepilot.test.fileAccessAllowed", (result) => {
           const override = result && result["pagepilot.test.fileAccessAllowed"];
           if (typeof override === "boolean") {

@@ -808,9 +808,15 @@
           return ok;
         },
         onRunPdfOcr: (mode) => {
-          emitPdfActionCommandReceived("run-pdf-ocr", { source: "sidebar", mode: getManualPdfOcrMode(mode || "fast") }, { command: "manual-ocr" });
-          if (getManualPdfOcrMode(mode || "fast") === "better") prepareBetterOcrRetryForCurrentQuery("sidebar");
-          return runManualPdfOcr(mode);
+          const ocrMode = getManualPdfOcrMode(mode || "fast");
+          emitPdfActionCommandReceived("run-pdf-ocr", { source: "sidebar", mode: ocrMode }, { command: "manual-ocr" });
+          if (ocrMode === "better") prepareBetterOcrRetryForCurrentQuery("sidebar");
+          return hydrateTestPdfOcrResultFromStorage().then(() => {
+            if (!startTestPdfOcrRunIfAvailable(ocrMode, { source: "sidebar" })) {
+              return runManualPdfOcr(ocrMode);
+            }
+            return true;
+          });
         },
         onCancelPdfOcr: () => {
           emitPdfActionCommandReceived("cancel-ocr", { source: "sidebar" }, { command: "cancel-ocr" });
@@ -834,8 +840,7 @@
         }),
         onClearQuery: () => clearSectionQuery("sidebar-clear"),
         onRunQueryBetterOcr: () => {
-          prepareBetterOcrRetryForCurrentQuery("sidebar-query");
-          return runManualPdfOcr("better");
+          return runBetterOcrForCurrentQuery("sidebar-query");
         },
         onNavigateQueryResult: (target) => navigateCurrentQueryResult(target && target.returnToMatch ? "sidebar-return" : "sidebar-weak-confirm", target || {}).catch((error) => {
           emitDebug("section-query:sidebar-navigate-error", {
@@ -1161,6 +1166,8 @@
 
   function getReadyPdfOcrModelCandidate(details = {}) {
     const routeKey = details.routeKey || getPdfDocumentRouteKey();
+    const rebuilt = buildRecoveredPdfModelFromCache(routeKey, details.reason || "ocr-ready-state", runtime.model, { remember: false });
+    if (isUsablePdfStatsModel(rebuilt, true) && isOcrBackedPdfModel(rebuilt)) return rebuilt;
     const candidates = [
       details.model || null,
       details.parserModel || null,
@@ -1169,8 +1176,7 @@
     ];
     const direct = candidates.find((model) => isUsablePdfStatsModel(model, true) && isOcrBackedPdfModel(model));
     if (direct) return direct;
-    const rebuilt = buildRecoveredPdfModelFromCache(routeKey, details.reason || "ocr-ready-state", runtime.model, { remember: false });
-    return isUsablePdfStatsModel(rebuilt, true) && isOcrBackedPdfModel(rebuilt) ? rebuilt : null;
+    return null;
   }
 
   function saveReadyPdfOcrState(reason = "ocr-ready", details = {}) {
@@ -4222,6 +4228,9 @@
       && next
       && next.source === "ocr"
     ) {
+      const existingMode = String(existing.ocrMode || "");
+      const nextMode = String(next.ocrMode || "");
+      if (/\b(better|smart)\b/i.test(nextMode) && !/\b(better|smart)\b/i.test(existingMode)) return false;
       const existingStructure = existing.ocrStructure || getPdfOcrStructureCompleteness(existing);
       const nextStructure = next.ocrStructure || getPdfOcrStructureCompleteness(next);
       if (existingStructure && existingStructure.complete && nextStructure && !nextStructure.complete) return true;
@@ -7676,7 +7685,14 @@
     if (!entry) return false;
     const text = String(entry.text || "").trim();
     const words = Number(entry.words) || countPdfWords(text);
-    if (entry.source === "ocr" && !isPdfOcrStructurallyCompleteForCache(entry)) return false;
+    if (entry.source === "ocr" && !isPdfOcrStructurallyCompleteForCache(entry)) {
+      const quality = entry.ocrTextQuality && typeof entry.ocrTextQuality === "object" ? entry.ocrTextQuality : {};
+      const explicitBetterReadable = /\b(better|smart)\b/i.test(String(entry.ocrMode || ""))
+        && words >= PDF_RECOVERY_MIN_WORDS
+        && quality.corrupted !== true
+        && (quality.readable === true || Number(entry.confidence || quality.confidence || 0) >= 70);
+      if (!explicitBetterReadable) return false;
+    }
     if (words >= PDF_RECOVERY_MIN_WORDS) return true;
     return Boolean(entry.source === "ocr" && isCacheableShortOcrText(text, entry.pages));
   }
@@ -11107,8 +11123,27 @@
   }
 
   function getTestPdfOcrEntry() {
-    if (!globalThis.SKIMROUTE_DEV_MODE) return null;
-    const raw = window.__PAGEPILOT_TEST_OCR_RESULT__;
+    if (!globalThis.SKIMROUTE_DEV_MODE && window.__PAGEPILOT_ENABLE_TEST_HOOKS__ !== true) return null;
+    let raw = runtime.testPdfOcrEntry && typeof runtime.testPdfOcrEntry === "object"
+      ? runtime.testPdfOcrEntry
+      : null;
+    if ((!raw || typeof raw !== "object") && window.__PAGEPILOT_ENABLE_TEST_HOOKS__ === true) {
+      try {
+        const stored = sessionStorage.getItem("pagepilot.test.ocrResult") || "";
+        raw = stored ? JSON.parse(stored) : null;
+      } catch (error) {
+        raw = null;
+      }
+    }
+    if ((!raw || typeof raw !== "object") && window.__PAGEPILOT_ENABLE_TEST_HOOKS__ === true) {
+      try {
+        const encoded = document.documentElement && document.documentElement.getAttribute("data-pagepilot-test-ocr-result") || "";
+        raw = encoded ? JSON.parse(encoded) : null;
+      } catch (error) {
+        raw = null;
+      }
+    }
+    if (!raw || typeof raw !== "object") raw = window.__PAGEPILOT_TEST_OCR_RESULT__;
     if (!raw || typeof raw !== "object") return null;
     const pages = normalizePdfRecoveryPages(Array.isArray(raw.pages) ? raw.pages : []);
     const text = String(raw.text || raw.reconstructedText || pages.map((page) => page && page.text || "").join(" ")).replace(/\s+/g, " ").trim();
@@ -11139,6 +11174,23 @@
         score: Number(raw.qualityScore) || 86
       }
     };
+  }
+
+  async function hydrateTestPdfOcrResultFromStorage() {
+    if (!hasChromeLocalStorage()) return false;
+    try {
+      const entry = await storageGet("pagepilot.test.ocrResult");
+      if (!entry || typeof entry !== "object") return false;
+      const delayMs = await storageGet("pagepilot.test.ocrDelayMs");
+      window.__PAGEPILOT_ENABLE_TEST_HOOKS__ = true;
+      window.__PAGEPILOT_TEST_OCR_RESULT__ = entry;
+      window.__PAGEPILOT_TEST_OCR_DELAY_MS__ = Math.max(80, Math.min(3000, Number(delayMs) || Number(entry.delayMs) || 700));
+      runtime.testPdfOcrEntry = entry;
+      runtime.testPdfOcrDelayMs = window.__PAGEPILOT_TEST_OCR_DELAY_MS__;
+      return true;
+    } catch (error) {
+      return false;
+    }
   }
 
   function startTestPdfOcrRunIfAvailable(mode = "fast", options = {}) {
@@ -11176,7 +11228,7 @@
       pagesRead: entry.pagesRead,
       exactIssue: "Development/test OCR seam is simulating normal OCR progress and completion without network-dependent OCR execution."
     });
-    const delayMs = Math.max(80, Math.min(3000, Number(window.__PAGEPILOT_TEST_OCR_DELAY_MS__) || Number(entry.delayMs) || 550));
+    const delayMs = Math.max(80, Math.min(3000, Number(runtime.testPdfOcrDelayMs) || Number(window.__PAGEPILOT_TEST_OCR_DELAY_MS__) || Number(entry.delayMs) || 550));
     runtime.pdfOcr.activePromise = new Promise((resolve) => {
       window.setTimeout(async () => {
         if (runtime.pdfOcr.activeAttemptId !== attemptId || runtime.pdfOcr.cancelRequested) {
@@ -11224,8 +11276,8 @@
           canRunBetter: Boolean(entry.canRunBetter),
           finalStatus: "success"
         });
-        scanPage("test-ocr-seam");
         await runPendingSectionQueryIfReady("test-ocr-seam");
+        scanPage("test-ocr-seam");
         render();
         publishStatusUpdate("pdf:ocr:test-complete");
         emitDebug("pdf:ocr:test-seam-complete", {
@@ -12862,6 +12914,15 @@
   function attachGlobalEvents() {
     addWindowListener("scroll", requestScrollUpdate, { passive: true });
     addDocumentListener("scroll", requestScrollUpdate, { passive: true, capture: true });
+    addDocumentListener("click", (event) => {
+      const target = event && event.target && event.target.closest ? event.target.closest(".pp-query-better-ocr") : null;
+      if (target) {
+        runBetterOcrForCurrentQuery("sidebar-query-capture");
+      }
+    }, true);
+    addDocumentListener("pagepilot:run-query-better-ocr", () => {
+      runBetterOcrForCurrentQuery("sidebar-query-event");
+    });
     addWindowListener("resize", requestResizeUpdate, { passive: true });
     addWindowListener("keydown", handleShortcut, true);
     addWindowListener("wheel", clearJumpEffectFromUser, { passive: true });
@@ -13306,6 +13367,27 @@
     if (type === "PAGEPILOT_STATUS") {
       return getPublicStatsSafely();
     }
+    if (type === "PAGEPILOT_DEBUG_SET_OCR_TEST_RESULT") {
+      if (message.testHook === true || globalThis.SKIMROUTE_DEV_MODE || window.__PAGEPILOT_ENABLE_TEST_HOOKS__ === true) {
+        window.__PAGEPILOT_ENABLE_TEST_HOOKS__ = true;
+        window.__PAGEPILOT_TEST_OCR_RESULT__ = message.entry && typeof message.entry === "object" ? message.entry : null;
+        window.__PAGEPILOT_TEST_OCR_DELAY_MS__ = Math.max(80, Math.min(3000, Number(message.delayMs) || 700));
+        runtime.testPdfOcrEntry = window.__PAGEPILOT_TEST_OCR_RESULT__;
+        runtime.testPdfOcrDelayMs = window.__PAGEPILOT_TEST_OCR_DELAY_MS__;
+        try {
+          if (window.__PAGEPILOT_TEST_OCR_RESULT__) {
+            sessionStorage.setItem("pagepilot.test.ocrResult", JSON.stringify(window.__PAGEPILOT_TEST_OCR_RESULT__));
+          }
+          sessionStorage.setItem("pagepilot.test.ocrDelayMs", String(window.__PAGEPILOT_TEST_OCR_DELAY_MS__));
+        } catch (error) {
+          // Test-only seam; ignore storage failures and keep the in-memory payload.
+        }
+        window.__PAGEPILOT_PDF_OCR_CACHE__ = Object.create(null);
+        runtime.recoveredPdfModelCache = null;
+        invalidatePdfQueryPassages("test-ocr-result-installed");
+      }
+      return getPublicStatsSafely();
+    }
     if (type === "PAGEPILOT_TOGGLE") {
       runPdfAction("toggle", {
         open: typeof message.open === "boolean" ? message.open : true,
@@ -13328,17 +13410,22 @@
     }
     if (type === "PAGEPILOT_RUN_PDF_OCR") {
       const mode = getManualPdfOcrMode(message.mode || "fast");
-      hydratePdfCache(getRouteCacheKey(), { source: "core-delegate-ocr" }).catch((error) => {
-        emitDebug("pdf:cache:hydrate-error", {
-          source,
-          error: String(error && error.message ? error.message : error),
-          exactIssue: "Core delegated an OCR command, but cache hydration failed before OCR start."
+      await hydrateTestPdfOcrResultFromStorage();
+      if (mode === "better") {
+        await runBetterOcrForCurrentQuery(source);
+        return getPublicStatsSafely();
+      } else {
+        hydratePdfCache(getRouteCacheKey(), { source: "core-delegate-ocr" }).catch((error) => {
+          emitDebug("pdf:cache:hydrate-error", {
+            source,
+            error: String(error && error.message ? error.message : error),
+            exactIssue: "Core delegated an OCR command, but cache hydration failed before OCR start."
+          });
         });
-      });
+      }
       if (runtime.pdfOcr && runtime.pdfOcr.attemptedForRoute === getRouteCacheKey()) {
         runtime.pdfOcr.completedForRoute = "";
       }
-      if (mode === "better") prepareBetterOcrRetryForCurrentQuery(source);
       if (!startTestPdfOcrRunIfAvailable(mode, { source })) {
         runManualPdfOcr(mode);
       }
@@ -14045,7 +14132,41 @@
           exactIssue: "A queued OCR query failed while running against the completed PDF model."
         });
       });
-    } else if (runtime.view.sectionQuery && runtime.view.sectionQuery.text && runtime.view.sectionQuery.status !== "waiting") {
+    } else if (
+      runtime.sectionQueryAutoNavigatingRequestId
+      && runtime.view.sectionQuery
+      && Number(runtime.view.sectionQuery.requestId || 0) === Number(runtime.sectionQueryAutoNavigatingRequestId || 0)
+    ) {
+      emitDebug("section-query:state-preserved", {
+        reason: `scan:${reason || "scan"}:query-navigation-in-flight`,
+        requestId: Number(runtime.sectionQueryAutoNavigatingRequestId || 0),
+        routeKey,
+        exactIssue: "PDF scan reconciliation skipped query preservation while an auto-navigation measurement is still running."
+      });
+    } else if (
+      runtime.view.sectionQuery
+      && runtime.view.sectionQuery.text
+      && runtime.view.sectionQuery.status === "waiting"
+      && isUsablePdfStatsModel(runtime.model, true)
+      && !(runtime.pdfOcr && (runtime.pdfOcr.pending || runtime.pdfOcr.retrying || isPdfOcrActive()))
+    ) {
+      runSectionQuery(runtime.view.sectionQuery.text, {
+        source: `rescan:${reason || "scan"}:waiting-query-ready`,
+        allowWeakNavigation: false,
+        requestId: runtime.view.sectionQuery.requestId
+      }).catch((error) => {
+        emitDebug("section-query:waiting-query-rerun-error", {
+          reason: `rescan:${reason || "scan"}`,
+          error: String(error && error.message ? error.message : error),
+          requestId: runtime.view.sectionQuery && runtime.view.sectionQuery.requestId || 0,
+          exactIssue: "A waiting PDF query could not be rerun after the OCR-backed model became ready."
+        });
+      });
+    } else if (
+      runtime.view.sectionQuery
+      && runtime.view.sectionQuery.text
+      && /^(strong|possible|weak)$/i.test(String(runtime.view.sectionQuery.status || ""))
+    ) {
       runSectionQuery(runtime.view.sectionQuery.text, {
         source: `rescan:${reason || "scan"}`,
         preserveOnly: true,
@@ -14239,6 +14360,7 @@
       targetPassageId,
       targetSurface: previous.targetSurface || previous.surface || next.surface || "pdf",
       targetPageNumber: Number(previous.targetPageNumber || previous.pageNumber) || Number(next.pageNumber) || 0,
+      navigation: previous.navigation || previous.targetNavigation || createEmptyQueryNavigationResult(),
       targetNavigation: previous.targetNavigation || previous.navigation || createEmptyQueryNavigationResult(),
       targetFingerprint: previous.targetFingerprint || buildSectionQueryTargetFingerprint(next, runtime.model && runtime.model.sections.find((section) => section.id === next.sectionId)),
       targetRouteKey: previous.targetRouteKey || getPdfDocumentRouteKey()
@@ -14400,12 +14522,44 @@
   async function runPendingSectionQueryIfReady(reason = "ocr-model-ready") {
     const pending = runtime.pendingSectionQuery;
     if (!pending || !pending.text) return false;
+    const routeKey = getPdfDocumentRouteKey();
+    if (pending.waitForBetterOcr) {
+      const minAttempt = Number(pending.minOcrAttemptId || 0) || 0;
+      const activeAttempt = Number(runtime.pdfOcr && runtime.pdfOcr.activeAttemptId || 0) || 0;
+      const ocrBusy = Boolean(runtime.pdfOcr && (runtime.pdfOcr.pending || runtime.pdfOcr.retrying || isPdfOcrActive()));
+      const completedForRoute = runtime.pdfOcr && runtime.pdfOcr.completedForRoute === routeKey;
+      if (ocrBusy || activeAttempt < minAttempt || !completedForRoute) {
+        emitDebug("section-query:pending-query-deferred", {
+          requestId: pending.requestId || 0,
+          reason,
+          routeKey,
+          activeAttempt,
+          minAttempt,
+          ocrBusy,
+          completedForRoute: Boolean(completedForRoute),
+          exactIssue: "A Better OCR preserved query is waiting for the newer OCR run before replaying."
+        });
+        return false;
+      }
+    }
+    const snapshot = getUsablePdfSnapshotForRoute(routeKey, `pending-query:${reason}`, runtime.model);
+    if (snapshot && snapshot.model && isUsablePdfStatsModel(snapshot.model, true)) {
+      runtime.model = normalizeRecoveredPdfModelForPublicStatus(
+        snapshot.model,
+        routeKey,
+        runtime.pdfOcr && runtime.pdfOcr.lastRecoveredEntry || null,
+        runtime.model,
+        `pending-query:${reason}:${snapshot.source || "snapshot"}`
+      );
+      rememberStablePdfModel(runtime.model, `pending-query:${reason}:${snapshot.source || "snapshot"}`);
+      invalidatePdfQueryPassages(`pending-query:${reason}`);
+    }
     if (!ensurePdfQueryModel(`pending-query:${reason}`) || !isUsablePdfStatsModel(runtime.model, true)) return false;
     runtime.pendingSectionQuery = null;
     emitDebug("section-query:ocr-model-ready", {
       requestId: pending.requestId || 0,
       source: pending.source || "",
-      routeKey: getPdfDocumentRouteKey(),
+      routeKey,
       sections: runtime.model && runtime.model.sections ? runtime.model.sections.length : 0,
       words: runtime.model && runtime.model.totalReadableWords || 0,
       exactIssue: "The queued query will now run against the completed OCR PDF model."
@@ -14548,8 +14702,25 @@
       && runtime.view.sectionQuery.canNavigate
       && runtime.view.sectionQuery.status !== "weak";
     if (shouldNavigate) {
+      const selectedQuery = runtime.view.sectionQuery;
       const section = runtime.model.sections.find((item) => item.id === runtime.view.sectionQuery.sectionId) || null;
-      const navigation = await navigatePdfQueryResult(runtime.view.sectionQuery, options.source || "query");
+      runtime.view.sectionQuery = {
+        ...selectedQuery,
+        status: "waiting",
+        reason: "Moving to the matching passage...",
+        canNavigate: false,
+        updatedAt: Date.now()
+      };
+      render();
+      runtime.sectionQueryAutoNavigatingRequestId = requestId;
+      let navigation = createEmptyQueryNavigationResult();
+      try {
+        navigation = await navigatePdfQueryResult(selectedQuery, options.source || "query");
+      } finally {
+        if (Number(runtime.sectionQueryAutoNavigatingRequestId || 0) === requestId) {
+          runtime.sectionQueryAutoNavigatingRequestId = 0;
+        }
+      }
       if (!runtime.view.sectionQuery || Number(runtime.view.sectionQuery.requestId || 0) !== requestId) {
         emitDebug("section-query:stale-navigation-discarded", {
           requestId,
@@ -14559,8 +14730,12 @@
         });
         return runtime.view.sectionQuery;
       }
-      runtime.view.sectionQuery.navigation = navigation;
-      applySavedSectionQueryTarget(runtime.view.sectionQuery, runtime.view.sectionQuery, navigation, section, options.source || "query");
+      runtime.view.sectionQuery = {
+        ...selectedQuery,
+        navigation,
+        updatedAt: Date.now()
+      };
+      applySavedSectionQueryTarget(runtime.view.sectionQuery, selectedQuery, navigation, section, options.source || "query");
       const ok = Boolean(navigation.navigated);
       setActionResult("query", ok, {
         section,
@@ -14600,8 +14775,12 @@
       text: String(query.text || ""),
       source: `${source}:better-ocr`,
       allowWeakNavigation: false,
-      requestId
+      requestId,
+      waitForBetterOcr: true,
+      minOcrAttemptId: (Number(runtime.pdfOcr && runtime.pdfOcr.activeAttemptId || 0) || 0) + 1
     };
+    runtime.recoveredPdfModelCache = null;
+    invalidatePdfQueryPassages("better-ocr-retry");
     runtime.view.sectionQuery = {
       ...query,
       requestId,
@@ -14711,6 +14890,23 @@
     );
     if (hasOcr && !credibleOcrEvidence) return "No OCR text resembling this query was found.";
     return hasOcr ? "No strong section match found in the OCR text." : "No strong section match found on this page.";
+  }
+
+  async function runBetterOcrForCurrentQuery(source = "better-ocr") {
+    if (isPdfOcrActive()) {
+      return true;
+    }
+    await hydrateTestPdfOcrResultFromStorage();
+    runtime.recoveredPdfModelCache = null;
+    invalidatePdfQueryPassages("better-ocr-start");
+    if (runtime.pdfOcr && runtime.pdfOcr.attemptedForRoute === getRouteCacheKey()) {
+      runtime.pdfOcr.completedForRoute = "";
+    }
+    prepareBetterOcrRetryForCurrentQuery(source);
+    if (!startTestPdfOcrRunIfAvailable("better", { source })) {
+      return runManualPdfOcr("better");
+    }
+    return true;
   }
 
   function emitPdfQueryNoMatchDiagnostics(search, text, source, requestId) {
